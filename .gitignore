@@ -8,8 +8,7 @@
 **/*.dmp
 **/.thumbs
 
-# No USD files allowed in the repo
-**/*.usd
+# Ignore large USD variants by default. Project-local .usd robot assets are tracked.
 **/*.usda
 **/*.usdc
 **/*.usdz

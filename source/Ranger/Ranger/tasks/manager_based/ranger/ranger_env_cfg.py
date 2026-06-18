@@ -3,8 +3,6 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-import math
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -12,37 +10,89 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import RayCasterCfg, RayCasterCameraCfg, patterns
 from isaaclab.utils import configclass
+
+from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
 
-##
-# Pre-defined configs
-##
-
-from isaaclab_assets.robots.cartpole import CARTPOLE_CFG  # isort:skip
-
 
 ##
-# Scene definition
+# 场景
 ##
 
 
 @configclass
 class RangerSceneCfg(InteractiveSceneCfg):
-    """Configuration for a cart-pole scene."""
+    """Configuration for a scene with the Ranger robot."""
 
-    # ground plane
+    # local ground plane, implemented as a thin static cuboid to avoid remote USD dependencies
     ground = AssetBaseCfg(
         prim_path="/World/ground",
-        spawn=sim_utils.GroundPlaneCfg(size=(100.0, 100.0)),
+        collision_group=-1,
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.01)),
+        spawn=sim_utils.MeshCuboidCfg(
+            size=(100.0, 100.0, 0.02),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="average",
+                restitution_combine_mode="average",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+        ),
     )
 
     # robot
-    robot: ArticulationCfg = CARTPOLE_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = RANGER_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    # sensors
+    mid360_lidar = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/mid360_link",
+        ray_alignment="base",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=16,
+            vertical_fov_range=(-7.0, 52.0),
+            horizontal_fov_range=(-180.0, 180.0),
+            horizontal_res=10.0,
+        ),
+        max_distance=40.0,
+        mesh_prim_paths=["/World/ground"],
+        debug_vis=True,
+    )
+
+    avia_lidar = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/avia_link",
+        ray_alignment="base",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=16,
+            vertical_fov_range=(-38.6, 38.6),
+            horizontal_fov_range=(-35.2, 35.2),
+            horizontal_res=2.0,
+        ),
+        max_distance=50.0,
+        mesh_prim_paths=["/World/ground"],
+        debug_vis=True,
+    )
+
+    d435i_camera = RayCasterCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/d435i_link",
+        pattern_cfg=patterns.PinholeCameraPatternCfg(
+            focal_length=1.93,
+            horizontal_aperture=3.80,
+            width=12,
+            height=10,
+        ),
+        max_distance=10.0,
+        mesh_prim_paths=["/World/ground"],
+        debug_vis=True,
+    )
 
     # lights
     dome_light = AssetBaseCfg(
@@ -60,7 +110,22 @@ class RangerSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
+    leg_hydraulic = mdp.HydraulicCylinderActionCfg(
+        asset_name="robot",
+        joint_names=["g_lb", "g_lf", "g_rf", "g_rb"],
+        preserve_order=True,
+        stroke_min=0.0, # 等效最小行程
+        stroke_max=1.0, # 等效最大行程
+        stroke_rate_limit=1.0, # 等效行程速率限制
+        time_constant=0.08, # 一阶响应时间常数
+        stroke_table=(0.0, 0.5, 1.0), # 查找表输入：虚拟液压缸行程
+        joint_pos_table=(-1.0, 0.0, 1.0), # 查找表输出：轮-腿关节目标位置（弧度）
+    )
+    wheel_joint_velocity = mdp.JointVelocityActionCfg(
+        asset_name="robot", 
+        joint_names=["w_.*"], 
+        scale=20.0 # 轮关节速度缩放因子，RL输出乘以该因子后作为轮关节的速度目标
+    )
 
 
 @configclass
@@ -74,6 +139,25 @@ class ObservationsCfg:
         # observation terms (order preserved)
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        local_height_scan = ObsTerm(
+            func=mdp.local_height_scan,
+            params={
+                "sensor_names": ("mid360_lidar", "avia_lidar"),
+                "x_range": (0.0, 2.0),
+                "y_range": (-0.6, 0.6),
+                "resolution": 0.1,
+                "invalid_height": 0.0,
+            },
+        )
+        local_height_scan_valid_mask = ObsTerm(
+            func=mdp.local_height_scan_valid_mask,
+            params={
+                "sensor_names": ("mid360_lidar", "avia_lidar"),
+                "x_range": (0.0, 2.0),
+                "y_range": (-0.6, 0.6),
+                "resolution": 0.1,
+            },
+        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -88,23 +172,18 @@ class EventCfg:
     """Configuration for events."""
 
     # reset
-    reset_cart_position = EventTerm(
-        func=mdp.reset_joints_by_offset,
+    reset_base = EventTerm(
+        func=mdp.reset_root_state_uniform,
         mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]),
-            "position_range": (-1.0, 1.0),
-            "velocity_range": (-0.5, 0.5),
-        },
+        params={"pose_range": {}, "velocity_range": {}},
     )
 
-    reset_pole_position = EventTerm(
+    reset_robot_joints = EventTerm(
         func=mdp.reset_joints_by_offset,
         mode="reset",
         params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]),
-            "position_range": (-0.25 * math.pi, 0.25 * math.pi),
-            "velocity_range": (-0.25 * math.pi, 0.25 * math.pi),
+            "position_range": (-0.05, 0.05),
+            "velocity_range": (-0.05, 0.05),
         },
     )
 
@@ -113,41 +192,14 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # (1) Constant running reward
     alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # (2) Failure penalty
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # (3) Primary task: keep pole upright
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # (4) Shaping tasks: lower cart velocity
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # (5) Shaping tasks: lower pole angular velocity
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
-    )
 
 
 @configclass
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
-    # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
-    # (2) Cart out of bounds
-    cart_out_of_bounds = DoneTerm(
-        func=mdp.joint_pos_out_of_manual_limit,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"]), "bounds": (-3.0, 3.0)},
-    )
 
 
 ##
@@ -174,7 +226,12 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 2
         self.episode_length_s = 5
         # viewer settings
-        self.viewer.eye = (8.0, 0.0, 5.0)
+        self.viewer.eye = (4.0, -4.0, 3.0)
+        self.viewer.lookat = (0.0, 0.0, 0.5)
         # simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
+        # sensor settings
+        self.scene.mid360_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.d435i_camera.update_period = self.decimation * self.sim.dt

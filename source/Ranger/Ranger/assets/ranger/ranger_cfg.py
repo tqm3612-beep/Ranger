@@ -39,14 +39,14 @@ RANGER_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
 
-    # 轮-腿关节的等效液压缸动作配置，使用自定义的HydraulicCylinderActionTermCfg
+    # Actuators are configured to stay compatible with effort-based motor and hydraulic action terms.
     actuators={
         "leg_joints": ImplicitActuatorCfg(
             joint_names_expr=["g_.*"],
             effort_limit_sim=300.0, # 最大等效力矩
             velocity_limit_sim=5.0, # 最大关节角速度
-            stiffness=1000.0, # 位置伺服刚度
-            damping=50.0, # 阻尼
+            stiffness=0.0,
+            damping=2.0,
         ),
         "wheel_joints": ImplicitActuatorCfg(
             joint_names_expr=["w_.*"],

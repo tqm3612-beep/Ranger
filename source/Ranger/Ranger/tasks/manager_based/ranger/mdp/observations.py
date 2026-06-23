@@ -13,7 +13,133 @@ import torch.nn.functional as F
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedEnv
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
+
+
+def base_lin_vel_normalized(
+    env: ManagerBasedEnv,
+    scale: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized base linear velocity in the body frame."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.clamp(asset.data.root_lin_vel_b / scale, min=-1.0, max=1.0)
+
+
+def base_ang_vel_normalized(
+    env: ManagerBasedEnv,
+    scale: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized base angular velocity in the body frame."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.clamp(asset.data.root_ang_vel_b / scale, min=-1.0, max=1.0)
+
+
+def projected_gravity_normalized(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return clipped projected gravity vector."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.clamp(asset.data.projected_gravity_b, min=-1.0, max=1.0)
+
+
+def joint_pos_rel_normalized(
+    env: ManagerBasedEnv,
+    scale: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized relative joint positions for the selected joints."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos_rel = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.clamp(joint_pos_rel / scale, min=-1.0, max=1.0)
+
+
+def joint_vel_rel_normalized(
+    env: ManagerBasedEnv,
+    scale: float = 5.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return normalized relative joint velocities for the selected joints."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel_rel = asset.data.joint_vel[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+    return torch.clamp(joint_vel_rel / scale, min=-1.0, max=1.0)
+
+
+def hydraulic_stroke_state(env: ManagerBasedEnv, action_name: str = "leg_hydraulic") -> torch.Tensor:
+    """Return the current equivalent hydraulic-cylinder stroke state."""
+
+    action_term = env.action_manager.get_term(action_name)
+    if not hasattr(action_term, "stroke_actual"):
+        raise AttributeError(f"Action term '{action_name}' does not expose 'stroke_actual'.")
+    return action_term.stroke_actual
+
+
+def hydraulic_stroke_state_normalized(
+    env: ManagerBasedEnv,
+    action_name: str = "leg_hydraulic",
+    stroke_min: float = 0.0,
+    stroke_max: float = 1.0,
+) -> torch.Tensor:
+    """Return normalized equivalent hydraulic-cylinder stroke state."""
+
+    stroke_actual = hydraulic_stroke_state(env=env, action_name=action_name)
+    normalized = (stroke_actual - stroke_min) / max(stroke_max - stroke_min, 1.0e-6)
+    return torch.clamp(normalized, min=0.0, max=1.0)
+
+
+def hydraulic_effort_state_normalized(
+    env: ManagerBasedEnv,
+    action_name: str = "leg_hydraulic",
+    effort_limit: float = 300.0,
+) -> torch.Tensor:
+    """Return normalized equivalent hydraulic effort state."""
+
+    action_term = env.action_manager.get_term(action_name)
+    if not hasattr(action_term, "effort_actual"):
+        raise AttributeError(f"Action term '{action_name}' does not expose 'effort_actual'.")
+    return torch.clamp(action_term.effort_actual / max(effort_limit, 1.0e-6), min=-1.0, max=1.0)
+
+
+def wheel_velocity_target_normalized(
+    env: ManagerBasedEnv,
+    action_name: str = "wheel_motor_csv",
+    velocity_limit: float = 20.0,
+) -> torch.Tensor:
+    """Return normalized wheel CSV target velocity state."""
+
+    action_term = env.action_manager.get_term(action_name)
+    if not hasattr(action_term, "velocity_target"):
+        raise AttributeError(f"Action term '{action_name}' does not expose 'velocity_target'.")
+    return torch.clamp(action_term.velocity_target / max(velocity_limit, 1.0e-6), min=-1.0, max=1.0)
+
+
+def wheel_torque_state_normalized(
+    env: ManagerBasedEnv,
+    action_name: str = "wheel_motor_csv",
+    effort_limit: float = 100.0,
+) -> torch.Tensor:
+    """Return normalized wheel torque state from the local CSV loop."""
+
+    action_term = env.action_manager.get_term(action_name)
+    if not hasattr(action_term, "torque_actual"):
+        raise AttributeError(f"Action term '{action_name}' does not expose 'torque_actual'.")
+    return torch.clamp(action_term.torque_actual / max(effort_limit, 1.0e-6), min=-1.0, max=1.0)
+
+
+def last_action_normalized(env: ManagerBasedEnv, action_name: str | None = None) -> torch.Tensor:
+    """Return clipped previous action history."""
+
+    if action_name is None:
+        return torch.clamp(env.action_manager.action, min=-1.0, max=1.0)
+    return torch.clamp(env.action_manager.get_term(action_name).raw_actions, min=-1.0, max=1.0)
 
 
 def local_sensor_visibility_maps(
@@ -48,10 +174,19 @@ def local_geometric_map_layers(
     y_range: tuple[float, float] = (-0.6, 0.6),
     resolution: float = 0.1,
     step_threshold: float = 0.08,
+    height_reference_x_range: tuple[float, float] = (0.0, 0.4),
+    height_reference_y_range: tuple[float, float] = (-0.3, 0.3),
+    slope_normalization: float = 0.6,
+    roughness_normalization: float = 0.05,
+    step_normalization: float = 0.15,
+    apply_noise: bool = False,
+    height_noise_std: float = 0.0,
+    risk_noise_std: float = 0.0,
+    valid_dropout_prob: float = 0.0,
 ) -> dict[str, torch.Tensor]:
     """Return the unflattened local geometric layers for debugging and visualization."""
 
-    height_map, valid_mask = _build_local_height_map(
+    height_map_raw, valid_mask = _build_local_height_map(
         env=env,
         sensor_names=sensor_names,
         asset_name=asset_name,
@@ -59,12 +194,47 @@ def local_geometric_map_layers(
         y_range=y_range,
         resolution=resolution,
     )
+    height_map = _normalize_height_map(
+        height_map_raw=height_map_raw,
+        valid_mask=valid_mask,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+        reference_x_range=height_reference_x_range,
+        reference_y_range=height_reference_y_range,
+    )
+    slope_map = _normalize_risk_map(
+        _compute_slope_map(height_map, valid_mask, resolution),
+        valid_mask,
+        normalization=slope_normalization,
+    )
+    roughness_map = _normalize_risk_map(
+        _compute_roughness_map(height_map, valid_mask),
+        valid_mask,
+        normalization=roughness_normalization,
+    )
+    step_map = _normalize_risk_map(
+        _compute_step_map(height_map, valid_mask, step_threshold),
+        valid_mask,
+        normalization=step_normalization,
+    )
+    height_map, slope_map, roughness_map, step_map, valid_mask = _apply_local_map_noise(
+        height_map=height_map,
+        slope_map=slope_map,
+        roughness_map=roughness_map,
+        step_map=step_map,
+        valid_mask=valid_mask,
+        apply_noise=apply_noise,
+        height_noise_std=height_noise_std,
+        risk_noise_std=risk_noise_std,
+        valid_dropout_prob=valid_dropout_prob,
+    )
 
     return {
         "height": height_map,
-        "slope": _compute_slope_map(height_map, valid_mask, resolution),
-        "roughness": _compute_roughness_map(height_map, valid_mask),
-        "step": _compute_step_map(height_map, valid_mask, step_threshold),
+        "slope": slope_map,
+        "roughness": roughness_map,
+        "step": step_map,
         "valid_mask": valid_mask.to(height_map.dtype),
     }
 
@@ -77,6 +247,15 @@ def local_geometric_map(
     y_range: tuple[float, float] = (-0.6, 0.6),
     resolution: float = 0.1,
     step_threshold: float = 0.08,
+    height_reference_x_range: tuple[float, float] = (0.0, 0.4),
+    height_reference_y_range: tuple[float, float] = (-0.3, 0.3),
+    slope_normalization: float = 0.6,
+    roughness_normalization: float = 0.05,
+    step_normalization: float = 0.15,
+    apply_noise: bool = False,
+    height_noise_std: float = 0.0,
+    risk_noise_std: float = 0.0,
+    valid_dropout_prob: float = 0.0,
 ) -> torch.Tensor:
     """Build a local five-layer geometric map from LiDAR ray hits.
 
@@ -94,6 +273,15 @@ def local_geometric_map(
         y_range=y_range,
         resolution=resolution,
         step_threshold=step_threshold,
+        height_reference_x_range=height_reference_x_range,
+        height_reference_y_range=height_reference_y_range,
+        slope_normalization=slope_normalization,
+        roughness_normalization=roughness_normalization,
+        step_normalization=step_normalization,
+        apply_noise=apply_noise,
+        height_noise_std=height_noise_std,
+        risk_noise_std=risk_noise_std,
+        valid_dropout_prob=valid_dropout_prob,
     )
     layers = torch.stack(
         (
@@ -193,6 +381,124 @@ def _compute_slope_map(height_map: torch.Tensor, valid_mask: torch.Tensor, resol
     diff_y = torch.abs(height_map[:, :, 1:] - height_map[:, :, :-1]) / resolution
     slope_y[:, :, 1:] = torch.where(valid_y, diff_y, torch.zeros_like(diff_y))
     return torch.maximum(slope_x, slope_y)
+
+
+def _normalize_height_map(
+    height_map_raw: torch.Tensor,
+    valid_mask: torch.Tensor,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    resolution: float,
+    reference_x_range: tuple[float, float],
+    reference_y_range: tuple[float, float],
+) -> torch.Tensor:
+    """Shift height so locally flat support terrain stays near zero."""
+
+    reference_height = _compute_height_reference(
+        height_map_raw=height_map_raw,
+        valid_mask=valid_mask,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+        reference_x_range=reference_x_range,
+        reference_y_range=reference_y_range,
+    )
+    height_map = height_map_raw - reference_height[:, None, None]
+    return torch.where(valid_mask, height_map, torch.zeros_like(height_map))
+
+
+def _compute_height_reference(
+    height_map_raw: torch.Tensor,
+    valid_mask: torch.Tensor,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    resolution: float,
+    reference_x_range: tuple[float, float],
+    reference_y_range: tuple[float, float],
+) -> torch.Tensor:
+    """Estimate the local ground reference height from a small anchor region near the robot."""
+
+    device = height_map_raw.device
+    num_x = height_map_raw.shape[1]
+    num_y = height_map_raw.shape[2]
+    x_coords = torch.linspace(x_range[0], x_range[1], num_x, device=device)
+    y_coords = torch.linspace(y_range[0], y_range[1], num_y, device=device)
+    x_mask = (x_coords >= reference_x_range[0]) & (x_coords <= reference_x_range[1])
+    y_mask = (y_coords >= reference_y_range[0]) & (y_coords <= reference_y_range[1])
+    reference_region_mask = x_mask[:, None] & y_mask[None, :]
+
+    fallback_region_mask = (x_coords >= x_range[0]) & (x_coords <= min(x_range[1], reference_x_range[1] + resolution))
+    fallback_region_mask = fallback_region_mask[:, None] & torch.ones((1, num_y), dtype=torch.bool, device=device)
+
+    reference_heights = []
+    for env_id in range(height_map_raw.shape[0]):
+        region_valid = valid_mask[env_id] & reference_region_mask
+        if region_valid.any():
+            reference_heights.append(height_map_raw[env_id][region_valid].median())
+            continue
+
+        fallback_valid = valid_mask[env_id] & fallback_region_mask
+        if fallback_valid.any():
+            reference_heights.append(height_map_raw[env_id][fallback_valid].median())
+            continue
+
+        all_valid = valid_mask[env_id]
+        if all_valid.any():
+            reference_heights.append(height_map_raw[env_id][all_valid].median())
+        else:
+            reference_heights.append(torch.tensor(0.0, device=device, dtype=height_map_raw.dtype))
+
+    return torch.stack(reference_heights, dim=0)
+
+
+def _normalize_risk_map(risk_map: torch.Tensor, valid_mask: torch.Tensor, normalization: float) -> torch.Tensor:
+    """Clamp a raw geometric risk layer into a 0..1 intensity map."""
+
+    if normalization <= 0.0:
+        raise ValueError(f"Risk normalization must be positive. Received: {normalization}")
+    normalized = torch.clamp(risk_map / normalization, min=0.0, max=1.0)
+    return torch.where(valid_mask, normalized, torch.zeros_like(normalized))
+
+
+def _apply_local_map_noise(
+    height_map: torch.Tensor,
+    slope_map: torch.Tensor,
+    roughness_map: torch.Tensor,
+    step_map: torch.Tensor,
+    valid_mask: torch.Tensor,
+    apply_noise: bool,
+    height_noise_std: float,
+    risk_noise_std: float,
+    valid_dropout_prob: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply lightweight noise and random visibility dropout to the local map."""
+
+    if not apply_noise:
+        return height_map, slope_map, roughness_map, step_map, valid_mask
+
+    valid_mask_noisy = valid_mask
+    if valid_dropout_prob > 0.0:
+        dropout = torch.rand_like(valid_mask.to(torch.float32)) < valid_dropout_prob
+        valid_mask_noisy = valid_mask & (~dropout)
+
+    if height_noise_std > 0.0:
+        height_map = height_map + torch.randn_like(height_map) * height_noise_std
+
+    if risk_noise_std > 0.0:
+        slope_map = slope_map + torch.randn_like(slope_map) * risk_noise_std
+        roughness_map = roughness_map + torch.randn_like(roughness_map) * risk_noise_std
+        step_map = step_map + torch.randn_like(step_map) * risk_noise_std
+
+    slope_map = torch.clamp(slope_map, min=0.0, max=1.0)
+    roughness_map = torch.clamp(roughness_map, min=0.0, max=1.0)
+    step_map = torch.clamp(step_map, min=0.0, max=1.0)
+
+    height_map = torch.where(valid_mask_noisy, height_map, torch.zeros_like(height_map))
+    slope_map = torch.where(valid_mask_noisy, slope_map, torch.zeros_like(slope_map))
+    roughness_map = torch.where(valid_mask_noisy, roughness_map, torch.zeros_like(roughness_map))
+    step_map = torch.where(valid_mask_noisy, step_map, torch.zeros_like(step_map))
+
+    return height_map, slope_map, roughness_map, step_map, valid_mask_noisy
 
 
 def _compute_roughness_map(height_map: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:

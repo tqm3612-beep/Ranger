@@ -74,6 +74,7 @@ def _configure_sensor_mesh_targets(env_cfg) -> None:
     for sensor_cfg_name in ("mid360_lidar", "avia_lidar", "d435i_camera"):
         getattr(env_cfg.scene, sensor_cfg_name).debug_vis = False
 
+
 def _terrain_cfg_for_case(terrain_case: str) -> TerrainImporterCfg:
     """Build a single-mesh terrain config that RayCaster can consume reliably."""
 
@@ -227,6 +228,8 @@ def main() -> None:
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
     )
+    env_cfg.observations.policy.enable_corruption = False
+    env_cfg.observations.policy.local_geometric_map.params["apply_noise"] = False
     _configure_sensor_mesh_targets(env_cfg)
     _configure_terrain(env_cfg, args_cli.terrain_case)
     print(f"[DEBUG]: building env for terrain_case={args_cli.terrain_case}", flush=True)

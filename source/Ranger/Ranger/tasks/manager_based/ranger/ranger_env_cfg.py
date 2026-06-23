@@ -10,10 +10,12 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import RayCasterCfg, RayCasterCameraCfg, patterns
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from Ranger.assets.ranger import RANGER_CFG
 
@@ -115,21 +117,31 @@ class RangerSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    leg_hydraulic = mdp.HydraulicCylinderActionCfg(
+    leg_hydraulic = mdp.HydraulicActuatorActionCfg(
         asset_name="robot",
         joint_names=["g_lb", "g_lf", "g_rf", "g_rb"],
         preserve_order=True,
-        stroke_min=0.0, # 等效最小行程
-        stroke_max=1.0, # 等效最大行程
-        stroke_rate_limit=1.0, # 等效行程速率限制
-        time_constant=0.08, # 一阶响应时间常数
-        stroke_table=(0.0, 0.5, 1.0), # 查找表输入：虚拟液压缸行程
-        joint_pos_table=(-1.0, 0.0, 1.0), # 查找表输出：轮-腿关节目标位置（弧度）
+        stroke_min=0.0,
+        stroke_max=1.0,
+        stroke_rate_limit=1.0,
+        time_constant=0.08,
+        stroke_table=(0.0, 0.5, 1.0),
+        joint_pos_table=(-1.0, 0.0, 1.0),
+        max_effort=300.0,
+        impedance_kp=250.0,
+        impedance_kd=30.0,
     )
-    wheel_joint_velocity = mdp.JointVelocityActionCfg(
-        asset_name="robot", 
-        joint_names=["w_.*"], 
-        scale=20.0 # 轮关节速度缩放因子，RL输出乘以该因子后作为轮关节的速度目标
+    wheel_motor_csv = mdp.WheelMotorCSVActionCfg(
+        asset_name="robot",
+        joint_names=["w_lb", "w_lf", "w_rf", "w_rb"],
+        preserve_order=True,
+        velocity_limit=20.0,
+        acceleration_limit=80.0,
+        command_time_constant=0.02,
+        velocity_kp=10.0,
+        velocity_damping=0.2,
+        viscous_friction=0.05,
+        effort_limit=100.0,
     )
 
 
@@ -142,8 +154,59 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        base_lin_vel = ObsTerm(
+            func=mdp.base_lin_vel_normalized,
+            params={"scale": 2.0},
+            noise=Unoise(n_min=-0.03, n_max=0.03),
+        )
+        base_ang_vel = ObsTerm(
+            func=mdp.base_ang_vel_normalized,
+            params={"scale": 3.0},
+            noise=Unoise(n_min=-0.04, n_max=0.04),
+        )
+        projected_gravity = ObsTerm(
+            func=mdp.projected_gravity_normalized,
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+        )
+        leg_joint_pos_rel = ObsTerm(
+            func=mdp.joint_pos_rel_normalized,
+            params={"scale": 1.0, "asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        leg_joint_vel_rel = ObsTerm(
+            func=mdp.joint_vel_rel_normalized,
+            params={"scale": 5.0, "asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+        )
+        wheel_joint_vel_rel = ObsTerm(
+            func=mdp.joint_vel_rel_normalized,
+            params={"scale": 20.0, "asset_cfg": SceneEntityCfg("robot", joint_names=["w_.*"])},
+            noise=Unoise(n_min=-0.02, n_max=0.02),
+        )
+        hydraulic_stroke_state = ObsTerm(
+            func=mdp.hydraulic_stroke_state_normalized,
+            params={"action_name": "leg_hydraulic", "stroke_min": 0.0, "stroke_max": 1.0},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        hydraulic_effort_state = ObsTerm(
+            func=mdp.hydraulic_effort_state_normalized,
+            params={"action_name": "leg_hydraulic", "effort_limit": 300.0},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        wheel_velocity_target = ObsTerm(
+            func=mdp.wheel_velocity_target_normalized,
+            params={"action_name": "wheel_motor_csv", "velocity_limit": 20.0},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        wheel_torque_state = ObsTerm(
+            func=mdp.wheel_torque_state_normalized,
+            params={"action_name": "wheel_motor_csv", "effort_limit": 100.0},
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
+        last_action = ObsTerm(
+            func=mdp.last_action_normalized,
+            noise=Unoise(n_min=-0.01, n_max=0.01),
+        )
         # Feed the policy the fused five-layer local geometric map directly
         # instead of duplicating height and valid-mask as separate terms.
         local_geometric_map = ObsTerm(
@@ -153,12 +216,21 @@ class ObservationsCfg:
                 "x_range": (0.0, 2.0),
                 "y_range": (-0.6, 0.6),
                 "resolution": 0.1,
+                "height_reference_x_range": (0.0, 0.4),
+                "height_reference_y_range": (-0.3, 0.3),
                 "step_threshold": 0.08,
+                "slope_normalization": 0.6,
+                "roughness_normalization": 0.05,
+                "step_normalization": 0.15,
+                "apply_noise": True,
+                "height_noise_std": 0.01,
+                "risk_noise_std": 0.02,
+                "valid_dropout_prob": 0.02,
             },
         )
 
         def __post_init__(self) -> None:
-            self.enable_corruption = False
+            self.enable_corruption = True
             self.concatenate_terms = True
 
     # observation groups
@@ -190,7 +262,34 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
+    alive = RewTerm(func=mdp.is_alive, weight=0.2)
+    forward_progress = RewTerm(
+        func=mdp.forward_velocity_reward,
+        weight=1.5,
+        params={"speed_scale": 1.0},
+    )
+    upright = RewTerm(func=mdp.flat_orientation_l2, weight=-2.0)
+    base_vertical_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+    base_roll_pitch_rate = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
+    lateral_velocity = RewTerm(func=mdp.lin_vel_y_l2, weight=-0.5)
+    leg_joint_deviation = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.02,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+    )
+    wheel_joint_velocity = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.0002,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["w_.*"])},
+    )
+    leg_joint_velocity = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.005,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+    )
+    action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    action_magnitude = RewTerm(func=mdp.action_l2, weight=-0.001)
+    termination = RewTerm(func=mdp.is_terminated, weight=-10.0)
 
 
 @configclass
@@ -198,6 +297,8 @@ class TerminationsCfg:
     """Termination terms for the MDP."""
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    bad_orientation = DoneTerm(func=mdp.bad_orientation, params={"limit_angle": 1.2})
+    root_height_low = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.1})
 
 
 ##

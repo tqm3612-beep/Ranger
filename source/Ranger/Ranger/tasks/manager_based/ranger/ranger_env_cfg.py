@@ -82,7 +82,12 @@ class RangerSceneCfg(InteractiveSceneCfg):
     )
 
     d435i_camera = RayCasterCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/d435i_link",
+        prim_path="{ENV_REGEX_NS}/Robot",
+        offset=RayCasterCameraCfg.OffsetCfg(
+            pos=(0.46259, 0.0, -0.21177),
+            rot=(0.241845, -0.664463, 0.664463, -0.241845),
+            convention="ros",
+        ),
         pattern_cfg=patterns.PinholeCameraPatternCfg(
             focal_length=1.93,
             horizontal_aperture=3.80,
@@ -139,23 +144,16 @@ class ObservationsCfg:
         # observation terms (order preserved)
         joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
-        local_height_scan = ObsTerm(
-            func=mdp.local_height_scan,
+        # Feed the policy the fused five-layer local geometric map directly
+        # instead of duplicating height and valid-mask as separate terms.
+        local_geometric_map = ObsTerm(
+            func=mdp.local_geometric_map,
             params={
-                "sensor_names": ("mid360_lidar", "avia_lidar"),
+                "sensor_names": ("mid360_lidar", "avia_lidar", "d435i_camera"),
                 "x_range": (0.0, 2.0),
                 "y_range": (-0.6, 0.6),
                 "resolution": 0.1,
-                "invalid_height": 0.0,
-            },
-        )
-        local_height_scan_valid_mask = ObsTerm(
-            func=mdp.local_height_scan_valid_mask,
-            params={
-                "sensor_names": ("mid360_lidar", "avia_lidar"),
-                "x_range": (0.0, 2.0),
-                "y_range": (-0.6, 0.6),
-                "resolution": 0.1,
+                "step_threshold": 0.08,
             },
         )
 

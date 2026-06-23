@@ -9,6 +9,7 @@
 **/.thumbs
 
 # Ignore large USD variants by default. Project-local .usd robot assets are tracked.
+**/*.usd
 **/*.usda
 **/*.usdc
 **/*.usdz

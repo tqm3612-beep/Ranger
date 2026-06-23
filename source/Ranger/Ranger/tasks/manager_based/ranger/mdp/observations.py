@@ -16,40 +16,42 @@ from isaaclab.envs import ManagerBasedEnv
 from isaaclab.sensors import RayCaster
 
 
-def local_height_scan(
+def local_sensor_visibility_maps(
     env: ManagerBasedEnv,
     sensor_names: tuple[str, ...],
     asset_name: str = "robot",
     x_range: tuple[float, float] = (0.0, 2.0),
     y_range: tuple[float, float] = (-0.6, 0.6),
     resolution: float = 0.1,
-    invalid_height: float = 0.0,
-) -> torch.Tensor:
-    """Build a local height scan from FOV-limited LiDAR ray hits."""
+) -> dict[str, torch.Tensor]:
+    """Return one local valid-mask grid per sensor for visibility debugging."""
 
-    height_map, _ = _build_local_height_map(
-        env=env,
-        sensor_names=sensor_names,
-        asset_name=asset_name,
-        x_range=x_range,
-        y_range=y_range,
-        resolution=resolution,
-        invalid_height=invalid_height,
-    )
-    return height_map.reshape(env.num_envs, -1)
+    visibility_maps = {}
+    for sensor_name in sensor_names:
+        _, valid_mask = _build_local_height_map(
+            env=env,
+            sensor_names=(sensor_name,),
+            asset_name=asset_name,
+            x_range=x_range,
+            y_range=y_range,
+            resolution=resolution,
+        )
+        visibility_maps[sensor_name] = valid_mask.to(torch.float32)
+    return visibility_maps
 
 
-def local_height_scan_valid_mask(
+def local_geometric_map_layers(
     env: ManagerBasedEnv,
     sensor_names: tuple[str, ...],
     asset_name: str = "robot",
     x_range: tuple[float, float] = (0.0, 2.0),
     y_range: tuple[float, float] = (-0.6, 0.6),
     resolution: float = 0.1,
-) -> torch.Tensor:
-    """Return valid cells for the local height scan."""
+    step_threshold: float = 0.08,
+) -> dict[str, torch.Tensor]:
+    """Return the unflattened local geometric layers for debugging and visualization."""
 
-    _, valid_mask = _build_local_height_map(
+    height_map, valid_mask = _build_local_height_map(
         env=env,
         sensor_names=sensor_names,
         asset_name=asset_name,
@@ -57,7 +59,14 @@ def local_height_scan_valid_mask(
         y_range=y_range,
         resolution=resolution,
     )
-    return valid_mask.to(torch.float32).reshape(env.num_envs, -1)
+
+    return {
+        "height": height_map,
+        "slope": _compute_slope_map(height_map, valid_mask, resolution),
+        "roughness": _compute_roughness_map(height_map, valid_mask),
+        "step": _compute_step_map(height_map, valid_mask, step_threshold),
+        "valid_mask": valid_mask.to(height_map.dtype),
+    }
 
 
 def local_geometric_map(
@@ -73,29 +82,26 @@ def local_geometric_map(
 
     The returned layers are height, slope, roughness, step, and valid mask.
     Points outside the local map bounds are discarded, so the policy only sees
-    geometry observed through the configured sensor rays.
+    geometry observed through the configured sensor rays. The map is expressed
+    in a gravity-aligned local frame that keeps yaw but removes roll and pitch.
     """
 
-    height_map, valid_mask = _build_local_height_map(
+    layers_dict = local_geometric_map_layers(
         env=env,
         sensor_names=sensor_names,
         asset_name=asset_name,
         x_range=x_range,
         y_range=y_range,
         resolution=resolution,
+        step_threshold=step_threshold,
     )
-
-    slope_map = _compute_slope_map(height_map, valid_mask, resolution)
-    roughness_map = _compute_roughness_map(height_map, valid_mask)
-    step_map = _compute_step_map(height_map, valid_mask, step_threshold)
-
     layers = torch.stack(
         (
-            height_map,
-            slope_map,
-            roughness_map,
-            step_map,
-            valid_mask.to(height_map.dtype),
+            layers_dict["height"],
+            layers_dict["slope"],
+            layers_dict["roughness"],
+            layers_dict["step"],
+            layers_dict["valid_mask"],
         ),
         dim=1,
     )
@@ -115,13 +121,22 @@ def _build_local_height_map(
     ray_hits_w = []
     for sensor_name in sensor_names:
         sensor: RayCaster = env.scene.sensors[sensor_name]
-        ray_hits_w.append(sensor.data.ray_hits_w)
+        if hasattr(sensor.data, "ray_hits_w"):
+            hits_w = sensor.data.ray_hits_w
+        else:
+            # RayCasterCamera stores world-space hits on the sensor object and may
+            # update a subset of environments internally, so refresh all envs here.
+            sensor._update_buffers_impl(slice(None))
+            hits_w = sensor.ray_hits_w
+        ray_hits_w.append(hits_w)
     points_w = torch.cat(ray_hits_w, dim=1)
 
     points_rel_w = points_w - asset.data.root_pos_w.unsqueeze(1)
     num_rays = points_rel_w.shape[1]
+    # Use a gravity-aligned local frame: keep yaw, remove roll and pitch.
+    root_yaw_quat_w = math_utils.yaw_quat(asset.data.root_quat_w)
     points_b = math_utils.quat_apply_inverse(
-        asset.data.root_quat_w.unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4),
+        root_yaw_quat_w.unsqueeze(1).expand(-1, num_rays, -1).reshape(-1, 4),
         points_rel_w.reshape(-1, 3),
     ).reshape(env.num_envs, num_rays, 3)
 

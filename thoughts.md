@@ -86,3 +86,41 @@ command                      目标速度或目标方向
 4. 车身高度 / 俯仰 / 横滚姿态
    ↓
 更稳定地通过复杂地形
+
+输入：
+obs =
+[
+  proprioception,          # 机器人自身状态
+  actuator_state,          # 液压腿/轮毂电机状态
+  task_goal,               # 目标相对位置
+  local_navigation_map,    # 局部几何/可通行/障碍地图
+  history                  # last_action 或短历史
+]
+
+base_lin_vel              3
+base_ang_vel              3
+projected_gravity         3
+leg_joint_pos_rel          4
+leg_joint_vel_rel          4
+wheel_joint_vel_rel        4
+hydraulic_stroke_state     4
+hydraulic_effort_state     4
+wheel_velocity_target      4
+wheel_torque_state         4
+goal_x_body_norm = clamp(goal_x_body / goal_range, -1, 1)
+goal_y_body_norm = clamp(goal_y_body / goal_range, -1, 1)
+goal_distance_norm = clamp(distance / goal_range, 0, 1)
+goal_bearing_sin          1
+goal_bearing_cos          1
+goal_valid                1
+height_map             地形相对高度
+slope_map              坡度风险
+roughness_map          粗糙度风险
+step_map               台阶风险
+obstacle_mask          障碍物/不可通行区域
+traversability_map     可通行性
+        traversability = f(slope, roughness, step, valid_mask)
+        cost = w1 * slope + w2 * roughness + w3 * step + w4 * unknown_penalty
+traversability = 1 - clamp(cost, 0, 1)
+valid_mask             有效观测区域
+last_action              8

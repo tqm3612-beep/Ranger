@@ -13,13 +13,67 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import RayCasterCfg, RayCasterCameraCfg, patterns
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, RayCasterCameraCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
+
+GOAL_STATE_PARAMS = {
+    # Stage-1 neutral input: goal_valid=0 and [sin, cos] = [0, 1].
+    # Later stages can enable a real goal without changing the policy interface.
+    "goal_x_body": 0.0,
+    "goal_y_body": 0.0,
+    "goal_range": 5.0,
+    "goal_enabled": False,
+}
+
+LOCAL_NAVIGATION_MAP_PARAMS = {
+    "sensor_names": ("mid360_lidar", "avia_lidar", "d435i_camera"),
+    "x_range": (0.0, 2.0),
+    "y_range": (-0.6, 0.6),
+    "resolution": 0.1,
+    "height_reference_x_range": (0.0, 0.4),
+    "height_reference_y_range": (-0.3, 0.3),
+    "step_threshold": 0.08,
+    "slope_normalization": 0.6,
+    "roughness_normalization": 0.05,
+    "step_normalization": 0.15,
+    "apply_noise": True,
+    "height_noise_std": 0.01,
+    "risk_noise_std": 0.02,
+    "valid_dropout_prob": 0.02,
+    "slope_weight": 0.4,
+    "roughness_weight": 0.3,
+    "step_weight": 0.3,
+    "unknown_penalty": 1.0,
+    # Stage-1 neutral map placeholder can be enabled later without changing observation shape.
+    "use_neutral_map": False,
+}
+
+
+def _navigation_map_grid_shape(resolution: float, x_range: tuple[float, float], y_range: tuple[float, float]) -> tuple[int, int]:
+    num_x = int(round((x_range[1] - x_range[0]) / resolution)) + 1
+    num_y = int(round((y_range[1] - y_range[0]) / resolution)) + 1
+    return num_x, num_y
+
+
+def _expected_policy_obs_dim() -> int:
+    low_dim_terms = 45
+    goal_dim = 6
+    map_layers = 6
+    num_x, num_y = _navigation_map_grid_shape(
+        resolution=LOCAL_NAVIGATION_MAP_PARAMS["resolution"],
+        x_range=LOCAL_NAVIGATION_MAP_PARAMS["x_range"],
+        y_range=LOCAL_NAVIGATION_MAP_PARAMS["y_range"],
+    )
+    return low_dim_terms + goal_dim + map_layers * num_x * num_y
+
+
+def _expected_action_dim() -> int:
+    return 8
 
 
 ##
@@ -99,6 +153,16 @@ class RangerSceneCfg(InteractiveSceneCfg):
         max_distance=10.0,
         mesh_prim_paths=["/World/ground"],
         debug_vis=True,
+    )
+
+    # Training-only privileged sensor for wheel-ground contact monitoring.
+    # It is intentionally kept out of the policy observations to preserve sim-to-real compatibility.
+    wheel_contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/w_.*",
+        update_period=0.0,
+        history_length=1,
+        track_air_time=True,
+        debug_vis=False,
     )
 
     # lights
@@ -203,30 +267,19 @@ class ObservationsCfg:
             params={"action_name": "wheel_motor_csv", "effort_limit": 100.0},
             noise=Unoise(n_min=-0.01, n_max=0.01),
         )
+        goal_state = ObsTerm(
+            func=mdp.goal_state,
+            params=GOAL_STATE_PARAMS,
+        )
         last_action = ObsTerm(
             func=mdp.last_action_normalized,
             noise=Unoise(n_min=-0.01, n_max=0.01),
         )
-        # Feed the policy the fused five-layer local geometric map directly
-        # instead of duplicating height and valid-mask as separate terms.
-        local_geometric_map = ObsTerm(
-            func=mdp.local_geometric_map,
-            params={
-                "sensor_names": ("mid360_lidar", "avia_lidar", "d435i_camera"),
-                "x_range": (0.0, 2.0),
-                "y_range": (-0.6, 0.6),
-                "resolution": 0.1,
-                "height_reference_x_range": (0.0, 0.4),
-                "height_reference_y_range": (-0.3, 0.3),
-                "step_threshold": 0.08,
-                "slope_normalization": 0.6,
-                "roughness_normalization": 0.05,
-                "step_normalization": 0.15,
-                "apply_noise": True,
-                "height_noise_std": 0.01,
-                "risk_noise_std": 0.02,
-                "valid_dropout_prob": 0.02,
-            },
+        # Feed the policy a fixed six-layer local navigation map. Stage-1
+        # training can later swap in a neutral map without changing this shape.
+        local_navigation_map = ObsTerm(
+            func=mdp.local_navigation_map,
+            params=LOCAL_NAVIGATION_MAP_PARAMS,
         )
 
         def __post_init__(self) -> None:
@@ -265,7 +318,7 @@ class RewardsCfg:
     alive = RewTerm(func=mdp.is_alive, weight=0.2)
     forward_progress = RewTerm(
         func=mdp.forward_velocity_reward,
-        weight=1.5,
+        weight=3,
         params={"speed_scale": 1.0},
     )
     upright = RewTerm(func=mdp.flat_orientation_l2, weight=-2.0)
@@ -334,3 +387,107 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.mid360_lidar.update_period = self.decimation * self.sim.dt
         self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
         self.scene.d435i_camera.update_period = self.decimation * self.sim.dt
+        self.scene.wheel_contact_forces.update_period = self.sim.dt
+        print(f"[RangerEnvCfg] Expected policy observation shape: {_expected_policy_obs_dim()} (legacy 1410 -> current 1689)")
+        print(f"[RangerEnvCfg] Expected action shape: {_expected_action_dim()} (4 leg + 4 wheel)")
+
+
+@configclass
+class RangerStandEnvCfg(RangerEnvCfg):
+    """Stage-1 standing configuration focused on stable four-wheel grounding."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.episode_length_s = 4.0
+
+        # Stage-1 uses the fixed neutral goal/map interface while we focus on posture stability.
+        self.observations.policy.goal_state.params["goal_enabled"] = False
+        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+
+        # Keep resets close to the nominal support pose so the policy can first learn to settle.
+        self.events.reset_robot_joints.params["position_range"] = (-0.005, 0.005)
+        self.events.reset_robot_joints.params["velocity_range"] = (-0.01, 0.01)
+
+        # Relax early failure slightly so the robot has time to stabilize after touchdown.
+        self.terminations.bad_orientation.params["limit_angle"] = 1.4
+        self.terminations.root_height_low.params["minimum_height"] = 0.05
+
+        # Turn off locomotion incentives and focus on stable support/contact quality first.
+        self.rewards.forward_progress.weight = 0.0
+        self.rewards.lateral_velocity.weight = -0.2
+        self.rewards.base_vertical_velocity.weight = -1.0
+        self.rewards.base_roll_pitch_rate.weight = -0.5
+        self.rewards.upright.weight = -3.0
+        self.rewards.wheel_joint_velocity.weight = -0.002
+        self.rewards.action_rate.weight = -0.02
+        self.rewards.action_magnitude.weight = -0.002
+
+        # Reward four-wheel contact coverage and balanced support forces during settling.
+        self.rewards.wheel_contact_count = RewTerm(
+            func=mdp.wheel_contact_count_reward,
+            weight=2.0,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_.*"]), "threshold": 1.0},
+        )
+        self.rewards.wheel_contact_balance = RewTerm(
+            func=mdp.wheel_contact_force_balance_reward,
+            weight=1.0,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_.*"]), "threshold": 1.0},
+        )
+
+
+@configclass
+class RangerVisualEnvCfg(RangerEnvCfg):
+    """Smaller training scene tuned for interactive visualization."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Keep only a handful of environments so the GUI stays readable during training.
+        self.scene.num_envs = 4
+        self.scene.env_spacing = 8.0
+        # Pull the camera back slightly so all visible robots fit in the initial view.
+        self.viewer.eye = (8.0, -8.0, 5.0)
+        self.viewer.lookat = (0.0, 0.0, 0.8)
+
+
+@configclass
+class RangerStandVisualEnvCfg(RangerStandEnvCfg):
+    """Standing-stage scene tuned for interactive visualization."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.scene.env_spacing = 8.0
+        self.viewer.eye = (8.0, -8.0, 5.0)
+        self.viewer.lookat = (0.0, 0.0, 0.8)
+
+
+@configclass
+class RangerForwardEnvCfg(RangerStandEnvCfg):
+    """Stage-2 forward configuration with a fixed goal and neutral navigation map."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Keep the policy interface fixed while enabling a simple forward objective.
+        self.observations.policy.goal_state.params["goal_enabled"] = True
+        self.observations.policy.goal_state.params["goal_x_body"] = 3.0
+        self.observations.policy.goal_state.params["goal_y_body"] = 0.0
+        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+
+        # Re-enable only the simple forward-progress incentive for the next stage.
+        self.rewards.forward_progress.weight = 2.0
+        self.rewards.wheel_joint_velocity.weight = 0.0
+        self.rewards.wheel_contact_count.weight = 1.0
+        self.rewards.wheel_contact_balance.weight = 0.5
+
+
+@configclass
+class RangerForwardVisualEnvCfg(RangerForwardEnvCfg):
+    """Forward-stage scene tuned for interactive visualization."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.scene.env_spacing = 8.0
+        self.viewer.eye = (8.0, -8.0, 5.0)
+        self.viewer.lookat = (0.0, 0.0, 0.8)

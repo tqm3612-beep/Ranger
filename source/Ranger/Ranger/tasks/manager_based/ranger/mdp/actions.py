@@ -50,6 +50,11 @@ class WheelMotorCSVAction(ActionTerm):
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
         self._velocity_target = torch.zeros_like(self._raw_actions)
+        self._wheel_forward_sign = torch.tensor(
+            [-1.0, -1.0, 1.0, 1.0],
+            device=self._raw_actions.device,
+            dtype=self._raw_actions.dtype,
+        ).unsqueeze(0)
         self._torque_actual = torch.zeros_like(self._raw_actions)
 
         self._velocity_limit = float(self.cfg.velocity_limit)
@@ -103,7 +108,11 @@ class WheelMotorCSVAction(ActionTerm):
         if self._clip is not None:
             self._raw_actions[:] = torch.clamp(self._raw_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1])
 
-        velocity_des = torch.clamp(self._raw_actions, min=-1.0, max=1.0) * self._velocity_limit
+        raw_wheel_actions = torch.clamp(self._raw_actions, min=-1.0, max=1.0)
+        left_cmd = raw_wheel_actions[:, 0:2].mean(dim=1, keepdim=True)
+        right_cmd = raw_wheel_actions[:, 2:4].mean(dim=1, keepdim=True)
+        semantic_wheel_cmd = torch.cat([left_cmd, left_cmd, right_cmd, right_cmd], dim=1)
+        velocity_des = semantic_wheel_cmd * self._velocity_limit * self._wheel_forward_sign
         if self._command_time_constant > 0.0:
             alpha = self._env.step_dt / (self._command_time_constant + self._env.step_dt)
             velocity_cmd = self._velocity_target + alpha * (velocity_des - self._velocity_target)

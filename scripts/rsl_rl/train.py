@@ -100,6 +100,50 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str) -> str:
+    """Resolve a checkpoint path from either an explicit file path or the standard run/checkpoint selectors."""
+
+    expanded_checkpoint = os.path.abspath(os.path.expanduser(load_checkpoint))
+    if os.path.isfile(expanded_checkpoint):
+        return expanded_checkpoint
+    return get_checkpoint_path(log_root_path, load_run, load_checkpoint)
+
+
+def _is_forward_finetune_task(task_name: str) -> bool:
+    return task_name.split(":")[-1] in {"Template-Ranger-Forward-v0", "Template-Ranger-Forward-Visual-v0"}
+
+
+def _load_forward_finetune_weights(runner: OnPolicyRunner, checkpoint_path: str) -> None:
+    """Load only actor/critic weights for forward-stage fine-tuning and reset policy std."""
+
+    loaded_dict = torch.load(checkpoint_path, map_location=runner.device, weights_only=False)
+    model_state_dict = loaded_dict["model_state_dict"]
+    actor_critic = runner.alg.policy
+    actor_critic_state = actor_critic.state_dict()
+
+    actor_critic_keys = {
+        key: value for key, value in model_state_dict.items() if key.startswith("actor.") or key.startswith("critic.")
+    }
+    missing_actor_critic_keys = {
+        key for key in actor_critic_state.keys() if (key.startswith("actor.") or key.startswith("critic.")) and key not in actor_critic_keys
+    }
+    if missing_actor_critic_keys:
+        missing_preview = sorted(missing_actor_critic_keys)
+        raise KeyError(f"Checkpoint is missing actor/critic weights required for forward fine-tuning: {missing_preview}")
+
+    actor_critic.load_state_dict(actor_critic_keys, strict=False)
+
+    if hasattr(actor_critic, "std"):
+        actor_critic.std.data.fill_(0.5)
+    elif hasattr(actor_critic, "log_std"):
+        actor_critic.log_std.data.fill_(torch.log(torch.tensor(0.5, device=actor_critic.log_std.device)))
+    else:
+        raise AttributeError("Actor-critic policy does not expose 'std' or 'log_std' for action noise reset.")
+
+    runner.current_learning_iteration = 0
+    print("Loaded stand policy weights for forward fine-tuning; reset action std to 0.5.")
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -147,7 +191,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = _resolve_resume_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -171,8 +215,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+        if _is_forward_finetune_task(args_cli.task):
+            _load_forward_finetune_weights(runner, resume_path)
+        else:
+            # load previously trained model
+            runner.load(resume_path)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -18,6 +18,7 @@ RANGER_USD_PATH = RANGER_ASSET_DIR / "usd" / "ranger.usd"
 RANGER_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         usd_path=str(RANGER_USD_PATH),
+        activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
             max_linear_velocity=1000.0,
@@ -34,8 +35,20 @@ RANGER_CFG = ArticulationCfg(
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.6),
-        joint_pos={".*": 0.0},
+        pos=(0.0, 0.0, 0.75),
+        joint_pos={
+            # Recomputed from the current URDF and wheel meshes so that, with
+            # base_link spawned at z=0.75, the four wheel lowest points are
+            # nearly coplanar at ground height.
+            "g_lb": 0,
+            "g_lf": 0,
+            "g_rf": 0,
+            "g_rb": 0,
+            "w_lb": 0.0,
+            "w_lf": 0.0,
+            "w_rf": 0.0,
+            "w_rb": 0.0,
+        },
         joint_vel={".*": 0.0},
     ),
 
@@ -43,17 +56,17 @@ RANGER_CFG = ArticulationCfg(
     actuators={
         "leg_joints": ImplicitActuatorCfg(
             joint_names_expr=["g_.*"],
-            effort_limit_sim=300.0, # 最大等效力矩
-            velocity_limit_sim=5.0, # 最大关节角速度
-            stiffness=0.0,
-            damping=2.0,
+            effort_limit_sim=800.0, # 最大等效力矩
+            velocity_limit_sim=3.0, # 最大关节角速度
+            stiffness=2e4, # 最大关节刚度
+            damping=2e3,  # 最大关节阻尼
         ),
         "wheel_joints": ImplicitActuatorCfg(
             joint_names_expr=["w_.*"],
-            effort_limit_sim=100.0,
-            velocity_limit_sim=100.0,
-            stiffness=0.0,
-            damping=2.0,
+            effort_limit_sim=130.0,
+            velocity_limit_sim=40.0,
+            stiffness=0,
+            damping=1.0,
         ),
     },
 )

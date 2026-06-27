@@ -511,14 +511,67 @@ def left_right_wheel_height_balance_l2(
 
 def front_rear_stroke_balance_l2(
     env: ManagerBasedRLEnv,
+    sensor_names: tuple[str, ...] = ("mid360_lidar", "avia_lidar", "d435i_camera"),
+    asset_name: str = "robot",
+    x_range: tuple[float, float] = (0.0, 2.0),
+    y_range: tuple[float, float] = (-0.6, 0.6),
+    resolution: float = 0.1,
+    step_threshold: float = 0.08,
+    height_reference_x_range: tuple[float, float] = (0.0, 0.4),
+    height_reference_y_range: tuple[float, float] = (-0.3, 0.3),
+    slope_normalization: float = 0.6,
+    roughness_normalization: float = 0.05,
+    step_normalization: float = 0.15,
+    slope_weight: float = 0.4,
+    roughness_weight: float = 0.3,
+    step_weight: float = 0.3,
+    height_range_weight: float = 0.2,
+    flatness_gain: float = 4.0,
 ) -> torch.Tensor:
-    """Penalize front/rear hydraulic stroke difference."""
+    """Penalize front/rear hydraulic stroke difference only on flat terrain."""
 
+    flat_weight = get_flat_terrain_weight(
+        env=env,
+        sensor_names=sensor_names,
+        asset_name=asset_name,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+        step_threshold=step_threshold,
+        height_reference_x_range=height_reference_x_range,
+        height_reference_y_range=height_reference_y_range,
+        slope_normalization=slope_normalization,
+        roughness_normalization=roughness_normalization,
+        step_normalization=step_normalization,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        height_range_weight=height_range_weight,
+        flatness_gain=flatness_gain,
+    )
     leg_action_term = env.action_manager.get_term("leg_hydraulic")
     stroke_command = leg_action_term.stroke_command
     front_mean = stroke_command[:, 1:3].mean(dim=1)
     rear_mean = stroke_command[:, [0, 3]].mean(dim=1)
-    return torch.square(front_mean - rear_mean)
+    return flat_weight * torch.square(front_mean - rear_mean)
+
+
+def base_pitch_stroke_compensation_l2(
+    env: ManagerBasedRLEnv,
+    k_pitch: float = 1.0,
+    target_diff_limit: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Match front/rear stroke split to the measured base pitch."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, pitch, _ = euler_xyz_from_quat(asset.data.root_quat_w)
+    stroke_command = env.action_manager.get_term("leg_hydraulic").stroke_command
+    front_mean = stroke_command[:, [1, 2]].mean(dim=1)
+    rear_mean = stroke_command[:, [0, 3]].mean(dim=1)
+    actual_diff = front_mean - rear_mean
+    target_diff = torch.clamp(k_pitch * pitch, min=-target_diff_limit, max=target_diff_limit)
+    return torch.square(actual_diff - target_diff)
 
 
 def left_right_stroke_balance_l2(

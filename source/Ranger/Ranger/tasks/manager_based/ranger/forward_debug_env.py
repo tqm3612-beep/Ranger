@@ -54,6 +54,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "base_clearance",
             "clearance_error",
             "root_height_w",
+            "base_pitch_deg",
             "semantic_wheel_velocity_target_mean",
             "semantic_wheel_joint_vel_mean",
             "wheel_action_abs_mean",
@@ -66,6 +67,10 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "stroke_mean",
             "stroke_abs_mean",
             "stroke_rate_mean",
+            "front_stroke_mean",
+            "rear_stroke_mean",
+            "target_front_rear_stroke_diff",
+            "actual_front_rear_stroke_diff",
             "joint_pos_g_min",
             "joint_pos_g_max",
             "joint_pos_g_abs_max",
@@ -98,6 +103,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         leg_action_term = self.action_manager.get_term("leg_hydraulic")
         flat_base_clearance_params = self.cfg.rewards.flat_base_clearance.params
         flat_stroke_nominal_params = self.cfg.rewards.flat_stroke_nominal.params
+        pitch_stroke_comp_params = self.cfg.rewards.base_pitch_stroke_compensation.params
         flat_stroke_asset_cfg = flat_stroke_nominal_params.get("asset_cfg", SceneEntityCfg("robot"))
         flat_base_asset_cfg = flat_base_clearance_params.get("asset_cfg", SceneEntityCfg("robot"))
         flat_stroke_asset_name = flat_stroke_asset_cfg.name
@@ -108,6 +114,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
         roll_deg = torch.rad2deg(roll)
         pitch_deg = torch.rad2deg(pitch)
+        base_pitch_deg = pitch_deg
         flat_weight = mdp.get_flat_terrain_weight(
             env=self,
             sensor_names=flat_stroke_nominal_params["sensor_names"],
@@ -173,7 +180,15 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             wheel_joint_vel * self._wheel_forward_sign
         ).mean(dim=1)
 
-        front_rear_stroke_diff = stroke_command[:, 1:3].mean(dim=1) - stroke_command[:, [0, 3]].mean(dim=1)
+        front_stroke_mean = stroke_command[:, [1, 2]].mean(dim=1)
+        rear_stroke_mean = stroke_command[:, [0, 3]].mean(dim=1)
+        target_front_rear_stroke_diff = torch.clamp(
+            pitch_stroke_comp_params["k_pitch"] * pitch,
+            min=-0.15,
+            max=0.15,
+        )
+        actual_front_rear_stroke_diff = front_stroke_mean - rear_stroke_mean
+        front_rear_stroke_diff = actual_front_rear_stroke_diff
         left_right_stroke_diff = stroke_command[:, :2].mean(dim=1) - stroke_command[:, 2:].mean(dim=1)
         stroke_min = torch.min(stroke_command, dim=1).values
         stroke_max = torch.max(stroke_command, dim=1).values
@@ -202,6 +217,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "base_clearance": base_clearance,
             "clearance_error": clearance_error,
             "root_height_w": root_height_w,
+            "base_pitch_deg": base_pitch_deg,
             "semantic_wheel_velocity_target_mean": semantic_wheel_velocity_target_mean,
             "semantic_wheel_joint_vel_mean": semantic_wheel_joint_vel_mean,
             "wheel_action_abs_mean": wheel_action_abs_mean,
@@ -214,6 +230,10 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "stroke_mean": stroke_mean,
             "stroke_abs_mean": stroke_abs_mean,
             "stroke_rate_mean": stroke_rate_mean,
+            "front_stroke_mean": front_stroke_mean,
+            "rear_stroke_mean": rear_stroke_mean,
+            "target_front_rear_stroke_diff": target_front_rear_stroke_diff,
+            "actual_front_rear_stroke_diff": actual_front_rear_stroke_diff,
             "joint_pos_g_min": joint_pos_g_min,
             "joint_pos_g_max": joint_pos_g_max,
             "joint_pos_g_abs_max": joint_pos_g_abs_max,

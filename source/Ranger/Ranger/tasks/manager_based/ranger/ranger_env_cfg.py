@@ -426,6 +426,12 @@ class RewardsCfg:
     front_rear_stroke_balance = RewTerm(
         func=mdp.front_rear_stroke_balance_l2,
         weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS},
+    )
+    base_pitch_stroke_compensation = RewTerm(
+        func=mdp.base_pitch_stroke_compensation_l2,
+        weight=0.0,
+        params={"k_pitch": 1.0, "asset_cfg": SceneEntityCfg("robot")},
     )
     left_right_stroke_balance = RewTerm(
         func=mdp.left_right_stroke_balance_l2,
@@ -561,8 +567,8 @@ class RangerVisualEnvCfg(RangerEnvCfg):
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
         # Pull the camera back slightly so all visible robots fit in the initial view.
-        self.viewer.eye = (8.0, -8.0, 5.0)
-        self.viewer.lookat = (0.0, 0.0, 0.8)
+        self.viewer.eye = (5.0, 30.0, 5.0)
+        self.viewer.lookat = (5.0, 5.0, 0.8)
 
 
 @configclass
@@ -641,9 +647,11 @@ class RangerSimpleTerrainEnvCfg(RangerForwardEnvCfg):
         self.rewards.base_height_low.params["target_height"] = 0.75
         self.rewards.joint_limit_margin.weight = -1.0
         self.rewards.wheel_semantic_velocity_symmetry.weight = -0.03
-        self.rewards.front_rear_wheel_height_balance.weight = -6.0
+        self.rewards.front_rear_wheel_height_balance.weight = 0.0
         self.rewards.left_right_wheel_height_balance.weight = -3.0
         self.rewards.front_rear_stroke_balance.weight = -3.0
+        self.rewards.base_pitch_stroke_compensation.weight = -3.0
+        self.rewards.base_pitch_stroke_compensation.params["k_pitch"] = -1.0
         self.rewards.left_right_stroke_balance.weight = -1.0
         self.rewards.flat_stroke_nominal.weight = -6.0
         self.rewards.flat_stroke_high.weight = -10.0
@@ -663,5 +671,5 @@ class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
-        self.viewer.eye = (16.0, 16.0, 11.0)
-        self.viewer.lookat = (4.0, 4.0, 0.9)
+        self.viewer.eye = (-10.0, 20.0, 5.0)
+        self.viewer.lookat = (-10.0, 0.0, 0.8)

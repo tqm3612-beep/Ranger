@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse
 
 from . import mdp
 
@@ -15,10 +16,25 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         super().__init__(*args, **kwargs)
 
         robot = self.scene["robot"]
+        self._leg_joint_ids, _ = robot.find_joints(
+            ["g_lb", "g_lf", "g_rf", "g_rb"],
+            preserve_order=True,
+        )
         self._wheel_joint_ids, _ = robot.find_joints(
             ["w_lb", "w_lf", "w_rf", "w_rb"],
             preserve_order=True,
         )
+        self._wheel_body_ids, self._wheel_body_names = robot.find_bodies(
+            ["w_lb", "w_lf", "w_rf", "w_rb"],
+            preserve_order=True,
+        )
+        contact_sensor = self.scene.sensors["wheel_contact_forces"]
+        self._wheel_contact_body_ids, _ = contact_sensor.find_bodies(
+            self._wheel_body_names,
+            preserve_order=True,
+        )
+        leg_action_term = self.action_manager.get_term("leg_hydraulic")
+        self._prev_stroke_command = leg_action_term.stroke_command.clone()
 
         # Wheel joint forward sign.
         # Joint order: [w_lb, w_lf, w_rf, w_rb]
@@ -31,32 +47,23 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
 
         self._forward_debug_metric_names = (
             "base_lin_vel_x",
-            "wheel_velocity_target_mean",
             "semantic_wheel_velocity_target_mean",
-            "wheel_joint_vel_mean",
             "semantic_wheel_joint_vel_mean",
             "wheel_action_abs_mean",
-            "forward_progress_raw",
-            "target_w_lb",
-            "target_w_lf",
-            "target_w_rf",
-            "target_w_rb",
-            "joint_vel_w_lb",
-            "joint_vel_w_lf",
-            "joint_vel_w_rf",
-            "joint_vel_w_rb",
-            "semantic_target_w_lb",
-            "semantic_target_w_lf",
-            "semantic_target_w_rf",
-            "semantic_target_w_rb",
-            "semantic_joint_vel_w_lb",
-            "semantic_joint_vel_w_lf",
-            "semantic_joint_vel_w_rf",
-            "semantic_joint_vel_w_rb",
-            "raw_action_w_lb",
-            "raw_action_w_lf",
-            "raw_action_w_rf",
-            "raw_action_w_rb",
+            "roll_deg",
+            "pitch_deg",
+            "abs_roll_deg",
+            "abs_pitch_deg",
+            "stroke_abs_mean",
+            "stroke_rate_mean",
+            "front_rear_stroke_diff",
+            "left_right_stroke_diff",
+            "front_rear_wheel_z_diff",
+            "left_right_wheel_z_diff",
+            "contact_force_front_mean",
+            "contact_force_rear_mean",
+            "contact_force_left_mean",
+            "contact_force_right_mean",
         )
     
         self._forward_debug_metric_sums = {
@@ -73,18 +80,33 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
     def _compute_forward_debug_metric_values(self) -> dict[str, torch.Tensor]:
         robot = self.scene["robot"]
         wheel_action_term = self.action_manager.get_term("wheel_motor_csv")
+        leg_action_term = self.action_manager.get_term("leg_hydraulic")
 
         base_lin_vel_x = robot.data.root_lin_vel_b[:, 0]
+        roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+        roll_deg = torch.rad2deg(roll)
+        pitch_deg = torch.rad2deg(pitch)
 
         wheel_velocity_target = wheel_action_term.velocity_target
         wheel_joint_vel = robot.data.joint_vel[:, self._wheel_joint_ids]
         semantic_wheel_velocity_target = wheel_velocity_target * self._wheel_forward_sign
         semantic_wheel_joint_vel = wheel_joint_vel * self._wheel_forward_sign
-
-        # Raw physical joint-space mean. This is kept for debugging, but after adding
-        # wheel_forward_sign it is no longer a good "forward motion" indicator.
-        wheel_velocity_target_mean = wheel_velocity_target.mean(dim=1)
-        wheel_joint_vel_mean = wheel_joint_vel.mean(dim=1)
+        stroke_command = leg_action_term.stroke_command
+        stroke_rate = torch.abs(stroke_command - self._prev_stroke_command) / max(self.step_dt, 1.0e-6)
+        wheel_pos_w = robot.data.body_pos_w[:, self._wheel_body_ids, :]
+        wheel_pos_w_rel = wheel_pos_w - robot.data.root_pos_w.unsqueeze(1)
+        wheel_pos_b = quat_apply_inverse(
+            robot.data.root_quat_w.unsqueeze(1).expand(-1, len(self._wheel_body_ids), -1).reshape(-1, 4),
+            wheel_pos_w_rel.reshape(-1, 3),
+        ).reshape(self.num_envs, len(self._wheel_body_ids), 3)
+        wheel_contact_sensor = self.scene.sensors["wheel_contact_forces"]
+        wheel_contact_force = torch.mean(
+            torch.norm(
+                wheel_contact_sensor.data.net_forces_w_history[:, :, self._wheel_contact_body_ids, :],
+                dim=-1,
+            ),
+            dim=1,
+        )
 
         # Semantic forward-direction mean.
         # Positive value means the wheels are commanded / rotating in the robot-forward direction.
@@ -96,46 +118,38 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             wheel_joint_vel * self._wheel_forward_sign
         ).mean(dim=1)
 
+        front_rear_stroke_diff = stroke_command[:, 1:3].mean(dim=1) - stroke_command[:, [0, 3]].mean(dim=1)
+        left_right_stroke_diff = stroke_command[:, :2].mean(dim=1) - stroke_command[:, 2:].mean(dim=1)
+        stroke_abs_mean = torch.mean(torch.abs(stroke_command), dim=1)
+        stroke_rate_mean = torch.mean(stroke_rate, dim=1)
+        front_rear_wheel_z_diff = wheel_pos_b[:, 1:3, 2].mean(dim=1) - wheel_pos_b[:, [0, 3], 2].mean(dim=1)
+        left_right_wheel_z_diff = wheel_pos_b[:, :2, 2].mean(dim=1) - wheel_pos_b[:, 2:, 2].mean(dim=1)
         wheel_action_abs_mean = torch.mean(torch.abs(wheel_action_term.raw_actions), dim=1)
-        forward_progress_raw = mdp.forward_velocity_reward(self, speed_scale=1.0)
+        contact_force_front_mean = wheel_contact_force[:, 1:3].mean(dim=1)
+        contact_force_rear_mean = wheel_contact_force[:, [0, 3]].mean(dim=1)
+        contact_force_left_mean = wheel_contact_force[:, :2].mean(dim=1)
+        contact_force_right_mean = wheel_contact_force[:, 2:].mean(dim=1)
+        self._prev_stroke_command.copy_(stroke_command)
 
         return {
             "base_lin_vel_x": base_lin_vel_x,
-            "wheel_velocity_target_mean": wheel_velocity_target_mean,
             "semantic_wheel_velocity_target_mean": semantic_wheel_velocity_target_mean,
-            "wheel_joint_vel_mean": wheel_joint_vel_mean,
             "semantic_wheel_joint_vel_mean": semantic_wheel_joint_vel_mean,
             "wheel_action_abs_mean": wheel_action_abs_mean,
-            "forward_progress_raw": forward_progress_raw,
-            
-            # per-wheel physical joint-space target
-            "target_w_lb": wheel_velocity_target[:, 0],
-            "target_w_lf": wheel_velocity_target[:, 1],
-            "target_w_rf": wheel_velocity_target[:, 2],
-            "target_w_rb": wheel_velocity_target[:, 3],
-
-            # per-wheel physical joint velocity
-            "joint_vel_w_lb": wheel_joint_vel[:, 0],
-            "joint_vel_w_lf": wheel_joint_vel[:, 1],
-            "joint_vel_w_rf": wheel_joint_vel[:, 2],
-            "joint_vel_w_rb": wheel_joint_vel[:, 3],
-
-            # per-wheel semantic forward target
-            "semantic_target_w_lb": semantic_wheel_velocity_target[:, 0],
-            "semantic_target_w_lf": semantic_wheel_velocity_target[:, 1],
-            "semantic_target_w_rf": semantic_wheel_velocity_target[:, 2],
-            "semantic_target_w_rb": semantic_wheel_velocity_target[:, 3],
-
-            # per-wheel semantic forward joint velocity
-            "semantic_joint_vel_w_lb": semantic_wheel_joint_vel[:, 0],
-            "semantic_joint_vel_w_lf": semantic_wheel_joint_vel[:, 1],
-            "semantic_joint_vel_w_rf": semantic_wheel_joint_vel[:, 2],
-            "semantic_joint_vel_w_rb": semantic_wheel_joint_vel[:, 3],
-
-            "raw_action_w_lb": wheel_action_term.raw_actions[:, 0],
-            "raw_action_w_lf": wheel_action_term.raw_actions[:, 1],
-            "raw_action_w_rf": wheel_action_term.raw_actions[:, 2],
-            "raw_action_w_rb": wheel_action_term.raw_actions[:, 3],
+            "roll_deg": roll_deg,
+            "pitch_deg": pitch_deg,
+            "abs_roll_deg": torch.abs(roll_deg),
+            "abs_pitch_deg": torch.abs(pitch_deg),
+            "stroke_abs_mean": stroke_abs_mean,
+            "stroke_rate_mean": stroke_rate_mean,
+            "front_rear_stroke_diff": front_rear_stroke_diff,
+            "left_right_stroke_diff": left_right_stroke_diff,
+            "front_rear_wheel_z_diff": front_rear_wheel_z_diff,
+            "left_right_wheel_z_diff": left_right_wheel_z_diff,
+            "contact_force_front_mean": contact_force_front_mean,
+            "contact_force_rear_mean": contact_force_rear_mean,
+            "contact_force_left_mean": contact_force_left_mean,
+            "contact_force_right_mean": contact_force_right_mean,
         }
 
     def _accumulate_forward_debug_metrics(self) -> None:
@@ -216,6 +230,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
     def _reset_idx(self, env_ids):
         debug_logs = self._consume_forward_debug_logs(env_ids)
         super()._reset_idx(env_ids)
+        leg_action_term = self.action_manager.get_term("leg_hydraulic")
+        self._prev_stroke_command[env_ids] = leg_action_term.stroke_command[env_ids]
         self.extras["log"].update(debug_logs)
 
     def render(self, recompute: bool = False) -> np.ndarray | None:

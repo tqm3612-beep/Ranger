@@ -147,11 +147,15 @@ class WheelMotorCSVAction(ActionTerm):
 
 
 class HydraulicActuatorAction(ActionTerm):
-    """Equivalent hydraulic actuator action using a fixed impedance controller.
+    """Equivalent hydraulic actuator action using position targets.
 
-    In this project version the policy outputs a normalized stroke target. The
-    action term converts it to a joint-angle target through the stroke lookup,
-    then applies impedance torque on the equivalent hydraulic joints.
+    Policy outputs normalized suspension commands. The action term maps them to
+    physical desired cylinder strokes ``stroke_des``, optionally filters and
+    rate-limits the command, and maps the stroke command to equivalent g_*
+    joint position targets. ``joint_position_sign`` is applied per joint so
+    larger ``stroke_des`` always means raising the corresponding wheel in the
+    unified policy semantics. The existing implicit actuator executes the low-
+    level position/impedance behavior in simulation.
     """
 
     cfg: "HydraulicActuatorActionCfg"
@@ -169,12 +173,16 @@ class HydraulicActuatorAction(ActionTerm):
 
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
-        self._stroke_actual = torch.zeros_like(self._raw_actions)
+        self._stroke_des = torch.zeros_like(self._raw_actions)
+        self._stroke_command = torch.zeros_like(self._raw_actions)
         self._position_target = torch.zeros_like(self._raw_actions)
         self._effort_actual = torch.zeros_like(self._raw_actions)
 
         self._stroke_table = torch.tensor(self.cfg.stroke_table, dtype=torch.float32, device=self.device)
         self._joint_pos_table = torch.tensor(self.cfg.joint_pos_table, dtype=torch.float32, device=self.device)
+        self._joint_position_sign = torch.tensor(
+            self.cfg.joint_position_sign, dtype=torch.float32, device=self.device
+        ).view(1, -1)
         if self._stroke_table.ndim != 1 or self._joint_pos_table.ndim != 1:
             raise ValueError("stroke_table and joint_pos_table must be one-dimensional.")
         if self._stroke_table.numel() != self._joint_pos_table.numel():
@@ -183,6 +191,10 @@ class HydraulicActuatorAction(ActionTerm):
             raise ValueError("stroke_table and joint_pos_table must contain at least two points.")
         if not torch.all(self._stroke_table[1:] > self._stroke_table[:-1]):
             raise ValueError("stroke_table must be strictly increasing.")
+        if self._joint_position_sign.shape[1] != self._num_joints:
+            raise ValueError(
+                "joint_position_sign must have the same length as the number of matched hydraulic joints."
+            )
 
         self._stroke_min = float(self.cfg.stroke_min)
         self._stroke_max = float(self.cfg.stroke_max)
@@ -203,8 +215,9 @@ class HydraulicActuatorAction(ActionTerm):
 
         self._stroke_mid = 0.5 * (self._stroke_min + self._stroke_max)
         self._stroke_half_range = 0.5 * (self._stroke_max - self._stroke_min)
-        self._stroke_actual[:] = self._stroke_mid
-        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual)
+        self._stroke_des[:] = self._stroke_mid
+        self._stroke_command[:] = self._stroke_mid
+        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_command) * self._joint_position_sign
 
         self._clip = _build_clip_tensor(
             clip=self.cfg.clip,
@@ -224,22 +237,42 @@ class HydraulicActuatorAction(ActionTerm):
 
     @property
     def processed_actions(self) -> torch.Tensor:
-        """Current torque command applied on the equivalent hydraulic joints."""
+        """Current joint position targets applied on the equivalent hydraulic joints."""
         return self._processed_actions
 
     @property
+    def stroke_des(self) -> torch.Tensor:
+        """Current physical desired cylinder stroke commanded by the policy."""
+        return self._stroke_des
+
+    @property
+    def stroke_command(self) -> torch.Tensor:
+        """Current filtered and rate-limited stroke command used inside simulation."""
+        return self._stroke_command
+
+    @property
+    def stroke_cmd(self) -> torch.Tensor:
+        """Alias for the filtered stroke command."""
+        return self._stroke_command
+
+    @property
     def stroke_actual(self) -> torch.Tensor:
-        """Current virtual cylinder stroke after actuator dynamics."""
-        return self._stroke_actual
+        """Backward-compatible alias for the filtered stroke command, not a measured physical stroke."""
+        return self._stroke_command
 
     @property
     def position_target(self) -> torch.Tensor:
-        """Current mapped joint position target from the stroke state."""
+        """Current mapped joint position target from the stroke command."""
         return self._position_target
 
     @property
+    def joint_position_sign(self) -> torch.Tensor:
+        """Per-joint sign used to keep ``stroke_des`` semantics consistent across legs."""
+        return self._joint_position_sign
+
+    @property
     def effort_actual(self) -> torch.Tensor:
-        """Current equivalent effort command applied by the actuator term."""
+        """Compatibility tensor; not used in position-target mode."""
         return self._effort_actual
 
     def process_actions(self, actions: torch.Tensor) -> None:
@@ -247,31 +280,29 @@ class HydraulicActuatorAction(ActionTerm):
         if self._clip is not None:
             self._raw_actions[:] = torch.clamp(self._raw_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1])
 
-        joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
-        joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
-
         stroke_des = self._stroke_mid + torch.clamp(self._raw_actions, min=-1.0, max=1.0) * self._stroke_half_range
-        stroke_des = torch.clamp(stroke_des, min=self._stroke_min, max=self._stroke_max)
+        self._stroke_des[:] = torch.clamp(stroke_des, min=self._stroke_min, max=self._stroke_max)
 
         if self._time_constant > 0.0:
             alpha = self._env.step_dt / (self._time_constant + self._env.step_dt)
-            stroke_target = self._stroke_actual + alpha * (stroke_des - self._stroke_actual)
+            stroke_target = self._stroke_command + alpha * (self._stroke_des - self._stroke_command)
         else:
-            stroke_target = stroke_des
+            stroke_target = self._stroke_des
 
         max_delta = self._stroke_rate_limit * self._env.step_dt
-        stroke_delta = torch.clamp(stroke_target - self._stroke_actual, min=-max_delta, max=max_delta)
-        self._stroke_actual[:] = torch.clamp(
-            self._stroke_actual + stroke_delta, min=self._stroke_min, max=self._stroke_max
+        stroke_delta = torch.clamp(stroke_target - self._stroke_command, min=-max_delta, max=max_delta)
+        self._stroke_command[:] = torch.clamp(
+            self._stroke_command + stroke_delta, min=self._stroke_min, max=self._stroke_max
         )
-        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual)
-
-        effort = self._impedance_kp * (self._position_target - joint_pos) - self._impedance_kd * joint_vel
-        self._effort_actual[:] = torch.clamp(effort, min=-self._max_effort, max=self._max_effort)
-        self._processed_actions[:] = self._effort_actual
+        base_position_target = self._interp_stroke_to_joint_pos(self._stroke_command)
+        position_target = base_position_target * self._joint_position_sign
+        joint_limits = self._asset.data.soft_joint_pos_limits[:, self._joint_ids]
+        self._position_target[:] = torch.clamp(position_target, min=joint_limits[..., 0], max=joint_limits[..., 1])
+        self._effort_actual.zero_()
+        self._processed_actions[:] = self._position_target
 
     def apply_actions(self) -> None:
-        self._asset.set_joint_effort_target(self._processed_actions, joint_ids=self._joint_ids)
+        self._asset.set_joint_position_target(self._processed_actions, joint_ids=self._joint_ids)
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         if env_ids is None:
@@ -279,8 +310,11 @@ class HydraulicActuatorAction(ActionTerm):
         self._raw_actions[env_ids] = 0.0
         self._processed_actions[env_ids] = 0.0
         self._effort_actual[env_ids] = 0.0
-        self._stroke_actual[env_ids] = self._stroke_mid
-        self._position_target[env_ids] = self._interp_stroke_to_joint_pos(self._stroke_actual[env_ids])
+        self._stroke_des[env_ids] = self._stroke_mid
+        self._stroke_command[env_ids] = self._stroke_mid
+        self._position_target[env_ids] = (
+            self._interp_stroke_to_joint_pos(self._stroke_command[env_ids]) * self._joint_position_sign
+        )
 
     def _interp_stroke_to_joint_pos(self, stroke: torch.Tensor) -> torch.Tensor:
         stroke_clamped = torch.clamp(stroke, min=self._stroke_table[0], max=self._stroke_table[-1])
@@ -326,16 +360,26 @@ class HydraulicActuatorActionCfg(ActionTermCfg):
     preserve_order: bool = False
 
     stroke_min: float = 0.0
+    """Physical desired stroke lower bound."""
     stroke_max: float = 1.0
+    """Physical desired stroke upper bound."""
     stroke_rate_limit: float = 1.0
+    """Command safety limit applied to ``stroke_des`` before position-target mapping."""
     time_constant: float = 0.08
+    """First-order command filter applied to ``stroke_des`` before position-target mapping."""
 
     stroke_table: tuple[float, ...] = (0.0, 0.5, 1.0)
+    """Calibration lookup from desired cylinder stroke to equivalent joint angle."""
     joint_pos_table: tuple[float, ...] = (-1.0, 0.0, 1.0)
+    """Equivalent joint-angle calibration corresponding to :attr:`stroke_table`."""
+    joint_position_sign: tuple[float, ...] = (1.0, -1.0, 1.0, -1.0)
+    """Per-joint sign that makes larger ``stroke_des`` mean raising the corresponding wheel."""
 
     max_effort: float = 300.0
     impedance_kp: float = 250.0
+    """Fixed low-level impedance proportional gain."""
     impedance_kd: float = 30.0
+    """Fixed low-level impedance derivative gain."""
 
 
 def _build_clip_tensor(

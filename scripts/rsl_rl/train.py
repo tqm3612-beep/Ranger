@@ -110,7 +110,12 @@ def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str
 
 
 def _is_forward_finetune_task(task_name: str) -> bool:
-    return task_name.split(":")[-1] in {"Template-Ranger-Forward-v0", "Template-Ranger-Forward-Visual-v0"}
+    return task_name.split(":")[-1] in {
+        "Template-Ranger-Forward-v0",
+        "Template-Ranger-Forward-Visual-v0",
+        "Template-Ranger-SimpleTerrain-v0",
+        "Template-Ranger-SimpleTerrain-Visual-v0",
+    }
 
 
 def _load_forward_finetune_weights(runner: OnPolicyRunner, checkpoint_path: str) -> None:

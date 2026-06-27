@@ -20,6 +20,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
+from .terrain_cfg import SIMPLE_TERRAIN_CFG
 
 GOAL_STATE_PARAMS = {
     # Stage-1 neutral input: goal_valid=0 and [sin, cos] = [0, 1].
@@ -172,6 +173,14 @@ class RangerSceneCfg(InteractiveSceneCfg):
     )
 
 
+@configclass
+class RangerSimpleTerrainSceneCfg(RangerSceneCfg):
+    """Scene configuration that swaps the flat cuboid for a low-difficulty generated terrain."""
+
+    ground = None
+    terrain = SIMPLE_TERRAIN_CFG
+
+
 ##
 # MDP settings
 ##
@@ -181,6 +190,11 @@ class RangerSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
+    # The first four policy outputs are normalized desired suspension-stroke
+    # commands. On hardware these correspond to the four suspension
+    # actuators' desired cylinder strokes. In simulation we map stroke_des
+    # through stroke_table -> joint_pos_table and execute it with a fixed
+    # impedance/PD effort controller on the equivalent g_* joints.
     leg_hydraulic = mdp.HydraulicActuatorActionCfg(
         asset_name="robot",
         joint_names=["g_lb", "g_lf", "g_rf", "g_rb"],
@@ -321,7 +335,22 @@ class RewardsCfg:
         weight=3,
         params={"speed_scale": 1.0},
     )
+    velocity_tracking = RewTerm(
+        func=mdp.forward_velocity_tracking_exp,
+        weight=0.0,
+        params={"target_speed": 0.45, "std": 0.2},
+    )
+    overspeed = RewTerm(
+        func=mdp.overspeed_l2,
+        weight=0.0,
+        params={"target_speed": 0.45},
+    )
     upright = RewTerm(func=mdp.flat_orientation_l2, weight=-2.0)
+    base_height_low = RewTerm(
+        func=mdp.base_height_below_target_l2,
+        weight=0.0,
+        params={"target_height": 0.42},
+    )
     base_vertical_velocity = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
     base_roll_pitch_rate = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.2)
     lateral_velocity = RewTerm(func=mdp.lin_vel_y_l2, weight=-0.5)
@@ -339,6 +368,15 @@ class RewardsCfg:
         func=mdp.joint_vel_l2,
         weight=-0.005,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+    )
+    joint_limit_margin = RewTerm(
+        func=mdp.joint_limit_margin_penalty,
+        weight=0.0,
+        params={"margin_ratio": 0.15, "asset_cfg": SceneEntityCfg("robot", joint_names=["g_.*"])},
+    )
+    wheel_semantic_velocity_symmetry = RewTerm(
+        func=mdp.wheel_semantic_velocity_symmetry_l2,
+        weight=0.0,
     )
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-0.001)
@@ -484,6 +522,44 @@ class RangerForwardEnvCfg(RangerStandEnvCfg):
 @configclass
 class RangerForwardVisualEnvCfg(RangerForwardEnvCfg):
     """Forward-stage scene tuned for interactive visualization."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.scene.env_spacing = 8.0
+        self.viewer.eye = (8.0, -8.0, 5.0)
+        self.viewer.lookat = (0.0, 0.0, 0.8)
+
+
+@configclass
+class RangerSimpleTerrainEnvCfg(RangerForwardEnvCfg):
+    """Stage-3 forward locomotion on mild terrain with neutral local map input."""
+
+    scene: RangerSimpleTerrainSceneCfg = RangerSimpleTerrainSceneCfg(num_envs=4096, env_spacing=4.0)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.episode_length_s = 6.0
+        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+
+        self.terminations.bad_orientation.params["limit_angle"] = 0.85
+        self.terminations.root_height_low.params["minimum_height"] = 0.4
+
+        self.rewards.forward_progress.weight = 0.0
+        self.rewards.velocity_tracking.weight = 2.5
+        self.rewards.overspeed.weight = -2.0
+        self.rewards.base_height_low.weight = -5.0
+        self.rewards.joint_limit_margin.weight = -1.0
+        self.rewards.wheel_semantic_velocity_symmetry.weight = -0.03
+        self.rewards.action_rate.weight = -0.03
+
+
+@configclass
+class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
+    """Simple-terrain forward scene tuned for interactive visualization."""
+
+    scene: RangerSimpleTerrainSceneCfg = RangerSimpleTerrainSceneCfg(num_envs=4, env_spacing=8.0)
 
     def __post_init__(self) -> None:
         super().__post_init__()

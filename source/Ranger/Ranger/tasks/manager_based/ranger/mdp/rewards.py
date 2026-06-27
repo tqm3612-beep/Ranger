@@ -29,6 +29,46 @@ def forward_velocity_reward(
     return torch.clamp(forward_speed / speed_scale, min=0.0)
 
 
+def forward_velocity_tracking_exp(
+    env: ManagerBasedRLEnv,
+    target_speed: float = 0.45,
+    std: float = 0.2,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward body-frame forward speed that stays close to a target cruising speed."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    forward_speed = asset.data.root_lin_vel_b[:, 0]
+    speed_error = forward_speed - target_speed
+    std_sq = max(std * std, 1e-6)
+    return torch.exp(-torch.square(speed_error) / std_sq)
+
+
+def overspeed_l2(
+    env: ManagerBasedRLEnv,
+    target_speed: float = 0.45,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize body-frame forward speed only when it exceeds the target cruising speed."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    forward_speed = asset.data.root_lin_vel_b[:, 0]
+    overspeed = torch.clamp(forward_speed - target_speed, min=0.0)
+    return torch.square(overspeed)
+
+
+def base_height_below_target_l2(
+    env: ManagerBasedRLEnv,
+    target_height: float = 0.42,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize the base only when it drops below the target height."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    height_error = torch.clamp(target_height - asset.data.root_pos_w[:, 2], min=0.0)
+    return torch.square(height_error)
+
+
 def lin_vel_y_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """Penalize lateral base velocity using an L2 squared kernel."""
 
@@ -44,6 +84,35 @@ def joint_pos_target_l2(env: ManagerBasedRLEnv, target: float, asset_cfg: SceneE
     joint_pos = wrap_to_pi(asset.data.joint_pos[:, asset_cfg.joint_ids])
     # compute the reward
     return torch.sum(torch.square(joint_pos - target), dim=1)
+
+
+def joint_limit_margin_penalty(
+    env: ManagerBasedRLEnv,
+    margin_ratio: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize joints that enter a configurable margin near their soft position limits."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    joint_limits = asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids]
+    dist_to_lower = joint_pos - joint_limits[..., 0]
+    dist_to_upper = joint_limits[..., 1] - joint_pos
+    min_margin = torch.minimum(dist_to_lower, dist_to_upper)
+    half_range = 0.5 * (joint_limits[..., 1] - joint_limits[..., 0])
+    normalized_margin = min_margin / torch.clamp(half_range, min=1e-6)
+    return torch.sum(torch.clamp(margin_ratio - normalized_margin, min=0.0), dim=1)
+
+
+def wheel_semantic_velocity_symmetry_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize mismatch between left/right mean semantic wheel velocity targets."""
+
+    wheel_action_term = env.action_manager.get_term("wheel_motor_csv")
+    wheel_forward_sign = torch.tensor([-1.0, -1.0, 1.0, 1.0], dtype=torch.float32, device=env.device).unsqueeze(0)
+    semantic_target = wheel_action_term.velocity_target * wheel_forward_sign
+    left_mean = semantic_target[:, :2].mean(dim=1)
+    right_mean = semantic_target[:, 2:].mean(dim=1)
+    return torch.square(left_mean - right_mean)
 
 
 def wheel_contact_count_reward(

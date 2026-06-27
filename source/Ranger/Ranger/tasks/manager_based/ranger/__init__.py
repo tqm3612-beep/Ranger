@@ -71,3 +71,23 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Template-Ranger-SimpleTerrain-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerSimpleTerrainEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Template-Ranger-SimpleTerrain-Visual-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerSimpleTerrainVisualEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)

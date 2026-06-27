@@ -40,6 +40,14 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+    if getattr(args_cli, "width", None) is None:
+        args_cli.width = 1920
+    if getattr(args_cli, "height", None) is None:
+        args_cli.height = 1080
+    if getattr(args_cli, "window_width", None) is None:
+        args_cli.window_width = 1920
+    if getattr(args_cli, "window_height", None) is None:
+        args_cli.window_height = 1080
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -54,6 +62,7 @@ import gymnasium as gym
 import os
 import time
 import torch
+from pxr import UsdGeom
 
 from rsl_rl.runners import OnPolicyRunner
 
@@ -73,8 +82,44 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, expor
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from isaacsim.core.utils.viewports import set_camera_view
 
 import Ranger.tasks  # noqa: F401
+from video_utils import HighQualityRecordVideo
+
+
+def _configure_video_viewer(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg) -> None:
+    """Mirror the default viewer to the right-side diagonal during video capture."""
+
+    if not args_cli.video:
+        return
+    if args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
+        env_cfg.viewer.eye = (16.0, 16.0, 11.0)
+        env_cfg.viewer.lookat = (4.0, 4.0, 0.9)
+        return
+    eye_x, eye_y, eye_z = env_cfg.viewer.eye
+    env_cfg.viewer.eye = (eye_x, abs(eye_y), eye_z)
+
+
+def _configure_simpleterrain_visual_camera(env) -> None:
+    """Apply the fixed recording view and narrower FOV only for the visual simple-terrain task."""
+
+    if not args_cli.video or args_cli.task.split(":")[-1] != "Template-Ranger-SimpleTerrain-Visual-v0":
+        return
+
+    unwrapped_env = env.unwrapped
+    eye = (16.0, 16.0, 11.0)
+    target = (4.0, 4.0, 0.9)
+    try:
+        set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
+    except TypeError:
+        set_camera_view(eye, target, camera_prim_path="/OmniverseKit_Persp")
+    except Exception:
+        unwrapped_env.sim.set_camera_view(eye, target)
+
+    camera_prim = UsdGeom.Camera(unwrapped_env.sim.stage.GetPrimAtPath("/OmniverseKit_Persp"))
+    if camera_prim:
+        camera_prim.GetFocalLengthAttr().Set(30.5)
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -90,6 +135,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     agent_cfg.device = args_cli.device if args_cli.device is not None else agent_cfg.device
+    _configure_video_viewer(env_cfg)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -109,6 +155,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    _configure_simpleterrain_visual_camera(env)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -124,7 +171,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         }
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        env = HighQualityRecordVideo(env, **video_kwargs)
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)

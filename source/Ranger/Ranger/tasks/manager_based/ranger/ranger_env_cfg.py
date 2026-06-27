@@ -54,6 +54,24 @@ LOCAL_NAVIGATION_MAP_PARAMS = {
     "use_neutral_map": False,
 }
 
+FLAT_TERRAIN_REWARD_MAP_PARAMS = {
+    "sensor_names": LOCAL_NAVIGATION_MAP_PARAMS["sensor_names"],
+    "x_range": LOCAL_NAVIGATION_MAP_PARAMS["x_range"],
+    "y_range": LOCAL_NAVIGATION_MAP_PARAMS["y_range"],
+    "resolution": LOCAL_NAVIGATION_MAP_PARAMS["resolution"],
+    "step_threshold": LOCAL_NAVIGATION_MAP_PARAMS["step_threshold"],
+    "height_reference_x_range": LOCAL_NAVIGATION_MAP_PARAMS["height_reference_x_range"],
+    "height_reference_y_range": LOCAL_NAVIGATION_MAP_PARAMS["height_reference_y_range"],
+    "slope_normalization": LOCAL_NAVIGATION_MAP_PARAMS["slope_normalization"],
+    "roughness_normalization": LOCAL_NAVIGATION_MAP_PARAMS["roughness_normalization"],
+    "step_normalization": LOCAL_NAVIGATION_MAP_PARAMS["step_normalization"],
+    "slope_weight": LOCAL_NAVIGATION_MAP_PARAMS["slope_weight"],
+    "roughness_weight": LOCAL_NAVIGATION_MAP_PARAMS["roughness_weight"],
+    "step_weight": LOCAL_NAVIGATION_MAP_PARAMS["step_weight"],
+    "height_range_weight": 0.2,
+    "flatness_gain": 4.0,
+}
+
 
 def _navigation_map_grid_shape(resolution: float, x_range: tuple[float, float], y_range: tuple[float, float]) -> tuple[int, int]:
     num_x = int(round((x_range[1] - x_range[0]) / resolution)) + 1
@@ -345,7 +363,24 @@ class RewardsCfg:
         weight=0.0,
         params={"target_speed": 0.45},
     )
+    underspeed = RewTerm(
+        func=mdp.underspeed_l2,
+        weight=0.0,
+        params={"target_speed": 0.45},
+    )
     upright = RewTerm(func=mdp.flat_orientation_l2, weight=-2.0)
+    roll_angle = RewTerm(func=mdp.roll_angle_l2, weight=0.0)
+    roll_angle_limit = RewTerm(
+        func=mdp.roll_angle_limit_l2,
+        weight=0.0,
+        params={"allowed_roll_deg": 3.0},
+    )
+    pitch_angle = RewTerm(func=mdp.pitch_angle_l2, weight=0.0)
+    pitch_angle_limit = RewTerm(
+        func=mdp.pitch_angle_limit_l2,
+        weight=0.0,
+        params={"allowed_pitch_deg": 3.0},
+    )
     base_height_low = RewTerm(
         func=mdp.base_height_below_target_l2,
         weight=0.0,
@@ -377,6 +412,49 @@ class RewardsCfg:
     wheel_semantic_velocity_symmetry = RewTerm(
         func=mdp.wheel_semantic_velocity_symmetry_l2,
         weight=0.0,
+    )
+    front_rear_wheel_height_balance = RewTerm(
+        func=mdp.front_rear_wheel_height_balance_l2,
+        weight=0.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    left_right_wheel_height_balance = RewTerm(
+        func=mdp.left_right_wheel_height_balance_l2,
+        weight=0.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    front_rear_stroke_balance = RewTerm(
+        func=mdp.front_rear_stroke_balance_l2,
+        weight=0.0,
+    )
+    left_right_stroke_balance = RewTerm(
+        func=mdp.left_right_stroke_balance_l2,
+        weight=0.0,
+    )
+    flat_stroke_nominal = RewTerm(
+        func=mdp.flat_stroke_nominal_l2,
+        weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS, "stroke_nominal": 0.4},
+    )
+    flat_stroke_high = RewTerm(
+        func=mdp.flat_stroke_high_l2,
+        weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS, "stroke_mean_limit": 0.55},
+    )
+    flat_base_clearance = RewTerm(
+        func=mdp.flat_base_clearance_l2,
+        weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS, "asset_cfg": SceneEntityCfg("robot"), "clearance_nominal": 0.85},
+    )
+    flat_root_height = RewTerm(
+        func=mdp.flat_root_height_l2,
+        weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS, "asset_cfg": SceneEntityCfg("robot"), "root_height_nominal": 0.85},
+    )
+    flat_attitude = RewTerm(
+        func=mdp.flat_attitude_l2,
+        weight=0.0,
+        params={**FLAT_TERRAIN_REWARD_MAP_PARAMS, "asset_cfg": SceneEntityCfg("robot")},
     )
     action_rate = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     action_magnitude = RewTerm(func=mdp.action_l2, weight=-0.001)
@@ -540,18 +618,38 @@ class RangerSimpleTerrainEnvCfg(RangerForwardEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        self.episode_length_s = 6.0
+        self.episode_length_s = 10.0
         self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.actions.leg_hydraulic.stroke_min = 0.25
+        self.actions.leg_hydraulic.stroke_max = 0.70
 
         self.terminations.bad_orientation.params["limit_angle"] = 0.85
         self.terminations.root_height_low.params["minimum_height"] = 0.4
 
         self.rewards.forward_progress.weight = 0.0
         self.rewards.velocity_tracking.weight = 2.5
+        self.rewards.velocity_tracking.params["target_speed"] = 1.0
         self.rewards.overspeed.weight = -2.0
+        self.rewards.overspeed.params["target_speed"] = 1.0
+        self.rewards.underspeed.weight = -2.0
+        self.rewards.underspeed.params["target_speed"] = 1.0
+        self.rewards.roll_angle.weight = -3.0
+        self.rewards.roll_angle_limit.weight = -20.0
+        self.rewards.pitch_angle.weight = -5.0
+        self.rewards.pitch_angle_limit.weight = -25.0
         self.rewards.base_height_low.weight = -5.0
+        self.rewards.base_height_low.params["target_height"] = 0.75
         self.rewards.joint_limit_margin.weight = -1.0
         self.rewards.wheel_semantic_velocity_symmetry.weight = -0.03
+        self.rewards.front_rear_wheel_height_balance.weight = -6.0
+        self.rewards.left_right_wheel_height_balance.weight = -3.0
+        self.rewards.front_rear_stroke_balance.weight = -3.0
+        self.rewards.left_right_stroke_balance.weight = -1.0
+        self.rewards.flat_stroke_nominal.weight = -6.0
+        self.rewards.flat_stroke_high.weight = -10.0
+        self.rewards.flat_base_clearance.weight = 0.0
+        self.rewards.flat_root_height.weight = -6.0
+        self.rewards.flat_attitude.weight = -2.0
         self.rewards.action_rate.weight = -0.03
 
 
@@ -565,5 +663,5 @@ class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
-        self.viewer.eye = (8.0, -8.0, 5.0)
-        self.viewer.lookat = (0.0, 0.0, 0.8)
+        self.viewer.eye = (16.0, 16.0, 11.0)
+        self.viewer.lookat = (4.0, 4.0, 0.9)

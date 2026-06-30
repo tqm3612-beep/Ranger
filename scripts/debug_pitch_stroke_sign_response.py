@@ -179,4 +179,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    simulation_app.close()
+    simulation_app.close(wait_for_replicator=False, skip_cleanup=True)

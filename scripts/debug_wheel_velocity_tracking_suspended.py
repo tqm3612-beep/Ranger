@@ -168,4 +168,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        simulation_app.close()
+        simulation_app.close(wait_for_replicator=False, skip_cleanup=True)

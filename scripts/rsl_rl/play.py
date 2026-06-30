@@ -234,4 +234,4 @@ if __name__ == "__main__":
     # run the main function
     main()
     # close sim app
-    simulation_app.close()
+    simulation_app.close(wait_for_replicator=False, skip_cleanup=True)

@@ -672,4 +672,49 @@ class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
         self.viewer.eye = (-10.0, 20.0, 5.0)
+        self.viewer.lookat = (-10.0, 5.0, 0.0)
+
+
+@configclass
+class RangerMapPostureEnvCfg(RangerSimpleTerrainEnvCfg):
+    """Stage-4 posture task that enables the real local map while keeping the stage-3 interface."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        local_map_params = self.observations.policy.local_navigation_map.params
+        local_map_params["use_neutral_map"] = False
+        local_map_params["apply_noise"] = False
+        local_map_params["valid_dropout_prob"] = 0.0
+        local_map_params["height_noise_std"] = 0.0
+        local_map_params["risk_noise_std"] = 0.0
+
+        self.rewards.velocity_tracking.weight = 2.5
+        self.rewards.velocity_tracking.params["target_speed"] = 1.0
+        self.rewards.overspeed.weight = -2.0
+        self.rewards.overspeed.params["target_speed"] = 1.0
+        self.rewards.underspeed.weight = -2.0
+        self.rewards.underspeed.params["target_speed"] = 1.0
+
+        self.rewards.roll_angle.weight = -4.0
+        self.rewards.pitch_angle.weight = -6.0
+        self.rewards.roll_angle_limit.weight = -25.0
+        self.rewards.pitch_angle_limit.weight = -30.0
+        self.rewards.base_vertical_velocity.weight = -1.0
+        self.rewards.base_roll_pitch_rate.weight = -0.3
+        self.rewards.joint_limit_margin.weight = -1.5
+        self.rewards.action_rate.weight = -0.04
+
+
+@configclass
+class RangerMapPostureVisualEnvCfg(RangerMapPostureEnvCfg):
+    """Stage-4 posture task tuned for interactive visualization."""
+
+    scene: RangerSimpleTerrainSceneCfg = RangerSimpleTerrainSceneCfg(num_envs=4, env_spacing=8.0)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 4
+        self.scene.env_spacing = 8.0
+        self.viewer.eye = (-10.0, 20.0, 5.0)
         self.viewer.lookat = (-10.0, 0.0, 0.8)

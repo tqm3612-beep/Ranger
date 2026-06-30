@@ -96,6 +96,34 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             device=self.device,
         )
 
+        self._eval_metric_names = (
+            "roll_rms_deg",
+            "pitch_rms_deg",
+            "roll_max_abs_deg",
+            "pitch_max_abs_deg",
+            "base_vertical_velocity_rms",
+            "base_roll_pitch_ang_vel_rms",
+            "average_forward_speed",
+            "velocity_tracking_error_rms",
+            "joint_limit_margin_penalty_mean",
+            "joint_limit_margin_count_mean",
+            "episode_length",
+            "success_rate",
+        )
+        self._eval_step_counts = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_roll_sq_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_pitch_sq_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_roll_abs_max = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_pitch_abs_max = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_base_vertical_velocity_sq_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_base_roll_pitch_ang_vel_sq_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_forward_speed_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_velocity_tracking_error_sq_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_joint_limit_margin_penalty_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_joint_limit_margin_count_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._eval_last_time_outs = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._eval_has_episode_result = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
 
     def _compute_forward_debug_metric_values(self) -> dict[str, torch.Tensor]:
         robot = self.scene["robot"]
@@ -254,6 +282,40 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         for name, value in metric_values.items():
             self._forward_debug_metric_sums[name] += value
         self._forward_debug_metric_counts += 1.0
+        self._accumulate_episode_eval_metrics(metric_values)
+
+    def _accumulate_episode_eval_metrics(self, metric_values: dict[str, torch.Tensor]) -> None:
+        robot = self.scene["robot"]
+        joint_limit_margin_params = self.cfg.rewards.joint_limit_margin.params
+        joint_pos = robot.data.joint_pos[:, self._leg_joint_ids]
+        joint_limits = robot.data.soft_joint_pos_limits[:, self._leg_joint_ids]
+        dist_to_lower = joint_pos - joint_limits[..., 0]
+        dist_to_upper = joint_limits[..., 1] - joint_pos
+        min_margin = torch.minimum(dist_to_lower, dist_to_upper)
+        half_range = 0.5 * (joint_limits[..., 1] - joint_limits[..., 0])
+        normalized_margin = min_margin / torch.clamp(half_range, min=1.0e-6)
+        margin_deficit = torch.clamp(joint_limit_margin_params["margin_ratio"] - normalized_margin, min=0.0)
+        joint_limit_margin_penalty = torch.sum(margin_deficit, dim=1)
+        joint_limit_margin_count = torch.sum(margin_deficit > 0.0, dim=1).to(torch.float32)
+
+        target_speed = float(self.cfg.rewards.velocity_tracking.params["target_speed"])
+        base_vertical_velocity = robot.data.root_lin_vel_b[:, 2]
+        base_roll_pitch_ang_vel_sq = torch.sum(torch.square(robot.data.root_ang_vel_b[:, :2]), dim=1)
+        velocity_tracking_error = metric_values["base_lin_vel_x"] - target_speed
+        abs_roll_deg = metric_values["abs_roll_deg"]
+        abs_pitch_deg = metric_values["abs_pitch_deg"]
+
+        self._eval_step_counts += 1.0
+        self._eval_roll_sq_sum += torch.square(metric_values["roll_deg"])
+        self._eval_pitch_sq_sum += torch.square(metric_values["pitch_deg"])
+        self._eval_roll_abs_max = torch.maximum(self._eval_roll_abs_max, abs_roll_deg)
+        self._eval_pitch_abs_max = torch.maximum(self._eval_pitch_abs_max, abs_pitch_deg)
+        self._eval_base_vertical_velocity_sq_sum += torch.square(base_vertical_velocity)
+        self._eval_base_roll_pitch_ang_vel_sq_sum += base_roll_pitch_ang_vel_sq
+        self._eval_forward_speed_sum += metric_values["base_lin_vel_x"]
+        self._eval_velocity_tracking_error_sq_sum += torch.square(velocity_tracking_error)
+        self._eval_joint_limit_margin_penalty_sum += joint_limit_margin_penalty
+        self._eval_joint_limit_margin_count_sum += joint_limit_margin_count
 
     def _consume_forward_debug_logs(self, env_ids) -> dict[str, float]:
         if isinstance(env_ids, slice):
@@ -271,6 +333,70 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             logs[f"Metrics/forward_debug/{name}"] = float(per_env_mean.mean().item())
             self._forward_debug_metric_sums[name][env_ids] = 0.0
         self._forward_debug_metric_counts[env_ids] = 0.0
+        return logs
+
+    def _consume_episode_eval_logs(self, env_ids) -> dict[str, float]:
+        if isinstance(env_ids, slice):
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        elif not isinstance(env_ids, torch.Tensor):
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+
+        if env_ids.numel() == 0:
+            return {}
+
+        finished_mask = self._eval_has_episode_result[env_ids]
+        if not torch.any(finished_mask):
+            return {}
+
+        env_ids = env_ids[finished_mask]
+        counts = self._eval_step_counts[env_ids]
+        valid_mask = counts > 0.0
+        if not torch.any(valid_mask):
+            return {}
+
+        env_ids = env_ids[valid_mask]
+        counts = torch.clamp(counts[valid_mask], min=1.0)
+
+        success_rate = self._eval_last_time_outs[env_ids].to(torch.float32)
+        logs = {
+            "Metrics/eval/num_episodes": float(env_ids.numel()),
+            "Metrics/eval/roll_rms_deg": float(torch.sqrt(self._eval_roll_sq_sum[env_ids] / counts).mean().item()),
+            "Metrics/eval/pitch_rms_deg": float(torch.sqrt(self._eval_pitch_sq_sum[env_ids] / counts).mean().item()),
+            "Metrics/eval/roll_max_abs_deg": float(self._eval_roll_abs_max[env_ids].mean().item()),
+            "Metrics/eval/pitch_max_abs_deg": float(self._eval_pitch_abs_max[env_ids].mean().item()),
+            "Metrics/eval/base_vertical_velocity_rms": float(
+                torch.sqrt(self._eval_base_vertical_velocity_sq_sum[env_ids] / counts).mean().item()
+            ),
+            "Metrics/eval/base_roll_pitch_ang_vel_rms": float(
+                torch.sqrt(self._eval_base_roll_pitch_ang_vel_sq_sum[env_ids] / counts).mean().item()
+            ),
+            "Metrics/eval/average_forward_speed": float((self._eval_forward_speed_sum[env_ids] / counts).mean().item()),
+            "Metrics/eval/velocity_tracking_error_rms": float(
+                torch.sqrt(self._eval_velocity_tracking_error_sq_sum[env_ids] / counts).mean().item()
+            ),
+            "Metrics/eval/joint_limit_margin_penalty_mean": float(
+                (self._eval_joint_limit_margin_penalty_sum[env_ids] / counts).mean().item()
+            ),
+            "Metrics/eval/joint_limit_margin_count_mean": float(
+                (self._eval_joint_limit_margin_count_sum[env_ids] / counts).mean().item()
+            ),
+            "Metrics/eval/episode_length": float(counts.mean().item()),
+            "Metrics/eval/success_rate": float(success_rate.mean().item()),
+        }
+
+        self._eval_step_counts[env_ids] = 0.0
+        self._eval_roll_sq_sum[env_ids] = 0.0
+        self._eval_pitch_sq_sum[env_ids] = 0.0
+        self._eval_roll_abs_max[env_ids] = 0.0
+        self._eval_pitch_abs_max[env_ids] = 0.0
+        self._eval_base_vertical_velocity_sq_sum[env_ids] = 0.0
+        self._eval_base_roll_pitch_ang_vel_sq_sum[env_ids] = 0.0
+        self._eval_forward_speed_sum[env_ids] = 0.0
+        self._eval_velocity_tracking_error_sq_sum[env_ids] = 0.0
+        self._eval_joint_limit_margin_penalty_sum[env_ids] = 0.0
+        self._eval_joint_limit_margin_count_sum[env_ids] = 0.0
+        self._eval_last_time_outs[env_ids] = False
+        self._eval_has_episode_result[env_ids] = False
         return logs
 
     def step(self, action: torch.Tensor):
@@ -306,6 +432,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
 
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_env_ids) > 0:
+            self._eval_last_time_outs[reset_env_ids] = self.termination_manager.time_outs[reset_env_ids]
+            self._eval_has_episode_result[reset_env_ids] = True
             self.recorder_manager.record_pre_reset(reset_env_ids)
 
             self._reset_idx(reset_env_ids)
@@ -326,10 +454,12 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
 
     def _reset_idx(self, env_ids):
         debug_logs = self._consume_forward_debug_logs(env_ids)
+        eval_logs = self._consume_episode_eval_logs(env_ids)
         super()._reset_idx(env_ids)
         leg_action_term = self.action_manager.get_term("leg_hydraulic")
         self._prev_stroke_command[env_ids] = leg_action_term.stroke_command[env_ids]
         self.extras["log"].update(debug_logs)
+        self.extras["log"].update(eval_logs)
 
     def render(self, recompute: bool = False) -> np.ndarray | None:
         return super().render(recompute=recompute)

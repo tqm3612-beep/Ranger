@@ -118,7 +118,7 @@ def _configure_video_viewer(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | Dir
         return
     if args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
         env_cfg.viewer.eye = (-10.0, 20.0, 5.0)
-        env_cfg.viewer.lookat = (-10.0, 0.0, 0.8)
+        env_cfg.viewer.lookat = (-10.0, 5.0, 0.0)
         return
     eye_x, eye_y, eye_z = env_cfg.viewer.eye
     env_cfg.viewer.eye = (eye_x, abs(eye_y), eye_z)
@@ -132,7 +132,7 @@ def _configure_simpleterrain_visual_camera(env) -> None:
 
     unwrapped_env = env.unwrapped
     eye = (-10.0, 20.0, 5.0)
-    target = (-10.0, 0.0, 0.8)
+    target = (-10.0, 5.0, 0.0)
     try:
         set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
     except TypeError:
@@ -160,6 +160,8 @@ def _is_forward_finetune_task(task_name: str) -> bool:
         "Template-Ranger-Forward-Visual-v0",
         "Template-Ranger-SimpleTerrain-v0",
         "Template-Ranger-SimpleTerrain-Visual-v0",
+        "Template-Ranger-MapPosture-v0",
+        "Template-Ranger-MapPosture-Visual-v0",
     }
 
 

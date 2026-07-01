@@ -75,7 +75,6 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 
@@ -122,6 +121,25 @@ def _configure_simpleterrain_visual_camera(env) -> None:
         camera_prim.GetFocalLengthAttr().Set(30.5)
 
 
+def _get_policy_normalizer(ppo_runner: OnPolicyRunner, policy_nn: torch.nn.Module) -> torch.nn.Module | None:
+    """Return the observation normalizer across supported RSL-RL versions."""
+
+    if hasattr(ppo_runner, "obs_normalizer"):
+        return ppo_runner.obs_normalizer
+    if hasattr(policy_nn, "actor_obs_normalizer"):
+        return policy_nn.actor_obs_normalizer
+    return None
+
+
+def _get_current_observations(env):
+    """Return observations across Isaac Lab wrapper API versions."""
+
+    obs = env.get_observations()
+    if isinstance(obs, tuple):
+        return obs[0]
+    return obs
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Play with RSL-RL agent."""
@@ -142,6 +160,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
     if args_cli.use_pretrained_checkpoint:
+        try:
+            from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "This Isaac Lab installation does not provide published pretrained checkpoint lookup. "
+                "Use --checkpoint with a local model path instead."
+            ) from exc
+
         resume_path = get_published_pretrained_checkpoint("rsl_rl", task_name)
         if not resume_path:
             print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
@@ -195,15 +221,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(
-        policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
-    )
+    policy_normalizer = _get_policy_normalizer(ppo_runner, policy_nn)
+    try:
+        export_policy_as_jit(policy_nn, policy_normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=policy_normalizer, path=export_model_dir, filename="policy.onnx")
+    except Exception as exc:
+        print(f"[WARNING] Failed to export policy, continuing play without exported files: {exc}")
 
     dt = env.unwrapped.step_dt
 
     # reset environment
-    obs, _ = env.get_observations()
+    obs = _get_current_observations(env)
     timestep = 0
     # simulate environment
     while simulation_app.is_running():

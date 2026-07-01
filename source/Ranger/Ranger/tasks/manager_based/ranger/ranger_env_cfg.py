@@ -707,6 +707,21 @@ class RangerMapPostureEnvCfg(RangerSimpleTerrainEnvCfg):
 
 
 @configclass
+class RangerMapPostureNoiseEnvCfg(RangerMapPostureEnvCfg):
+    """Stage-4 posture task with mild local-map noise/dropout for robustness fine-tuning."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        local_map_params = self.observations.policy.local_navigation_map.params
+        local_map_params["use_neutral_map"] = False
+        local_map_params["apply_noise"] = True
+        local_map_params["valid_dropout_prob"] = 0.02
+        local_map_params["height_noise_std"] = 0.01
+        local_map_params["risk_noise_std"] = 0.02
+
+
+@configclass
 class RangerMapPostureVisualEnvCfg(RangerMapPostureEnvCfg):
     """Stage-4 posture task tuned for interactive visualization."""
 

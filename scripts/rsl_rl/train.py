@@ -79,6 +79,7 @@ if args_cli.distributed and version.parse(installed_version) < version.parse(RSL
 
 import gymnasium as gym
 import os
+import pickle
 import torch
 from datetime import datetime
 from pxr import UsdGeom
@@ -93,7 +94,15 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab.utils.io import dump_yaml
+try:
+    from isaaclab.utils.io import dump_pickle
+except ImportError:
+    def dump_pickle(filename: str, data) -> None:
+        """Fallback for Isaac Lab versions that no longer expose dump_pickle."""
+
+        with open(filename, "wb") as file:
+            pickle.dump(data, file)
 from isaacsim.core.utils.viewports import set_camera_view
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
@@ -161,6 +170,7 @@ def _is_forward_finetune_task(task_name: str) -> bool:
         "Template-Ranger-SimpleTerrain-v0",
         "Template-Ranger-SimpleTerrain-Visual-v0",
         "Template-Ranger-MapPosture-v0",
+        "Template-Ranger-MapPosture-Noise-v0",
         "Template-Ranger-MapPosture-Visual-v0",
     }
 

@@ -31,6 +31,46 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--width", type=int, default=3840, help="Render width for video recording.")
+parser.add_argument("--height", type=int, default=2160, help="Render height for video recording.")
+parser.add_argument("--window_width", type=int, default=3840, help="Window width for rendering.")
+parser.add_argument("--window_height", type=int, default=2160, help="Window height for rendering.")
+parser.add_argument(
+    "--camera_eye",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("X", "Y", "Z"),
+    help="Recording camera position in world coordinates.",
+)
+parser.add_argument(
+    "--camera_lookat",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("X", "Y", "Z"),
+    help="Recording camera look-at target in world coordinates.",
+)
+parser.add_argument(
+    "--camera_focal_length",
+    type=float,
+    default=None,
+    help="Recording camera focal length. Larger values zoom in.",
+)
+parser.add_argument(
+    "--video_output_width",
+    type=int,
+    default=None,
+    help="Output video width. Defaults to the render width.",
+)
+parser.add_argument(
+    "--video_output_height",
+    type=int,
+    default=None,
+    help="Output video height. Defaults to the render height.",
+)
+parser.add_argument("--video_bitrate", type=str, default="30000k", help="Output video bitrate.")
+parser.add_argument("--video_crf", type=int, default=14, help="Output video CRF. Lower is higher quality.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -41,13 +81,13 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
     if getattr(args_cli, "width", None) is None:
-        args_cli.width = 1920
+        args_cli.width = 3840
     if getattr(args_cli, "height", None) is None:
-        args_cli.height = 1080
+        args_cli.height = 2160
     if getattr(args_cli, "window_width", None) is None:
-        args_cli.window_width = 1920
+        args_cli.window_width = 3840
     if getattr(args_cli, "window_height", None) is None:
-        args_cli.window_height = 1080
+        args_cli.window_height = 2160
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -92,23 +132,31 @@ def _configure_video_viewer(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | Dir
 
     if not args_cli.video:
         return
+    if args_cli.camera_eye is not None:
+        env_cfg.viewer.eye = tuple(args_cli.camera_eye)
+    if args_cli.camera_lookat is not None:
+        env_cfg.viewer.lookat = tuple(args_cli.camera_lookat)
+    if args_cli.camera_eye is not None or args_cli.camera_lookat is not None:
+        return
     if args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
         env_cfg.viewer.eye = (-10.0, 20.0, 5.0)
-        env_cfg.viewer.lookat = (-10.0, 5.0, 0.0)
+        env_cfg.viewer.lookat = (-10.0, 7.0, 0.0)
         return
     eye_x, eye_y, eye_z = env_cfg.viewer.eye
     env_cfg.viewer.eye = (eye_x, abs(eye_y), eye_z)
 
 
-def _configure_simpleterrain_visual_camera(env) -> None:
-    """Apply the fixed recording view and narrower FOV only for the visual simple-terrain task."""
+def _configure_recording_camera(env) -> None:
+    """Apply the configured recording camera view and optional narrower FOV."""
 
-    if not args_cli.video or args_cli.task.split(":")[-1] != "Template-Ranger-SimpleTerrain-Visual-v0":
+    if not args_cli.video:
         return
 
     unwrapped_env = env.unwrapped
-    eye = (-10.0, 20.0, 5.0)
-    target = (-10.0, 5.0, 0.0)
+    eye = tuple(args_cli.camera_eye) if args_cli.camera_eye is not None else tuple(unwrapped_env.cfg.viewer.eye)
+    target = (
+        tuple(args_cli.camera_lookat) if args_cli.camera_lookat is not None else tuple(unwrapped_env.cfg.viewer.lookat)
+    )
     try:
         set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
     except TypeError:
@@ -118,7 +166,10 @@ def _configure_simpleterrain_visual_camera(env) -> None:
 
     camera_prim = UsdGeom.Camera(unwrapped_env.sim.stage.GetPrimAtPath("/OmniverseKit_Persp"))
     if camera_prim:
-        camera_prim.GetFocalLengthAttr().Set(30.5)
+        if args_cli.camera_focal_length is not None:
+            camera_prim.GetFocalLengthAttr().Set(args_cli.camera_focal_length)
+        elif args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
+            camera_prim.GetFocalLengthAttr().Set(30.5)
 
 
 def _get_policy_normalizer(ppo_runner: OnPolicyRunner, policy_nn: torch.nn.Module) -> torch.nn.Module | None:
@@ -181,7 +232,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    _configure_simpleterrain_visual_camera(env)
+    _configure_recording_camera(env)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
@@ -194,6 +245,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             "step_trigger": lambda step: step == 0,
             "video_length": args_cli.video_length,
             "disable_logger": True,
+            "video_bitrate": args_cli.video_bitrate,
+            "video_crf": args_cli.video_crf,
+            "output_size": (
+                args_cli.video_output_width or args_cli.width,
+                args_cli.video_output_height or args_cli.height,
+            ),
         }
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)

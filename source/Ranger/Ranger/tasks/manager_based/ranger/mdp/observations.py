@@ -219,6 +219,16 @@ def local_navigation_map_layers(
     height_noise_std: float = 0.0,
     risk_noise_std: float = 0.0,
     valid_dropout_prob: float = 0.0,
+    height_bias_std: float = 0.0,
+    height_spatial_noise_std: float = 0.0,
+    risk_bias_std: float = 0.0,
+    risk_spatial_noise_std: float = 0.0,
+    spatial_noise_kernel_size: int = 3,
+    valid_block_dropout_prob: float = 0.0,
+    valid_block_dropout_size: int = 3,
+    valid_row_dropout_prob: float = 0.0,
+    valid_col_dropout_prob: float = 0.0,
+    map_shift_max_cells: int = 0,
     slope_weight: float = 0.4,
     roughness_weight: float = 0.3,
     step_weight: float = 0.3,
@@ -277,6 +287,16 @@ def local_navigation_map_layers(
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
         valid_dropout_prob=valid_dropout_prob,
+        height_bias_std=height_bias_std,
+        height_spatial_noise_std=height_spatial_noise_std,
+        risk_bias_std=risk_bias_std,
+        risk_spatial_noise_std=risk_spatial_noise_std,
+        spatial_noise_kernel_size=spatial_noise_kernel_size,
+        valid_block_dropout_prob=valid_block_dropout_prob,
+        valid_block_dropout_size=valid_block_dropout_size,
+        valid_row_dropout_prob=valid_row_dropout_prob,
+        valid_col_dropout_prob=valid_col_dropout_prob,
+        map_shift_max_cells=map_shift_max_cells,
     )
     traversability_map = _compute_traversability_map(
         slope_map=slope_map,
@@ -316,6 +336,16 @@ def local_navigation_map(
     height_noise_std: float = 0.0,
     risk_noise_std: float = 0.0,
     valid_dropout_prob: float = 0.0,
+    height_bias_std: float = 0.0,
+    height_spatial_noise_std: float = 0.0,
+    risk_bias_std: float = 0.0,
+    risk_spatial_noise_std: float = 0.0,
+    spatial_noise_kernel_size: int = 3,
+    valid_block_dropout_prob: float = 0.0,
+    valid_block_dropout_size: int = 3,
+    valid_row_dropout_prob: float = 0.0,
+    valid_col_dropout_prob: float = 0.0,
+    map_shift_max_cells: int = 0,
     slope_weight: float = 0.4,
     roughness_weight: float = 0.3,
     step_weight: float = 0.3,
@@ -341,6 +371,16 @@ def local_navigation_map(
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
         valid_dropout_prob=valid_dropout_prob,
+        height_bias_std=height_bias_std,
+        height_spatial_noise_std=height_spatial_noise_std,
+        risk_bias_std=risk_bias_std,
+        risk_spatial_noise_std=risk_spatial_noise_std,
+        spatial_noise_kernel_size=spatial_noise_kernel_size,
+        valid_block_dropout_prob=valid_block_dropout_prob,
+        valid_block_dropout_size=valid_block_dropout_size,
+        valid_row_dropout_prob=valid_row_dropout_prob,
+        valid_col_dropout_prob=valid_col_dropout_prob,
+        map_shift_max_cells=map_shift_max_cells,
         slope_weight=slope_weight,
         roughness_weight=roughness_weight,
         step_weight=step_weight,
@@ -378,6 +418,16 @@ def local_geometric_map_layers(
     height_noise_std: float = 0.0,
     risk_noise_std: float = 0.0,
     valid_dropout_prob: float = 0.0,
+    height_bias_std: float = 0.0,
+    height_spatial_noise_std: float = 0.0,
+    risk_bias_std: float = 0.0,
+    risk_spatial_noise_std: float = 0.0,
+    spatial_noise_kernel_size: int = 3,
+    valid_block_dropout_prob: float = 0.0,
+    valid_block_dropout_size: int = 3,
+    valid_row_dropout_prob: float = 0.0,
+    valid_col_dropout_prob: float = 0.0,
+    map_shift_max_cells: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Backward-compatible wrapper that returns the original five-layer map."""
 
@@ -398,6 +448,16 @@ def local_geometric_map_layers(
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
         valid_dropout_prob=valid_dropout_prob,
+        height_bias_std=height_bias_std,
+        height_spatial_noise_std=height_spatial_noise_std,
+        risk_bias_std=risk_bias_std,
+        risk_spatial_noise_std=risk_spatial_noise_std,
+        spatial_noise_kernel_size=spatial_noise_kernel_size,
+        valid_block_dropout_prob=valid_block_dropout_prob,
+        valid_block_dropout_size=valid_block_dropout_size,
+        valid_row_dropout_prob=valid_row_dropout_prob,
+        valid_col_dropout_prob=valid_col_dropout_prob,
+        map_shift_max_cells=map_shift_max_cells,
     )
     return {
         "height": layers_dict["height"],
@@ -425,6 +485,16 @@ def local_geometric_map(
     height_noise_std: float = 0.0,
     risk_noise_std: float = 0.0,
     valid_dropout_prob: float = 0.0,
+    height_bias_std: float = 0.0,
+    height_spatial_noise_std: float = 0.0,
+    risk_bias_std: float = 0.0,
+    risk_spatial_noise_std: float = 0.0,
+    spatial_noise_kernel_size: int = 3,
+    valid_block_dropout_prob: float = 0.0,
+    valid_block_dropout_size: int = 3,
+    valid_row_dropout_prob: float = 0.0,
+    valid_col_dropout_prob: float = 0.0,
+    map_shift_max_cells: int = 0,
 ) -> torch.Tensor:
     """Backward-compatible wrapper that returns the original five-layer map."""
 
@@ -445,6 +515,16 @@ def local_geometric_map(
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
         valid_dropout_prob=valid_dropout_prob,
+        height_bias_std=height_bias_std,
+        height_spatial_noise_std=height_spatial_noise_std,
+        risk_bias_std=risk_bias_std,
+        risk_spatial_noise_std=risk_spatial_noise_std,
+        spatial_noise_kernel_size=spatial_noise_kernel_size,
+        valid_block_dropout_prob=valid_block_dropout_prob,
+        valid_block_dropout_size=valid_block_dropout_size,
+        valid_row_dropout_prob=valid_row_dropout_prob,
+        valid_col_dropout_prob=valid_col_dropout_prob,
+        map_shift_max_cells=map_shift_max_cells,
     )
     layers = torch.stack(
         (
@@ -690,25 +770,114 @@ def _apply_local_map_noise(
     height_noise_std: float,
     risk_noise_std: float,
     valid_dropout_prob: float,
+    height_bias_std: float,
+    height_spatial_noise_std: float,
+    risk_bias_std: float,
+    risk_spatial_noise_std: float,
+    spatial_noise_kernel_size: int,
+    valid_block_dropout_prob: float,
+    valid_block_dropout_size: int,
+    valid_row_dropout_prob: float,
+    valid_col_dropout_prob: float,
+    map_shift_max_cells: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Apply lightweight noise and random visibility dropout to the local map."""
+    """Apply configurable perception noise and structured visibility dropout to the local map."""
 
     if not apply_noise:
         return height_map, slope_map, roughness_map, step_map, valid_mask
+
+    if map_shift_max_cells > 0:
+        shift_x, shift_y = _sample_map_shifts(
+            num_envs=height_map.shape[0],
+            max_shift_cells=map_shift_max_cells,
+            device=height_map.device,
+        )
+        height_map = _shift_map(height_map, shift_x=shift_x, shift_y=shift_y)
+        slope_map = _shift_map(slope_map, shift_x=shift_x, shift_y=shift_y)
+        roughness_map = _shift_map(roughness_map, shift_x=shift_x, shift_y=shift_y)
+        step_map = _shift_map(step_map, shift_x=shift_x, shift_y=shift_y)
+        valid_mask = _shift_map(valid_mask, shift_x=shift_x, shift_y=shift_y)
 
     valid_mask_noisy = valid_mask
     if valid_dropout_prob > 0.0:
         dropout = torch.rand_like(valid_mask.to(torch.float32)) < valid_dropout_prob
         valid_mask_noisy = valid_mask & (~dropout)
 
+    if valid_block_dropout_prob > 0.0:
+        block_dropout = _random_block_mask(
+            valid_mask,
+            dropout_prob=valid_block_dropout_prob,
+            block_size=valid_block_dropout_size,
+        )
+        valid_mask_noisy = valid_mask_noisy & (~block_dropout)
+
+    if valid_row_dropout_prob > 0.0:
+        row_dropout = torch.rand(
+            (valid_mask.shape[0], valid_mask.shape[1], 1),
+            device=valid_mask.device,
+            dtype=torch.float32,
+        ) < valid_row_dropout_prob
+        valid_mask_noisy = valid_mask_noisy & (~row_dropout)
+
+    if valid_col_dropout_prob > 0.0:
+        col_dropout = torch.rand(
+            (valid_mask.shape[0], 1, valid_mask.shape[2]),
+            device=valid_mask.device,
+            dtype=torch.float32,
+        ) < valid_col_dropout_prob
+        valid_mask_noisy = valid_mask_noisy & (~col_dropout)
+
+    if height_bias_std > 0.0:
+        height_bias = torch.randn(
+            (height_map.shape[0], 1, 1),
+            device=height_map.device,
+            dtype=height_map.dtype,
+        ) * height_bias_std
+        height_map = height_map + height_bias
+
     if height_noise_std > 0.0:
         height_map = height_map + torch.randn_like(height_map) * height_noise_std
+
+    if height_spatial_noise_std > 0.0:
+        height_map = height_map + _spatial_noise_like(
+            height_map,
+            std=height_spatial_noise_std,
+            kernel_size=spatial_noise_kernel_size,
+        )
+
+    if risk_bias_std > 0.0:
+        risk_bias = torch.randn(
+            (slope_map.shape[0], 1, 1),
+            device=slope_map.device,
+            dtype=slope_map.dtype,
+        ) * risk_bias_std
+        slope_map = slope_map + risk_bias
+        roughness_map = roughness_map + risk_bias
+        step_map = step_map + risk_bias
 
     if risk_noise_std > 0.0:
         slope_map = slope_map + torch.randn_like(slope_map) * risk_noise_std
         roughness_map = roughness_map + torch.randn_like(roughness_map) * risk_noise_std
         step_map = step_map + torch.randn_like(step_map) * risk_noise_std
 
+    if risk_spatial_noise_std > 0.0:
+        slope_map = slope_map + _spatial_noise_like(
+            slope_map,
+            std=risk_spatial_noise_std,
+            kernel_size=spatial_noise_kernel_size,
+        )
+        roughness_map = roughness_map + _spatial_noise_like(
+            roughness_map,
+            std=risk_spatial_noise_std,
+            kernel_size=spatial_noise_kernel_size,
+        )
+        step_map = step_map + _spatial_noise_like(
+            step_map,
+            std=risk_spatial_noise_std,
+            kernel_size=spatial_noise_kernel_size,
+        )
+
+    height_map = torch.clamp(height_map, min=-1.0, max=1.0)
     slope_map = torch.clamp(slope_map, min=0.0, max=1.0)
     roughness_map = torch.clamp(roughness_map, min=0.0, max=1.0)
     step_map = torch.clamp(step_map, min=0.0, max=1.0)
@@ -719,6 +888,66 @@ def _apply_local_map_noise(
     step_map = torch.where(valid_mask_noisy, step_map, torch.zeros_like(step_map))
 
     return height_map, slope_map, roughness_map, step_map, valid_mask_noisy
+
+
+def _sample_map_shifts(num_envs: int, max_shift_cells: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample per-environment integer registration offsets."""
+
+    shift_x = torch.randint(
+        low=-max_shift_cells,
+        high=max_shift_cells + 1,
+        size=(num_envs,),
+        device=device,
+    )
+    shift_y = torch.randint(
+        low=-max_shift_cells,
+        high=max_shift_cells + 1,
+        size=(num_envs,),
+        device=device,
+    )
+    return shift_x, shift_y
+
+
+def _shift_map(map_tensor: torch.Tensor, shift_x: torch.Tensor, shift_y: torch.Tensor) -> torch.Tensor:
+    """Roll each environment's map by the provided integer offsets."""
+
+    num_envs, num_x, num_y = map_tensor.shape
+    env_ids = torch.arange(num_envs, device=map_tensor.device)[:, None, None]
+    x_ids = (torch.arange(num_x, device=map_tensor.device)[None, :, None] - shift_x[:, None, None]) % num_x
+    y_ids = (torch.arange(num_y, device=map_tensor.device)[None, None, :] - shift_y[:, None, None]) % num_y
+    return map_tensor[env_ids, x_ids, y_ids]
+
+
+def _spatial_noise_like(map_tensor: torch.Tensor, std: float, kernel_size: int) -> torch.Tensor:
+    """Generate smoothed zero-mean noise with approximately the requested standard deviation."""
+
+    if std <= 0.0:
+        return torch.zeros_like(map_tensor)
+
+    kernel_size = max(int(kernel_size), 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    noise = torch.randn_like(map_tensor).unsqueeze(1)
+    if kernel_size > 1:
+        noise = F.avg_pool2d(noise, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    noise = noise.squeeze(1)
+    noise = noise - noise.mean(dim=(1, 2), keepdim=True)
+    noise_std = torch.clamp(noise.std(dim=(1, 2), keepdim=True), min=1.0e-6)
+    return noise / noise_std * std
+
+
+def _random_block_mask(valid_mask: torch.Tensor, dropout_prob: float, block_size: int) -> torch.Tensor:
+    """Create structured dropout by expanding random seed cells into local blocks."""
+
+    if dropout_prob <= 0.0:
+        return torch.zeros_like(valid_mask)
+
+    block_size = max(int(block_size), 1)
+    if block_size % 2 == 0:
+        block_size += 1
+    seeds = (torch.rand_like(valid_mask.to(torch.float32)) < dropout_prob).unsqueeze(1).to(torch.float32)
+    block_mask = F.max_pool2d(seeds, kernel_size=block_size, stride=1, padding=block_size // 2)
+    return block_mask.squeeze(1) > 0.5
 
 
 def _compute_roughness_map(height_map: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:

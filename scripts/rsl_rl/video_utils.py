@@ -33,7 +33,7 @@ class HighQualityRecordVideo(
         video_codec: str = "libx264",
         video_crf: int = 16,
         video_preset: str = "slow",
-        output_size: tuple[int, int] | None = (1920, 1080),
+        output_size: tuple[int, int] | None = (3840, 2160),
     ):
         gym.utils.RecordConstructorArgs.__init__(
             self,

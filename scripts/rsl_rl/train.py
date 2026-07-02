@@ -38,13 +38,13 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
     if getattr(args_cli, "width", None) is None:
-        args_cli.width = 1920
+        args_cli.width = 3840
     if getattr(args_cli, "height", None) is None:
-        args_cli.height = 1080
+        args_cli.height = 2160
     if getattr(args_cli, "window_width", None) is None:
-        args_cli.window_width = 1920
+        args_cli.window_width = 3840
     if getattr(args_cli, "window_height", None) is None:
-        args_cli.window_height = 1080
+        args_cli.window_height = 2160
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -127,7 +127,7 @@ def _configure_video_viewer(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | Dir
         return
     if args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
         env_cfg.viewer.eye = (-10.0, 20.0, 5.0)
-        env_cfg.viewer.lookat = (-10.0, 5.0, 0.0)
+        env_cfg.viewer.lookat = (-10.0, 7.0, 0.0)
         return
     eye_x, eye_y, eye_z = env_cfg.viewer.eye
     env_cfg.viewer.eye = (eye_x, abs(eye_y), eye_z)
@@ -141,7 +141,7 @@ def _configure_simpleterrain_visual_camera(env) -> None:
 
     unwrapped_env = env.unwrapped
     eye = (-10.0, 20.0, 5.0)
-    target = (-10.0, 5.0, 0.0)
+    target = (-10.0, 7.0, 0.0)
     try:
         set_camera_view(eye=eye, target=target, camera_prim_path="/OmniverseKit_Persp")
     except TypeError:
@@ -171,6 +171,7 @@ def _is_forward_finetune_task(task_name: str) -> bool:
         "Template-Ranger-SimpleTerrain-Visual-v0",
         "Template-Ranger-MapPosture-v0",
         "Template-Ranger-MapPosture-Noise-v0",
+        "Template-Ranger-MapPosture-ComplexNoise-v0",
         "Template-Ranger-MapPosture-Visual-v0",
     }
 

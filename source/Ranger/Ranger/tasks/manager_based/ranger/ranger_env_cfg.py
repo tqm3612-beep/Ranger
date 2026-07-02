@@ -46,6 +46,16 @@ LOCAL_NAVIGATION_MAP_PARAMS = {
     "height_noise_std": 0.01,
     "risk_noise_std": 0.02,
     "valid_dropout_prob": 0.02,
+    "height_bias_std": 0.0,
+    "height_spatial_noise_std": 0.0,
+    "risk_bias_std": 0.0,
+    "risk_spatial_noise_std": 0.0,
+    "spatial_noise_kernel_size": 3,
+    "valid_block_dropout_prob": 0.0,
+    "valid_block_dropout_size": 3,
+    "valid_row_dropout_prob": 0.0,
+    "valid_col_dropout_prob": 0.0,
+    "map_shift_max_cells": 0,
     "slope_weight": 0.4,
     "roughness_weight": 0.3,
     "step_weight": 0.3,
@@ -500,8 +510,8 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 2
         self.episode_length_s = 5
         # viewer settings
-        self.viewer.eye = (4.0, -4.0, 3.0)
-        self.viewer.lookat = (0.0, 0.0, 0.5)
+        self.viewer.eye = (-10.0, 20.0, 5.0)
+        self.viewer.lookat = (-10.0, 7.0, 0.0)
         # simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
@@ -672,7 +682,7 @@ class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
         self.viewer.eye = (-10.0, 20.0, 5.0)
-        self.viewer.lookat = (-10.0, 5.0, 0.0)
+        self.viewer.lookat = (-10.0, 7.0, 0.0)
 
 
 @configclass
@@ -681,6 +691,7 @@ class RangerMapPostureEnvCfg(RangerSimpleTerrainEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.sim.physx.gpu_collision_stack_size = 2**27
 
         local_map_params = self.observations.policy.local_navigation_map.params
         local_map_params["use_neutral_map"] = False
@@ -688,6 +699,14 @@ class RangerMapPostureEnvCfg(RangerSimpleTerrainEnvCfg):
         local_map_params["valid_dropout_prob"] = 0.0
         local_map_params["height_noise_std"] = 0.0
         local_map_params["risk_noise_std"] = 0.0
+        local_map_params["height_bias_std"] = 0.0
+        local_map_params["height_spatial_noise_std"] = 0.0
+        local_map_params["risk_bias_std"] = 0.0
+        local_map_params["risk_spatial_noise_std"] = 0.0
+        local_map_params["valid_block_dropout_prob"] = 0.0
+        local_map_params["valid_row_dropout_prob"] = 0.0
+        local_map_params["valid_col_dropout_prob"] = 0.0
+        local_map_params["map_shift_max_cells"] = 0
 
         self.rewards.velocity_tracking.weight = 2.5
         self.rewards.velocity_tracking.params["target_speed"] = 1.0
@@ -719,6 +738,31 @@ class RangerMapPostureNoiseEnvCfg(RangerMapPostureEnvCfg):
         local_map_params["valid_dropout_prob"] = 0.02
         local_map_params["height_noise_std"] = 0.01
         local_map_params["risk_noise_std"] = 0.02
+
+
+@configclass
+class RangerMapPostureComplexNoiseEnvCfg(RangerMapPostureEnvCfg):
+    """Stage-4 posture task with stronger, structured local-map perception noise."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        local_map_params = self.observations.policy.local_navigation_map.params
+        local_map_params["use_neutral_map"] = False
+        local_map_params["apply_noise"] = True
+        local_map_params["height_noise_std"] = 0.02
+        local_map_params["height_bias_std"] = 0.015
+        local_map_params["height_spatial_noise_std"] = 0.025
+        local_map_params["risk_noise_std"] = 0.04
+        local_map_params["risk_bias_std"] = 0.02
+        local_map_params["risk_spatial_noise_std"] = 0.04
+        local_map_params["spatial_noise_kernel_size"] = 5
+        local_map_params["valid_dropout_prob"] = 0.04
+        local_map_params["valid_block_dropout_prob"] = 0.006
+        local_map_params["valid_block_dropout_size"] = 3
+        local_map_params["valid_row_dropout_prob"] = 0.01
+        local_map_params["valid_col_dropout_prob"] = 0.01
+        local_map_params["map_shift_max_cells"] = 1
 
 
 @configclass

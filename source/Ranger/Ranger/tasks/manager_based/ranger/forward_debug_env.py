@@ -55,6 +55,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "local_height_range",
             "local_height_std",
             "local_height_max_abs",
+            "lookahead_roll_feature",
+            "lookahead_pitch_feature",
             "terrain_level",
             "terrain_type",
             "local_ground_height_b",
@@ -216,6 +218,23 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         local_height_range = torch.clamp(local_height_max - local_height_min, min=0.0)
         local_height_std = torch.sqrt(torch.clamp(local_height_var, min=0.0))
         local_height_max_abs = torch.where(local_valid, torch.abs(local_height), torch.zeros_like(local_height)).amax(dim=(1, 2))
+        lookahead_roll_feature, lookahead_pitch_feature = mdp.lookahead_terrain_features(
+            env=self,
+            sensor_names=flat_stroke_nominal_params["sensor_names"],
+            asset_name=flat_stroke_asset_name,
+            x_range=flat_stroke_nominal_params["x_range"],
+            y_range=flat_stroke_nominal_params["y_range"],
+            resolution=flat_stroke_nominal_params["resolution"],
+            step_threshold=flat_stroke_nominal_params["step_threshold"],
+            height_reference_x_range=flat_stroke_nominal_params["height_reference_x_range"],
+            height_reference_y_range=flat_stroke_nominal_params["height_reference_y_range"],
+            slope_normalization=flat_stroke_nominal_params["slope_normalization"],
+            roughness_normalization=flat_stroke_nominal_params["roughness_normalization"],
+            step_normalization=flat_stroke_nominal_params["step_normalization"],
+            slope_weight=flat_stroke_nominal_params["slope_weight"],
+            roughness_weight=flat_stroke_nominal_params["roughness_weight"],
+            step_weight=flat_stroke_nominal_params["step_weight"],
+        )
         terrain = self.scene.terrain
         terrain_level = (
             terrain.terrain_levels.to(torch.float32)
@@ -316,6 +335,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "local_height_range": local_height_range,
             "local_height_std": local_height_std,
             "local_height_max_abs": local_height_max_abs,
+            "lookahead_roll_feature": lookahead_roll_feature,
+            "lookahead_pitch_feature": lookahead_pitch_feature,
             "terrain_level": terrain_level,
             "terrain_type": terrain_type,
             "local_ground_height_b": local_ground_height_b,

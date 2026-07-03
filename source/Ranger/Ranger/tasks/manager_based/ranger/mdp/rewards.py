@@ -12,7 +12,7 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse, wrap_to_pi
-from .observations import _pack_local_map_params, get_local_map_manager
+from .observations import _pack_local_map_params, get_local_map_manager, local_navigation_map_layers
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -380,6 +380,132 @@ def actual_stroke_rate_l2(
     penalty = torch.mean(torch.square(stroke_rate), dim=1)
     prev_stroke[:] = stroke_actual
     return penalty
+
+
+def _masked_region_mean(
+    layer: torch.Tensor,
+    valid_mask: torch.Tensor,
+    x_coords: torch.Tensor,
+    y_coords: torch.Tensor,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+) -> torch.Tensor:
+    x_mask = (x_coords >= x_range[0]) & (x_coords <= x_range[1])
+    y_mask = (y_coords >= y_range[0]) & (y_coords <= y_range[1])
+    region_mask = x_mask[:, None] & y_mask[None, :]
+    masked_valid = valid_mask & region_mask.unsqueeze(0)
+    valid_count = torch.clamp(masked_valid.sum(dim=(1, 2)).to(layer.dtype), min=1.0)
+    return torch.where(masked_valid, layer, torch.zeros_like(layer)).sum(dim=(1, 2)) / valid_count
+
+
+def lookahead_terrain_features(
+    env: ManagerBasedRLEnv,
+    sensor_names: tuple[str, ...] = ("mid360_lidar", "avia_lidar", "d435i_camera"),
+    asset_name: str = "robot",
+    x_range: tuple[float, float] = (0.0, 2.0),
+    y_range: tuple[float, float] = (-0.6, 0.6),
+    resolution: float = 0.1,
+    step_threshold: float = 0.08,
+    height_reference_x_range: tuple[float, float] = (0.0, 0.4),
+    height_reference_y_range: tuple[float, float] = (-0.3, 0.3),
+    slope_normalization: float = 0.6,
+    roughness_normalization: float = 0.05,
+    step_normalization: float = 0.15,
+    slope_weight: float = 0.4,
+    roughness_weight: float = 0.3,
+    step_weight: float = 0.3,
+    lookahead_x_range: tuple[float, float] = (0.25, 0.50),
+    current_x_range: tuple[float, float] = (0.0, 0.25),
+    left_y_range: tuple[float, float] = (0.15, 0.55),
+    right_y_range: tuple[float, float] = (-0.55, -0.15),
+    center_y_range: tuple[float, float] = (-0.35, 0.35),
+    height_feature_weight: float = 1.0,
+    slope_feature_weight: float = 0.05,
+    step_feature_weight: float = 0.05,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return compact lookahead terrain features from cached clean local map layers."""
+
+    layers = local_navigation_map_layers(
+        env=env,
+        sensor_names=sensor_names,
+        asset_name=asset_name,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+        step_threshold=step_threshold,
+        height_reference_x_range=height_reference_x_range,
+        height_reference_y_range=height_reference_y_range,
+        slope_normalization=slope_normalization,
+        roughness_normalization=roughness_normalization,
+        step_normalization=step_normalization,
+        apply_noise=False,
+        height_noise_std=0.0,
+        risk_noise_std=0.0,
+        valid_dropout_prob=0.0,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        unknown_penalty=1.0,
+        use_neutral_map=False,
+    )
+    height = layers["height"]
+    valid_mask = layers["valid_mask"] > 0.5
+    num_x = height.shape[1]
+    num_y = height.shape[2]
+    x_coords = torch.linspace(x_range[0], x_range[1], num_x, device=height.device, dtype=height.dtype)
+    y_coords = torch.linspace(y_range[0], y_range[1], num_y, device=height.device, dtype=height.dtype)
+
+    def terrain_signal(region_x_range: tuple[float, float], region_y_range: tuple[float, float]) -> torch.Tensor:
+        height_mean = _masked_region_mean(height, valid_mask, x_coords, y_coords, region_x_range, region_y_range)
+        slope_mean = _masked_region_mean(layers["slope"], valid_mask, x_coords, y_coords, region_x_range, region_y_range)
+        step_mean = _masked_region_mean(layers["step"], valid_mask, x_coords, y_coords, region_x_range, region_y_range)
+        return height_feature_weight * height_mean + slope_feature_weight * slope_mean + step_feature_weight * step_mean
+
+    left_signal = terrain_signal(lookahead_x_range, left_y_range)
+    right_signal = terrain_signal(lookahead_x_range, right_y_range)
+    front_signal = terrain_signal(lookahead_x_range, center_y_range)
+    current_signal = terrain_signal(current_x_range, center_y_range)
+    lookahead_roll_feature = left_signal - right_signal
+    lookahead_pitch_feature = front_signal - current_signal
+    return lookahead_roll_feature, lookahead_pitch_feature
+
+
+def lookahead_left_right_stroke_compensation(
+    env: ManagerBasedRLEnv,
+    feature_params: dict | None = None,
+    gain: float = 1.0,
+    clamp_abs: float = 0.08,
+    roll_sign: float = 1.0,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Match measured left-right stroke difference to upcoming left-right terrain change."""
+
+    if feature_params is None:
+        feature_params = {}
+    lookahead_roll_feature, _ = lookahead_terrain_features(env, **feature_params)
+    expected_diff = torch.clamp(roll_sign * gain * lookahead_roll_feature, min=-clamp_abs, max=clamp_abs)
+    stroke_actual = env.action_manager.get_term(action_name).stroke_measured
+    actual_diff = stroke_actual[:, :2].mean(dim=1) - stroke_actual[:, 2:].mean(dim=1)
+    return torch.square(actual_diff - expected_diff)
+
+
+def lookahead_front_rear_stroke_compensation(
+    env: ManagerBasedRLEnv,
+    feature_params: dict | None = None,
+    gain: float = 1.0,
+    clamp_abs: float = 0.08,
+    pitch_sign: float = 1.0,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Match measured front-rear stroke difference to upcoming front terrain change."""
+
+    if feature_params is None:
+        feature_params = {}
+    _, lookahead_pitch_feature = lookahead_terrain_features(env, **feature_params)
+    expected_diff = torch.clamp(pitch_sign * gain * lookahead_pitch_feature, min=-clamp_abs, max=clamp_abs)
+    stroke_actual = env.action_manager.get_term(action_name).stroke_measured
+    actual_diff = stroke_actual[:, [1, 2]].mean(dim=1) - stroke_actual[:, [0, 3]].mean(dim=1)
+    return torch.square(actual_diff - expected_diff)
 
 
 def flat_base_clearance_l2(

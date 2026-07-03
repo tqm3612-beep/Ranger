@@ -139,8 +139,8 @@ def _configure_video_viewer(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | Dir
     if args_cli.camera_eye is not None or args_cli.camera_lookat is not None:
         return
     if args_cli.task.split(":")[-1] == "Template-Ranger-SimpleTerrain-Visual-v0":
-        env_cfg.viewer.eye = (-10.0, 20.0, 5.0)
-        env_cfg.viewer.lookat = (-10.0, 7.0, 0.0)
+        env_cfg.viewer.eye = (-7.0, 20.0, 5.0)
+        env_cfg.viewer.lookat = (-7.0, 7.0, 0.0)
         return
     eye_x, eye_y, eye_z = env_cfg.viewer.eye
     env_cfg.viewer.eye = (eye_x, abs(eye_y), eye_z)

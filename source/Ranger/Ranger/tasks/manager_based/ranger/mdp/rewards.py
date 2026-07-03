@@ -12,7 +12,7 @@ from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply_inverse, wrap_to_pi
-from .observations import _build_local_height_map, _compute_height_reference, local_navigation_map_layers
+from .observations import _pack_local_map_params, get_local_map_manager
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -56,8 +56,8 @@ def get_flat_terrain_weight(
 ) -> torch.Tensor:
     """Estimate how flat the local terrain is, with flat terrain near 1 and complex terrain near 0."""
 
-    layers = local_navigation_map_layers(
-        env=env,
+    manager = get_local_map_manager(env)
+    params = _pack_local_map_params(
         sensor_names=sensor_names,
         asset_name=asset_name,
         x_range=x_range,
@@ -77,28 +77,12 @@ def get_flat_terrain_weight(
         roughness_weight=roughness_weight,
         step_weight=step_weight,
         unknown_penalty=1.0,
-        use_neutral_map=False,
     )
-    valid_mask = layers["valid_mask"] > 0.5
-    valid_count = torch.clamp(valid_mask.sum(dim=(1, 2)).to(torch.float32), min=1.0)
-
-    slope_mean = (layers["slope"] * valid_mask).sum(dim=(1, 2)) / valid_count
-    roughness_mean = (layers["roughness"] * valid_mask).sum(dim=(1, 2)) / valid_count
-    step_mean = (layers["step"] * valid_mask).sum(dim=(1, 2)) / valid_count
-
-    height_for_max = torch.where(valid_mask, layers["height"], torch.full_like(layers["height"], -1.0e6))
-    height_for_min = torch.where(valid_mask, layers["height"], torch.full_like(layers["height"], 1.0e6))
-    height_max = torch.where(valid_count > 0.0, height_for_max.amax(dim=(1, 2)), torch.zeros_like(valid_count))
-    height_min = torch.where(valid_count > 0.0, height_for_min.amin(dim=(1, 2)), torch.zeros_like(valid_count))
-    height_range = torch.clamp(height_max - height_min, min=0.0, max=1.0)
-
-    terrain_complexity = (
-        slope_weight * slope_mean
-        + roughness_weight * roughness_mean
-        + step_weight * step_mean
-        + height_range_weight * height_range
-    ) / max(slope_weight + roughness_weight + step_weight + height_range_weight, 1.0e-6)
-    return torch.exp(-flatness_gain * terrain_complexity)
+    return manager.get_flat_terrain_weight(
+        height_range_weight=height_range_weight,
+        flatness_gain=flatness_gain,
+        **params,
+    )
 
 
 def get_local_ground_height(
@@ -113,23 +97,25 @@ def get_local_ground_height(
 ) -> torch.Tensor:
     """Estimate the local ground height near the robot in the base-frame z convention."""
 
-    height_map_raw, valid_mask = _build_local_height_map(
-        env=env,
+    manager = get_local_map_manager(env)
+    params = _pack_local_map_params(
         sensor_names=sensor_names,
         asset_name=asset_name,
         x_range=x_range,
         y_range=y_range,
         resolution=resolution,
+        step_threshold=0.08,
+        height_reference_x_range=height_reference_x_range,
+        height_reference_y_range=height_reference_y_range,
+        slope_normalization=0.6,
+        roughness_normalization=0.05,
+        step_normalization=0.15,
+        slope_weight=0.4,
+        roughness_weight=0.3,
+        step_weight=0.3,
+        unknown_penalty=1.0,
     )
-    return _compute_height_reference(
-        height_map_raw=height_map_raw,
-        valid_mask=valid_mask,
-        x_range=x_range,
-        y_range=y_range,
-        resolution=resolution,
-        reference_x_range=height_reference_x_range,
-        reference_y_range=height_reference_y_range,
-    )
+    return manager.get_local_ground_height(**params)
 
 
 def forward_velocity_reward(
@@ -337,6 +323,63 @@ def flat_stroke_high_l2(
     stroke_mean = env.action_manager.get_term("leg_hydraulic").stroke_command.mean(dim=1)
     stroke_high = torch.clamp(stroke_mean - stroke_mean_limit, min=0.0)
     return flat_weight * torch.square(stroke_high)
+
+
+def stroke_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    limit: float = 0.5,
+    quadratic_gain: float = 4.0,
+) -> torch.Tensor:
+    """Penalize only suspension stroke commands above a soft limit."""
+
+    stroke_command = env.action_manager.get_term("leg_hydraulic").stroke_command
+    stroke_high = torch.clamp(stroke_command - limit, min=0.0)
+    return torch.mean(stroke_high + quadratic_gain * torch.square(stroke_high), dim=1)
+
+
+def actual_stroke_nominal_l2(
+    env: ManagerBasedRLEnv,
+    stroke_nominal: float = 0.4,
+) -> torch.Tensor:
+    """Pull measured suspension stroke toward a nominal operating point."""
+
+    stroke_actual = env.action_manager.get_term("leg_hydraulic").stroke_measured
+    return torch.mean(torch.square(stroke_actual - stroke_nominal), dim=1)
+
+
+def actual_stroke_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    limit: float = 0.5,
+    quadratic_gain: float = 4.0,
+) -> torch.Tensor:
+    """Penalize only measured suspension stroke above a soft limit."""
+
+    stroke_actual = env.action_manager.get_term("leg_hydraulic").stroke_measured
+    stroke_high = torch.clamp(stroke_actual - limit, min=0.0)
+    return torch.mean(stroke_high + quadratic_gain * torch.square(stroke_high), dim=1)
+
+
+def actual_stroke_rate_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Penalize measured suspension stroke rate."""
+
+    stroke_actual = env.action_manager.get_term(action_name).stroke_measured
+    attr_name = "_ranger_prev_measured_stroke"
+    prev_stroke = getattr(env, attr_name, None)
+    if prev_stroke is None or prev_stroke.shape != stroke_actual.shape:
+        prev_stroke = stroke_actual.clone()
+        setattr(env, attr_name, prev_stroke)
+
+    episode_start = env.episode_length_buf <= 1
+    if torch.any(episode_start):
+        prev_stroke[episode_start] = stroke_actual[episode_start]
+
+    stroke_rate = (stroke_actual - prev_stroke) / max(env.step_dt, 1.0e-6)
+    penalty = torch.mean(torch.square(stroke_rate), dim=1)
+    prev_stroke[:] = stroke_actual
+    return penalty
 
 
 def flat_base_clearance_l2(

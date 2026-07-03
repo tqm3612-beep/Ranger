@@ -7,6 +7,9 @@
 
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 import torch.nn.functional as F
 
@@ -15,6 +18,9 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
+
+
+LOCAL_MAP_MANAGER_ATTR = "_ranger_local_map_manager"
 
 
 def base_lin_vel_normalized(
@@ -178,6 +184,214 @@ def last_action_normalized(env: ManagerBasedEnv, action_name: str | None = None)
     return torch.clamp(env.action_manager.get_term(action_name).raw_actions, min=-1.0, max=1.0)
 
 
+class RangerLocalMapManager:
+    """Small env-attached cache for Ranger local terrain maps.
+
+    The manager owns real local-map generation. Observation, reward, and debug
+    paths should read through this cache so each env step refreshes the ray map
+    at most once, and only every ``map_update_interval`` policy steps.
+    """
+
+    def __init__(self, env: ManagerBasedEnv, map_update_interval: int = 4):
+        self.env = env
+        self.map_update_interval = max(int(map_update_interval), 1)
+        self.profile_enabled = os.environ.get("RANGER_PROFILE", "0") == "1"
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.real_map_updates = 0
+        self.total_update_time_s = 0.0
+        self.last_update_step = -1
+        self.last_update_step_per_env = torch.full(
+            (env.num_envs,),
+            -1,
+            device=env.device,
+            dtype=torch.long,
+        )
+        self.cache_valid = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        self.clean_layers: dict[str, torch.Tensor] | None = None
+        self.clean_flat_map: torch.Tensor | None = None
+        self.policy_flat_map: torch.Tensor | None = None
+        self.raw_height_map: torch.Tensor | None = None
+        self.raw_valid_mask: torch.Tensor | None = None
+        self.local_ground_height: torch.Tensor | None = None
+        self.flat_terrain_weight: torch.Tensor | None = None
+        self._signature: tuple | None = None
+        self._neutral_layers: dict[tuple[float, float, float, float, float], dict[str, torch.Tensor]] = {}
+
+    def invalidate(self, env_ids=None) -> None:
+        """Mark selected environments as needing a fresh real map after reset."""
+
+        if env_ids is None:
+            env_ids = slice(None)
+        if isinstance(env_ids, slice):
+            index = env_ids
+        elif isinstance(env_ids, torch.Tensor):
+            index = env_ids.to(device=self.env.device, dtype=torch.long)
+        else:
+            index = torch.as_tensor(env_ids, device=self.env.device, dtype=torch.long)
+
+        self.cache_valid[index] = False
+        self.last_update_step_per_env[index] = -1
+        if self.clean_layers is not None:
+            for layer in self.clean_layers.values():
+                layer[index] = 0.0
+            self.clean_layers["traversability"][index] = 1.0
+            self.clean_layers["valid_mask"][index] = 1.0
+            self.clean_flat_map = _flatten_navigation_layers(self.clean_layers)
+        if self.raw_height_map is not None:
+            self.raw_height_map[index] = 0.0
+        if self.raw_valid_mask is not None:
+            self.raw_valid_mask[index] = False
+        if self.local_ground_height is not None:
+            self.local_ground_height[index] = 0.0
+        if self.flat_terrain_weight is not None:
+            self.flat_terrain_weight[index] = 1.0
+        self.policy_flat_map = None
+
+    def get_neutral_layers(
+        self,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        resolution: float,
+    ) -> dict[str, torch.Tensor]:
+        key = (float(x_range[0]), float(x_range[1]), float(y_range[0]), float(y_range[1]), float(resolution))
+        if key not in self._neutral_layers:
+            self._neutral_layers[key] = _build_neutral_navigation_map_layers(
+                env=self.env,
+                x_range=x_range,
+                y_range=y_range,
+                resolution=resolution,
+            )
+        return self._neutral_layers[key]
+
+    def get_clean_layers(self, **params) -> dict[str, torch.Tensor]:
+        self._ensure_clean_map(**params)
+        return self.clean_layers
+
+    def get_clean_flat_map(self, **params) -> torch.Tensor:
+        self._ensure_clean_map(**params)
+        return self.clean_flat_map
+
+    def get_policy_flat_map(self, **params) -> torch.Tensor:
+        clean_layers = self.get_clean_layers(**params)
+        noisy_layers = _maybe_apply_navigation_map_noise(clean_layers=clean_layers, **params)
+        self.policy_flat_map = _flatten_navigation_layers(noisy_layers)
+        return self.policy_flat_map
+
+    def get_local_ground_height(self, **params) -> torch.Tensor:
+        self._ensure_clean_map(**params)
+        return self.local_ground_height
+
+    def get_flat_terrain_weight(
+        self,
+        height_range_weight: float,
+        flatness_gain: float,
+        **params,
+    ) -> torch.Tensor:
+        layers = self.get_clean_layers(**params)
+        valid_mask = layers["valid_mask"] > 0.5
+        valid_count = torch.clamp(valid_mask.sum(dim=(1, 2)).to(torch.float32), min=1.0)
+
+        slope_mean = (layers["slope"] * valid_mask).sum(dim=(1, 2)) / valid_count
+        roughness_mean = (layers["roughness"] * valid_mask).sum(dim=(1, 2)) / valid_count
+        step_mean = (layers["step"] * valid_mask).sum(dim=(1, 2)) / valid_count
+
+        height_for_max = torch.where(valid_mask, layers["height"], torch.full_like(layers["height"], -1.0e6))
+        height_for_min = torch.where(valid_mask, layers["height"], torch.full_like(layers["height"], 1.0e6))
+        height_max = torch.where(valid_count > 0.0, height_for_max.amax(dim=(1, 2)), torch.zeros_like(valid_count))
+        height_min = torch.where(valid_count > 0.0, height_for_min.amin(dim=(1, 2)), torch.zeros_like(valid_count))
+        height_range = torch.clamp(height_max - height_min, min=0.0, max=1.0)
+
+        slope_weight = params["slope_weight"]
+        roughness_weight = params["roughness_weight"]
+        step_weight = params["step_weight"]
+        terrain_complexity = (
+            slope_weight * slope_mean
+            + roughness_weight * roughness_mean
+            + step_weight * step_mean
+            + height_range_weight * height_range
+        ) / max(slope_weight + roughness_weight + step_weight + height_range_weight, 1.0e-6)
+        self.flat_terrain_weight = torch.exp(-flatness_gain * terrain_complexity)
+        return self.flat_terrain_weight
+
+    def _ensure_clean_map(self, **params) -> None:
+        signature = _local_map_signature(params)
+        current_step = int(getattr(self.env, "common_step_counter", 0))
+        needs_update = (
+            self.clean_layers is None
+            or self._signature != signature
+            or not bool(torch.all(self.cache_valid).item())
+            or self.last_update_step < 0
+            or current_step - self.last_update_step >= self.map_update_interval
+        )
+        if not needs_update:
+            self.cache_hits += 1
+            return
+
+        self.cache_misses += 1
+        start_time = time.perf_counter()
+        clean_layers, raw_height_map, raw_valid_mask, local_ground_height = _build_clean_navigation_map_layers(
+            env=self.env,
+            sensor_names=params["sensor_names"],
+            asset_name=params["asset_name"],
+            x_range=params["x_range"],
+            y_range=params["y_range"],
+            resolution=params["resolution"],
+            step_threshold=params["step_threshold"],
+            height_reference_x_range=params["height_reference_x_range"],
+            height_reference_y_range=params["height_reference_y_range"],
+            slope_normalization=params["slope_normalization"],
+            roughness_normalization=params["roughness_normalization"],
+            step_normalization=params["step_normalization"],
+            slope_weight=params["slope_weight"],
+            roughness_weight=params["roughness_weight"],
+            step_weight=params["step_weight"],
+            unknown_penalty=params["unknown_penalty"],
+        )
+        self.clean_layers = clean_layers
+        self.clean_flat_map = _flatten_navigation_layers(clean_layers)
+        self.raw_height_map = raw_height_map
+        self.raw_valid_mask = raw_valid_mask
+        self.local_ground_height = local_ground_height
+        self.policy_flat_map = None
+        self._signature = signature
+        self.cache_valid[:] = True
+        self.last_update_step = current_step
+        self.last_update_step_per_env[:] = current_step
+        self.real_map_updates += 1
+        self.total_update_time_s += time.perf_counter() - start_time
+        self._maybe_print_profile()
+
+    def _maybe_print_profile(self) -> None:
+        if not self.profile_enabled or self.real_map_updates % 100 != 0:
+            return
+        avg_ms = 1000.0 * self.total_update_time_s / max(self.real_map_updates, 1)
+        print(
+            "[RangerLocalMapManager] "
+            f"updates={self.real_map_updates} hits={self.cache_hits} misses={self.cache_misses} "
+            f"avg_update_ms={avg_ms:.3f} interval={self.map_update_interval}",
+            flush=True,
+        )
+
+
+def get_local_map_manager(env: ManagerBasedEnv, map_update_interval: int | None = None) -> RangerLocalMapManager:
+    manager = getattr(env, LOCAL_MAP_MANAGER_ATTR, None)
+    if map_update_interval is None:
+        map_update_interval = _resolve_map_update_interval(env)
+    if manager is None:
+        manager = RangerLocalMapManager(env=env, map_update_interval=map_update_interval)
+        setattr(env, LOCAL_MAP_MANAGER_ATTR, manager)
+    else:
+        manager.map_update_interval = max(int(map_update_interval), 1)
+    return manager
+
+
+def reset_local_map_cache(env: ManagerBasedEnv, env_ids=None) -> None:
+    manager = getattr(env, LOCAL_MAP_MANAGER_ATTR, None)
+    if manager is not None:
+        manager.invalidate(env_ids)
+
+
 def local_sensor_visibility_maps(
     env: ManagerBasedEnv,
     sensor_names: tuple[str, ...],
@@ -229,6 +443,7 @@ def local_navigation_map_layers(
     valid_row_dropout_prob: float = 0.0,
     valid_col_dropout_prob: float = 0.0,
     map_shift_max_cells: int = 0,
+    map_update_interval: int | None = None,
     slope_weight: float = 0.4,
     roughness_weight: float = 0.3,
     step_weight: float = 0.3,
@@ -237,52 +452,30 @@ def local_navigation_map_layers(
 ) -> dict[str, torch.Tensor]:
     """Return the unflattened local navigation layers for planning-aware policies."""
 
+    manager = get_local_map_manager(env, map_update_interval=map_update_interval)
     if use_neutral_map:
-        return _build_neutral_navigation_map_layers(
-            env=env,
+        return manager.get_neutral_layers(
             x_range=x_range,
             y_range=y_range,
             resolution=resolution,
         )
 
-    height_map_raw, valid_mask = _build_local_height_map(
-        env=env,
+    params = _pack_local_map_params(
         sensor_names=sensor_names,
         asset_name=asset_name,
         x_range=x_range,
         y_range=y_range,
         resolution=resolution,
-    )
-    height_map = _normalize_height_map(
-        height_map_raw=height_map_raw,
-        valid_mask=valid_mask,
-        x_range=x_range,
-        y_range=y_range,
-        resolution=resolution,
-        reference_x_range=height_reference_x_range,
-        reference_y_range=height_reference_y_range,
-    )
-    slope_map = _normalize_risk_map(
-        _compute_slope_map(height_map, valid_mask, resolution),
-        valid_mask,
-        normalization=slope_normalization,
-    )
-    roughness_map = _normalize_risk_map(
-        _compute_roughness_map(height_map, valid_mask),
-        valid_mask,
-        normalization=roughness_normalization,
-    )
-    step_map = _normalize_risk_map(
-        _compute_step_map(height_map, valid_mask, step_threshold),
-        valid_mask,
-        normalization=step_normalization,
-    )
-    height_map, slope_map, roughness_map, step_map, valid_mask = _apply_local_map_noise(
-        height_map=height_map,
-        slope_map=slope_map,
-        roughness_map=roughness_map,
-        step_map=step_map,
-        valid_mask=valid_mask,
+        step_threshold=step_threshold,
+        height_reference_x_range=height_reference_x_range,
+        height_reference_y_range=height_reference_y_range,
+        slope_normalization=slope_normalization,
+        roughness_normalization=roughness_normalization,
+        step_normalization=step_normalization,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        unknown_penalty=unknown_penalty,
         apply_noise=apply_noise,
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
@@ -298,25 +491,8 @@ def local_navigation_map_layers(
         valid_col_dropout_prob=valid_col_dropout_prob,
         map_shift_max_cells=map_shift_max_cells,
     )
-    traversability_map = _compute_traversability_map(
-        slope_map=slope_map,
-        roughness_map=roughness_map,
-        step_map=step_map,
-        valid_mask=valid_mask,
-        slope_weight=slope_weight,
-        roughness_weight=roughness_weight,
-        step_weight=step_weight,
-        unknown_penalty=unknown_penalty,
-    )
-
-    return {
-        "height": height_map,
-        "slope": slope_map,
-        "roughness": roughness_map,
-        "step": step_map,
-        "traversability": traversability_map,
-        "valid_mask": valid_mask.to(height_map.dtype),
-    }
+    clean_layers = manager.get_clean_layers(**params)
+    return _maybe_apply_navigation_map_noise(clean_layers=clean_layers, **params)
 
 
 def local_navigation_map(
@@ -346,6 +522,7 @@ def local_navigation_map(
     valid_row_dropout_prob: float = 0.0,
     valid_col_dropout_prob: float = 0.0,
     map_shift_max_cells: int = 0,
+    map_update_interval: int | None = None,
     slope_weight: float = 0.4,
     roughness_weight: float = 0.3,
     step_weight: float = 0.3,
@@ -354,8 +531,27 @@ def local_navigation_map(
 ) -> torch.Tensor:
     """Build a local six-layer navigation map from ray-based terrain perception."""
 
-    layers_dict = local_navigation_map_layers(
-        env=env,
+    if use_neutral_map:
+        layers_dict = local_navigation_map_layers(
+            env=env,
+            sensor_names=sensor_names,
+            asset_name=asset_name,
+            x_range=x_range,
+            y_range=y_range,
+            resolution=resolution,
+            step_threshold=step_threshold,
+            height_reference_x_range=height_reference_x_range,
+            height_reference_y_range=height_reference_y_range,
+            slope_normalization=slope_normalization,
+            roughness_normalization=roughness_normalization,
+            step_normalization=step_normalization,
+            use_neutral_map=True,
+            map_update_interval=map_update_interval,
+        )
+        return _flatten_navigation_layers(layers_dict)
+
+    manager = get_local_map_manager(env, map_update_interval=map_update_interval)
+    params = _pack_local_map_params(
         sensor_names=sensor_names,
         asset_name=asset_name,
         x_range=x_range,
@@ -367,6 +563,10 @@ def local_navigation_map(
         slope_normalization=slope_normalization,
         roughness_normalization=roughness_normalization,
         step_normalization=step_normalization,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        unknown_penalty=unknown_penalty,
         apply_noise=apply_noise,
         height_noise_std=height_noise_std,
         risk_noise_std=risk_noise_std,
@@ -381,24 +581,10 @@ def local_navigation_map(
         valid_row_dropout_prob=valid_row_dropout_prob,
         valid_col_dropout_prob=valid_col_dropout_prob,
         map_shift_max_cells=map_shift_max_cells,
-        slope_weight=slope_weight,
-        roughness_weight=roughness_weight,
-        step_weight=step_weight,
-        unknown_penalty=unknown_penalty,
-        use_neutral_map=use_neutral_map,
     )
-    layers = torch.stack(
-        (
-            layers_dict["height"],
-            layers_dict["slope"],
-            layers_dict["roughness"],
-            layers_dict["step"],
-            layers_dict["traversability"],
-            layers_dict["valid_mask"],
-        ),
-        dim=1,
-    )
-    return layers.reshape(env.num_envs, -1)
+    if apply_noise:
+        return manager.get_policy_flat_map(**params)
+    return manager.get_clean_flat_map(**params)
 
 
 def local_geometric_map_layers(
@@ -611,6 +797,258 @@ def _build_local_height_map(
     height_map = flat_height.reshape(env.num_envs, num_x, num_y)
     height_map = torch.where(valid_mask, height_map, torch.full_like(height_map, invalid_height))
     return height_map, valid_mask
+
+
+def _build_clean_navigation_map_layers(
+    env: ManagerBasedEnv,
+    sensor_names: tuple[str, ...],
+    asset_name: str,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    resolution: float,
+    step_threshold: float,
+    height_reference_x_range: tuple[float, float],
+    height_reference_y_range: tuple[float, float],
+    slope_normalization: float,
+    roughness_normalization: float,
+    step_normalization: float,
+    slope_weight: float,
+    roughness_weight: float,
+    step_weight: float,
+    unknown_penalty: float,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build clean local navigation layers from ray sensors.
+
+    This is the only path that should call ``_build_local_height_map`` for the
+    policy/reward local map during normal training.
+    """
+
+    height_map_raw, valid_mask = _build_local_height_map(
+        env=env,
+        sensor_names=sensor_names,
+        asset_name=asset_name,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+    )
+    local_ground_height = _compute_height_reference(
+        height_map_raw=height_map_raw,
+        valid_mask=valid_mask,
+        x_range=x_range,
+        y_range=y_range,
+        resolution=resolution,
+        reference_x_range=height_reference_x_range,
+        reference_y_range=height_reference_y_range,
+    )
+    height_map = torch.where(valid_mask, height_map_raw - local_ground_height[:, None, None], torch.zeros_like(height_map_raw))
+    slope_map = _normalize_risk_map(
+        _compute_slope_map(height_map, valid_mask, resolution),
+        valid_mask,
+        normalization=slope_normalization,
+    )
+    roughness_map = _normalize_risk_map(
+        _compute_roughness_map(height_map, valid_mask),
+        valid_mask,
+        normalization=roughness_normalization,
+    )
+    step_map = _normalize_risk_map(
+        _compute_step_map(height_map, valid_mask, step_threshold),
+        valid_mask,
+        normalization=step_normalization,
+    )
+    traversability_map = _compute_traversability_map(
+        slope_map=slope_map,
+        roughness_map=roughness_map,
+        step_map=step_map,
+        valid_mask=valid_mask,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        unknown_penalty=unknown_penalty,
+    )
+    clean_layers = {
+        "height": height_map,
+        "slope": slope_map,
+        "roughness": roughness_map,
+        "step": step_map,
+        "traversability": traversability_map,
+        "valid_mask": valid_mask.to(height_map.dtype),
+    }
+    return clean_layers, height_map_raw, valid_mask, local_ground_height
+
+
+def _flatten_navigation_layers(layers_dict: dict[str, torch.Tensor]) -> torch.Tensor:
+    layers = torch.stack(
+        (
+            layers_dict["height"],
+            layers_dict["slope"],
+            layers_dict["roughness"],
+            layers_dict["step"],
+            layers_dict["traversability"],
+            layers_dict["valid_mask"],
+        ),
+        dim=1,
+    )
+    return layers.reshape(layers.shape[0], -1)
+
+
+def _maybe_apply_navigation_map_noise(
+    clean_layers: dict[str, torch.Tensor],
+    apply_noise: bool,
+    height_noise_std: float,
+    risk_noise_std: float,
+    valid_dropout_prob: float,
+    height_bias_std: float,
+    height_spatial_noise_std: float,
+    risk_bias_std: float,
+    risk_spatial_noise_std: float,
+    spatial_noise_kernel_size: int,
+    valid_block_dropout_prob: float,
+    valid_block_dropout_size: int,
+    valid_row_dropout_prob: float,
+    valid_col_dropout_prob: float,
+    map_shift_max_cells: int,
+    slope_weight: float,
+    roughness_weight: float,
+    step_weight: float,
+    unknown_penalty: float,
+    **_: object,
+) -> dict[str, torch.Tensor]:
+    if not apply_noise:
+        return clean_layers
+
+    valid_mask = clean_layers["valid_mask"] > 0.5
+    height_map, slope_map, roughness_map, step_map, valid_mask = _apply_local_map_noise(
+        height_map=clean_layers["height"],
+        slope_map=clean_layers["slope"],
+        roughness_map=clean_layers["roughness"],
+        step_map=clean_layers["step"],
+        valid_mask=valid_mask,
+        apply_noise=apply_noise,
+        height_noise_std=height_noise_std,
+        risk_noise_std=risk_noise_std,
+        valid_dropout_prob=valid_dropout_prob,
+        height_bias_std=height_bias_std,
+        height_spatial_noise_std=height_spatial_noise_std,
+        risk_bias_std=risk_bias_std,
+        risk_spatial_noise_std=risk_spatial_noise_std,
+        spatial_noise_kernel_size=spatial_noise_kernel_size,
+        valid_block_dropout_prob=valid_block_dropout_prob,
+        valid_block_dropout_size=valid_block_dropout_size,
+        valid_row_dropout_prob=valid_row_dropout_prob,
+        valid_col_dropout_prob=valid_col_dropout_prob,
+        map_shift_max_cells=map_shift_max_cells,
+    )
+    traversability_map = _compute_traversability_map(
+        slope_map=slope_map,
+        roughness_map=roughness_map,
+        step_map=step_map,
+        valid_mask=valid_mask,
+        slope_weight=slope_weight,
+        roughness_weight=roughness_weight,
+        step_weight=step_weight,
+        unknown_penalty=unknown_penalty,
+    )
+    return {
+        "height": height_map,
+        "slope": slope_map,
+        "roughness": roughness_map,
+        "step": step_map,
+        "traversability": traversability_map,
+        "valid_mask": valid_mask.to(height_map.dtype),
+    }
+
+
+def _pack_local_map_params(
+    sensor_names: tuple[str, ...],
+    asset_name: str,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    resolution: float,
+    step_threshold: float,
+    height_reference_x_range: tuple[float, float],
+    height_reference_y_range: tuple[float, float],
+    slope_normalization: float,
+    roughness_normalization: float,
+    step_normalization: float,
+    slope_weight: float,
+    roughness_weight: float,
+    step_weight: float,
+    unknown_penalty: float,
+    apply_noise: bool = False,
+    height_noise_std: float = 0.0,
+    risk_noise_std: float = 0.0,
+    valid_dropout_prob: float = 0.0,
+    height_bias_std: float = 0.0,
+    height_spatial_noise_std: float = 0.0,
+    risk_bias_std: float = 0.0,
+    risk_spatial_noise_std: float = 0.0,
+    spatial_noise_kernel_size: int = 3,
+    valid_block_dropout_prob: float = 0.0,
+    valid_block_dropout_size: int = 3,
+    valid_row_dropout_prob: float = 0.0,
+    valid_col_dropout_prob: float = 0.0,
+    map_shift_max_cells: int = 0,
+) -> dict[str, object]:
+    return {
+        "sensor_names": tuple(sensor_names),
+        "asset_name": asset_name,
+        "x_range": tuple(x_range),
+        "y_range": tuple(y_range),
+        "resolution": resolution,
+        "step_threshold": step_threshold,
+        "height_reference_x_range": tuple(height_reference_x_range),
+        "height_reference_y_range": tuple(height_reference_y_range),
+        "slope_normalization": slope_normalization,
+        "roughness_normalization": roughness_normalization,
+        "step_normalization": step_normalization,
+        "slope_weight": slope_weight,
+        "roughness_weight": roughness_weight,
+        "step_weight": step_weight,
+        "unknown_penalty": unknown_penalty,
+        "apply_noise": apply_noise,
+        "height_noise_std": height_noise_std,
+        "risk_noise_std": risk_noise_std,
+        "valid_dropout_prob": valid_dropout_prob,
+        "height_bias_std": height_bias_std,
+        "height_spatial_noise_std": height_spatial_noise_std,
+        "risk_bias_std": risk_bias_std,
+        "risk_spatial_noise_std": risk_spatial_noise_std,
+        "spatial_noise_kernel_size": spatial_noise_kernel_size,
+        "valid_block_dropout_prob": valid_block_dropout_prob,
+        "valid_block_dropout_size": valid_block_dropout_size,
+        "valid_row_dropout_prob": valid_row_dropout_prob,
+        "valid_col_dropout_prob": valid_col_dropout_prob,
+        "map_shift_max_cells": map_shift_max_cells,
+    }
+
+
+def _local_map_signature(params: dict[str, object]) -> tuple:
+    return (
+        params["sensor_names"],
+        params["asset_name"],
+        params["x_range"],
+        params["y_range"],
+        float(params["resolution"]),
+        float(params["step_threshold"]),
+        params["height_reference_x_range"],
+        params["height_reference_y_range"],
+        float(params["slope_normalization"]),
+        float(params["roughness_normalization"]),
+        float(params["step_normalization"]),
+        float(params["slope_weight"]),
+        float(params["roughness_weight"]),
+        float(params["step_weight"]),
+        float(params["unknown_penalty"]),
+    )
+
+
+def _resolve_map_update_interval(env: ManagerBasedEnv) -> int:
+    try:
+        params = env.cfg.observations.policy.local_navigation_map.params
+        return int(params.get("map_update_interval", 4))
+    except Exception:
+        return 4
 
 
 def _compute_slope_map(height_map: torch.Tensor, valid_mask: torch.Tensor, resolution: float) -> torch.Tensor:

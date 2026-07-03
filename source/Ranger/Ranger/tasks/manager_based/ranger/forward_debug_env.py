@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -36,6 +38,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         )
         leg_action_term = self.action_manager.get_term("leg_hydraulic")
         self._prev_stroke_command = leg_action_term.stroke_command.clone()
+        self._enable_forward_debug_metrics = os.environ.get("RANGER_DEBUG_METRICS", "0") == "1"
 
         # Wheel joint forward sign.
         # Joint order: [w_lb, w_lf, w_rf, w_rb]
@@ -49,6 +52,11 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._forward_debug_metric_names = (
             "base_lin_vel_x",
             "flat_weight",
+            "local_height_range",
+            "local_height_std",
+            "local_height_max_abs",
+            "terrain_level",
+            "terrain_type",
             "local_ground_height_b",
             "local_ground_height_w",
             "base_clearance",
@@ -67,6 +75,13 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "stroke_mean",
             "stroke_abs_mean",
             "stroke_rate_mean",
+            "stroke_over_0_5_ratio",
+            "stroke_over_0_55_ratio",
+            "actual_stroke_min",
+            "actual_stroke_max",
+            "actual_stroke_mean",
+            "actual_stroke_over_0_5_ratio",
+            "actual_stroke_over_0_55_ratio",
             "front_stroke_mean",
             "rear_stroke_mean",
             "target_front_rear_stroke_diff",
@@ -162,6 +177,56 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             height_range_weight=flat_stroke_nominal_params["height_range_weight"],
             flatness_gain=flat_stroke_nominal_params["flatness_gain"],
         )
+        local_map_layers = mdp.local_navigation_map_layers(
+            env=self,
+            sensor_names=flat_stroke_nominal_params["sensor_names"],
+            asset_name=flat_stroke_asset_name,
+            x_range=flat_stroke_nominal_params["x_range"],
+            y_range=flat_stroke_nominal_params["y_range"],
+            resolution=flat_stroke_nominal_params["resolution"],
+            step_threshold=flat_stroke_nominal_params["step_threshold"],
+            height_reference_x_range=flat_stroke_nominal_params["height_reference_x_range"],
+            height_reference_y_range=flat_stroke_nominal_params["height_reference_y_range"],
+            slope_normalization=flat_stroke_nominal_params["slope_normalization"],
+            roughness_normalization=flat_stroke_nominal_params["roughness_normalization"],
+            step_normalization=flat_stroke_nominal_params["step_normalization"],
+            apply_noise=False,
+            height_noise_std=0.0,
+            risk_noise_std=0.0,
+            valid_dropout_prob=0.0,
+            slope_weight=flat_stroke_nominal_params["slope_weight"],
+            roughness_weight=flat_stroke_nominal_params["roughness_weight"],
+            step_weight=flat_stroke_nominal_params["step_weight"],
+            unknown_penalty=1.0,
+            use_neutral_map=False,
+        )
+        local_height = local_map_layers["height"]
+        local_valid = local_map_layers["valid_mask"] > 0.5
+        valid_count = torch.clamp(local_valid.sum(dim=(1, 2)).to(torch.float32), min=1.0)
+        local_height_for_max = torch.where(local_valid, local_height, torch.full_like(local_height, -1.0e6))
+        local_height_for_min = torch.where(local_valid, local_height, torch.full_like(local_height, 1.0e6))
+        local_height_max = local_height_for_max.amax(dim=(1, 2))
+        local_height_min = local_height_for_min.amin(dim=(1, 2))
+        local_height_mean = (local_height * local_valid).sum(dim=(1, 2)) / valid_count
+        local_height_var = (
+            torch.square(torch.where(local_valid, local_height - local_height_mean.view(-1, 1, 1), torch.zeros_like(local_height)))
+            .sum(dim=(1, 2))
+            / valid_count
+        )
+        local_height_range = torch.clamp(local_height_max - local_height_min, min=0.0)
+        local_height_std = torch.sqrt(torch.clamp(local_height_var, min=0.0))
+        local_height_max_abs = torch.where(local_valid, torch.abs(local_height), torch.zeros_like(local_height)).amax(dim=(1, 2))
+        terrain = self.scene.terrain
+        terrain_level = (
+            terrain.terrain_levels.to(torch.float32)
+            if terrain is not None and hasattr(terrain, "terrain_levels")
+            else torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        )
+        terrain_type = (
+            terrain.terrain_types.to(torch.float32)
+            if terrain is not None and hasattr(terrain, "terrain_types")
+            else torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        )
         local_ground_height_b = mdp.get_local_ground_height(
             env=self,
             sensor_names=flat_base_clearance_params["sensor_names"],
@@ -182,6 +247,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         semantic_wheel_velocity_target = wheel_velocity_target * self._wheel_forward_sign
         semantic_wheel_joint_vel = wheel_joint_vel * self._wheel_forward_sign
         stroke_command = leg_action_term.stroke_command
+        actual_stroke = leg_action_term.stroke_measured
         stroke_rate = torch.abs(stroke_command - self._prev_stroke_command) / max(self.step_dt, 1.0e-6)
         wheel_pos_w = robot.data.body_pos_w[:, self._wheel_body_ids, :]
         wheel_pos_w_rel = wheel_pos_w - robot.data.root_pos_w.unsqueeze(1)
@@ -223,6 +289,13 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         stroke_mean = torch.mean(stroke_command, dim=1)
         stroke_abs_mean = torch.mean(torch.abs(stroke_command), dim=1)
         stroke_rate_mean = torch.mean(stroke_rate, dim=1)
+        stroke_over_0_5_ratio = torch.mean((stroke_command > 0.5).to(torch.float32), dim=1)
+        stroke_over_0_55_ratio = torch.mean((stroke_command > 0.55).to(torch.float32), dim=1)
+        actual_stroke_min = torch.min(actual_stroke, dim=1).values
+        actual_stroke_max = torch.max(actual_stroke, dim=1).values
+        actual_stroke_mean = torch.mean(actual_stroke, dim=1)
+        actual_stroke_over_0_5_ratio = torch.mean((actual_stroke > 0.5).to(torch.float32), dim=1)
+        actual_stroke_over_0_55_ratio = torch.mean((actual_stroke > 0.55).to(torch.float32), dim=1)
         joint_pos_g_min = torch.min(leg_joint_pos, dim=1).values
         joint_pos_g_max = torch.max(leg_joint_pos, dim=1).values
         joint_pos_g_abs_max = torch.max(torch.abs(leg_joint_pos), dim=1).values
@@ -240,6 +313,11 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         return {
             "base_lin_vel_x": base_lin_vel_x,
             "flat_weight": flat_weight,
+            "local_height_range": local_height_range,
+            "local_height_std": local_height_std,
+            "local_height_max_abs": local_height_max_abs,
+            "terrain_level": terrain_level,
+            "terrain_type": terrain_type,
             "local_ground_height_b": local_ground_height_b,
             "local_ground_height_w": local_ground_height_w,
             "base_clearance": base_clearance,
@@ -258,6 +336,13 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "stroke_mean": stroke_mean,
             "stroke_abs_mean": stroke_abs_mean,
             "stroke_rate_mean": stroke_rate_mean,
+            "stroke_over_0_5_ratio": stroke_over_0_5_ratio,
+            "stroke_over_0_55_ratio": stroke_over_0_55_ratio,
+            "actual_stroke_min": actual_stroke_min,
+            "actual_stroke_max": actual_stroke_max,
+            "actual_stroke_mean": actual_stroke_mean,
+            "actual_stroke_over_0_5_ratio": actual_stroke_over_0_5_ratio,
+            "actual_stroke_over_0_55_ratio": actual_stroke_over_0_55_ratio,
             "front_stroke_mean": front_stroke_mean,
             "rear_stroke_mean": rear_stroke_mean,
             "target_front_rear_stroke_diff": target_front_rear_stroke_diff,
@@ -278,13 +363,17 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         }
 
     def _accumulate_forward_debug_metrics(self) -> None:
+        if not self._enable_forward_debug_metrics:
+            self._accumulate_episode_eval_metrics(None)
+            return
+
         metric_values = self._compute_forward_debug_metric_values()
         for name, value in metric_values.items():
             self._forward_debug_metric_sums[name] += value
         self._forward_debug_metric_counts += 1.0
         self._accumulate_episode_eval_metrics(metric_values)
 
-    def _accumulate_episode_eval_metrics(self, metric_values: dict[str, torch.Tensor]) -> None:
+    def _accumulate_episode_eval_metrics(self, metric_values: dict[str, torch.Tensor] | None) -> None:
         robot = self.scene["robot"]
         joint_limit_margin_params = self.cfg.rewards.joint_limit_margin.params
         joint_pos = robot.data.joint_pos[:, self._leg_joint_ids]
@@ -301,23 +390,37 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         target_speed = float(self.cfg.rewards.velocity_tracking.params["target_speed"])
         base_vertical_velocity = robot.data.root_lin_vel_b[:, 2]
         base_roll_pitch_ang_vel_sq = torch.sum(torch.square(robot.data.root_ang_vel_b[:, :2]), dim=1)
-        velocity_tracking_error = metric_values["base_lin_vel_x"] - target_speed
-        abs_roll_deg = metric_values["abs_roll_deg"]
-        abs_pitch_deg = metric_values["abs_pitch_deg"]
+        if metric_values is None:
+            base_lin_vel_x = robot.data.root_lin_vel_b[:, 0]
+            roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+            roll_deg = torch.rad2deg(roll)
+            pitch_deg = torch.rad2deg(pitch)
+            abs_roll_deg = torch.abs(roll_deg)
+            abs_pitch_deg = torch.abs(pitch_deg)
+        else:
+            base_lin_vel_x = metric_values["base_lin_vel_x"]
+            roll_deg = metric_values["roll_deg"]
+            pitch_deg = metric_values["pitch_deg"]
+            abs_roll_deg = metric_values["abs_roll_deg"]
+            abs_pitch_deg = metric_values["abs_pitch_deg"]
+        velocity_tracking_error = base_lin_vel_x - target_speed
 
         self._eval_step_counts += 1.0
-        self._eval_roll_sq_sum += torch.square(metric_values["roll_deg"])
-        self._eval_pitch_sq_sum += torch.square(metric_values["pitch_deg"])
+        self._eval_roll_sq_sum += torch.square(roll_deg)
+        self._eval_pitch_sq_sum += torch.square(pitch_deg)
         self._eval_roll_abs_max = torch.maximum(self._eval_roll_abs_max, abs_roll_deg)
         self._eval_pitch_abs_max = torch.maximum(self._eval_pitch_abs_max, abs_pitch_deg)
         self._eval_base_vertical_velocity_sq_sum += torch.square(base_vertical_velocity)
         self._eval_base_roll_pitch_ang_vel_sq_sum += base_roll_pitch_ang_vel_sq
-        self._eval_forward_speed_sum += metric_values["base_lin_vel_x"]
+        self._eval_forward_speed_sum += base_lin_vel_x
         self._eval_velocity_tracking_error_sq_sum += torch.square(velocity_tracking_error)
         self._eval_joint_limit_margin_penalty_sum += joint_limit_margin_penalty
         self._eval_joint_limit_margin_count_sum += joint_limit_margin_count
 
     def _consume_forward_debug_logs(self, env_ids) -> dict[str, float]:
+        if not self._enable_forward_debug_metrics:
+            return {}
+
         if isinstance(env_ids, slice):
             env_ids = torch.arange(self.num_envs, device=self.device)
         elif not isinstance(env_ids, torch.Tensor):
@@ -456,6 +559,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         debug_logs = self._consume_forward_debug_logs(env_ids)
         eval_logs = self._consume_episode_eval_logs(env_ids)
         super()._reset_idx(env_ids)
+        mdp.reset_local_map_cache(self, env_ids)
         leg_action_term = self.action_manager.get_term("leg_hydraulic")
         self._prev_stroke_command[env_ids] = leg_action_term.stroke_command[env_ids]
         self.extras["log"].update(debug_logs)

@@ -3,7 +3,10 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import numpy as np
+
 import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -14,6 +17,8 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, RayCasterCameraCfg, patterns
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.terrains.height_field.utils import height_field_to_mesh
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
@@ -21,6 +26,242 @@ from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
 from .terrain_cfg import SIMPLE_TERRAIN_CFG
+
+
+@height_field_to_mesh
+def ranger_mixed_patch_terrain(difficulty: float, cfg) -> np.ndarray:
+    """Generate one traversable tile with multiple forward-direction terrain patches."""
+
+    width_pixels = int(cfg.size[0] / cfg.horizontal_scale)
+    length_pixels = int(cfg.size[1] / cfg.horizontal_scale)
+    heights_m = np.zeros((width_pixels, length_pixels), dtype=np.float32)
+    x = np.linspace(0.0, cfg.size[0], width_pixels, endpoint=False, dtype=np.float32)
+    y = np.linspace(-0.5 * cfg.size[1], 0.5 * cfg.size[1], length_pixels, endpoint=False, dtype=np.float32)
+    yy = y.reshape(1, length_pixels)
+    rng = np.random.default_rng()
+
+    patch_types = ("roughness", "grooves", "low_steps", "ridges", "rolling_slope", "bumps")
+    num_patches = max(2, int(cfg.num_patches))
+    patch_edges = np.linspace(0, width_pixels, num_patches + 1, dtype=np.int32)
+    transition_pixels = max(1, int(cfg.transition_width / cfg.horizontal_scale))
+    carry_height = 0.0
+
+    for patch_index in range(num_patches):
+        start = int(patch_edges[patch_index])
+        stop = int(patch_edges[patch_index + 1])
+        if stop <= start:
+            continue
+
+        patch_type = "flat_transition" if patch_index == 0 else str(rng.choice(patch_types))
+        patch_x = x[start:stop] - x[start]
+        patch_width = max(float(patch_x[-1] + cfg.horizontal_scale), cfg.horizontal_scale)
+        xx = patch_x.reshape(stop - start, 1)
+        patch = np.zeros((stop - start, length_pixels), dtype=np.float32)
+
+        if patch_type == "roughness":
+            amp = cfg.roughness_range[0] + difficulty * (cfg.roughness_range[1] - cfg.roughness_range[0])
+            coarse_x = max(2, int(np.ceil(patch_width / cfg.roughness_scale)))
+            coarse_y = max(2, int(np.ceil(cfg.size[1] / cfg.roughness_scale)))
+            coarse = rng.uniform(-amp, amp, size=(coarse_x, coarse_y)).astype(np.float32)
+            repeat_x = int(np.ceil(patch.shape[0] / coarse_x))
+            repeat_y = int(np.ceil(patch.shape[1] / coarse_y))
+            patch = np.repeat(np.repeat(coarse, repeat_x, axis=0), repeat_y, axis=1)[: patch.shape[0], : patch.shape[1]]
+        elif patch_type == "grooves":
+            amp = cfg.groove_depth_range[0] + difficulty * (cfg.groove_depth_range[1] - cfg.groove_depth_range[0])
+            groove = -amp * np.maximum(0.0, np.cos(2.0 * np.pi * yy / cfg.groove_spacing)) ** 4
+            patch = np.broadcast_to(groove, patch.shape).copy()
+        elif patch_type == "low_steps":
+            step_h = cfg.step_height_range[0] + difficulty * (cfg.step_height_range[1] - cfg.step_height_range[0])
+            step_pixels = max(1, int(cfg.step_width / cfg.horizontal_scale))
+            step_ids = np.floor(np.arange(stop - start, dtype=np.float32) / step_pixels)
+            patch = ((step_ids % 2.0) * step_h).reshape(stop - start, 1)
+            patch = np.broadcast_to(patch, (stop - start, length_pixels)).copy()
+        elif patch_type == "ridges":
+            amp = cfg.ridge_height_range[0] + difficulty * (cfg.ridge_height_range[1] - cfg.ridge_height_range[0])
+            ridge = amp * np.maximum(0.0, np.cos(2.0 * np.pi * yy / cfg.ridge_spacing)) ** 4
+            patch = np.broadcast_to(ridge, patch.shape).copy()
+        elif patch_type == "rolling_slope":
+            slope = cfg.slope_range[0] + difficulty * (cfg.slope_range[1] - cfg.slope_range[0])
+            slope *= float(rng.choice((-1.0, 1.0)))
+            patch = slope * (xx - 0.5 * patch_width)
+            patch += 0.5 * cfg.bump_height_range[1] * np.sin(2.0 * np.pi * xx / max(patch_width, cfg.horizontal_scale))
+            patch = np.broadcast_to(patch, (stop - start, length_pixels)).copy()
+        elif patch_type == "bumps":
+            amp = cfg.bump_height_range[0] + difficulty * (cfg.bump_height_range[1] - cfg.bump_height_range[0])
+            for _ in range(max(1, int(cfg.num_bumps_per_patch))):
+                cx = rng.uniform(0.0, patch_width)
+                cy = rng.uniform(-0.45 * cfg.size[1], 0.45 * cfg.size[1])
+                sx = rng.uniform(0.20, 0.45)
+                sy = rng.uniform(0.15, 0.40)
+                sign = float(rng.choice((-0.6, 1.0)))
+                patch += sign * amp * np.exp(-0.5 * (((xx - cx) / sx) ** 2 + ((yy - cy) / sy) ** 2))
+
+        patch -= float(np.mean(patch[0]))
+        patch += carry_height
+        if patch_index > 0:
+            blend = min(transition_pixels, patch.shape[0])
+            prev = heights_m[start - 1 : start, :]
+            alpha = np.linspace(0.0, 1.0, blend, endpoint=True, dtype=np.float32).reshape(blend, 1)
+            patch[:blend] = (1.0 - alpha) * prev + alpha * patch[:blend]
+        carry_height = float(np.mean(patch[-1]))
+        heights_m[start:stop] = patch
+
+    heights_m -= float(np.mean(heights_m[: max(1, transition_pixels)]))
+    heights_m = np.clip(heights_m, -cfg.max_abs_height, cfg.max_abs_height)
+    return np.rint(heights_m / cfg.vertical_scale).astype(np.int16)
+
+
+@configclass
+class RangerMixedPatchTerrainCfg(terrain_gen.HfTerrainBaseCfg):
+    """Single-tile mixed terrain split into forward-direction traversable patches."""
+
+    function = ranger_mixed_patch_terrain
+
+    num_patches: int = 6
+    transition_width: float = 0.25
+    roughness_range: tuple[float, float] = (0.04, 0.06)
+    roughness_scale: float = 0.35
+    step_height_range: tuple[float, float] = (0.05, 0.10)
+    step_width: float = 0.35
+    ridge_height_range: tuple[float, float] = (0.03, 0.08)
+    ridge_spacing: float = 0.55
+    groove_depth_range: tuple[float, float] = (0.03, 0.08)
+    groove_spacing: float = 0.55
+    bump_height_range: tuple[float, float] = (0.03, 0.08)
+    num_bumps_per_patch: int = 5
+    slope_range: tuple[float, float] = (0.10, 0.22)
+    max_abs_height: float = 0.16
+
+
+SIMPLE_MIXED_TERRAIN_CFG = TerrainImporterCfg(
+    prim_path="/World/ground",
+    terrain_type="generator",
+    terrain_generator=terrain_gen.TerrainGeneratorCfg(
+        seed=41,
+        curriculum=True,
+        size=(8.0, 8.0),
+        border_width=0.0,
+        num_rows=4,
+        num_cols=4,
+        horizontal_scale=0.05,
+        vertical_scale=0.005,
+        slope_threshold=None,
+        difficulty_range=(0.0, 0.6),
+        use_cache=False,
+        sub_terrains={
+            "flat": terrain_gen.MeshPlaneTerrainCfg(proportion=0.30),
+            "gentle_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                proportion=0.25,
+                slope_range=(0.025, 0.10),
+                platform_width=1.8,
+                border_width=0.0,
+            ),
+            "low_roughness": terrain_gen.HfRandomUniformTerrainCfg(
+                proportion=0.25,
+                noise_range=(-0.015, 0.015),
+                noise_step=0.005,
+                downsampled_scale=0.25,
+                border_width=0.0,
+            ),
+            "small_bumps": terrain_gen.HfWaveTerrainCfg(
+                proportion=0.20,
+                amplitude_range=(0.005, 0.020),
+                num_waves=2,
+                border_width=0.0,
+            ),
+        },
+    ),
+    max_init_terrain_level=0,
+    collision_group=-1,
+    physics_material=sim_utils.RigidBodyMaterialCfg(
+        friction_combine_mode="average",
+        restitution_combine_mode="average",
+        static_friction=1.0,
+        dynamic_friction=1.0,
+        restitution=0.0,
+    ),
+    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+    debug_vis=False,
+)
+
+
+MODERATE_MIXED_TERRAIN_CFG = TerrainImporterCfg(
+    prim_path="/World/ground",
+    terrain_type="generator",
+    terrain_generator=terrain_gen.TerrainGeneratorCfg(
+        seed=47,
+        curriculum=True,
+        size=(8.0, 8.0),
+        border_width=0.0,
+        num_rows=4,
+        num_cols=4,
+        horizontal_scale=0.05,
+        vertical_scale=0.005,
+        slope_threshold=None,
+        difficulty_range=(0.35, 0.90),
+        use_cache=False,
+        sub_terrains={
+            "mixed_patch": RangerMixedPatchTerrainCfg(
+                proportion=0.60,
+                num_patches=6,
+                transition_width=0.25,
+                roughness_range=(0.04, 0.06),
+                step_height_range=(0.05, 0.10),
+                ridge_height_range=(0.03, 0.08),
+                groove_depth_range=(0.03, 0.08),
+                bump_height_range=(0.03, 0.08),
+                slope_range=(0.10, 0.22),
+                max_abs_height=0.16,
+                border_width=0.0,
+            ),
+            "flat_transition": terrain_gen.MeshPlaneTerrainCfg(proportion=0.03),
+            "moderate_slope": terrain_gen.HfPyramidSlopedTerrainCfg(
+                proportion=0.07,
+                slope_range=(0.10, 0.22),
+                platform_width=1.2,
+                border_width=0.0,
+            ),
+            "moderate_roughness": terrain_gen.HfRandomUniformTerrainCfg(
+                proportion=0.12,
+                noise_range=(-0.05, 0.05),
+                noise_step=0.005,
+                downsampled_scale=0.20,
+                border_width=0.0,
+            ),
+            "low_steps": terrain_gen.HfPyramidStairsTerrainCfg(
+                proportion=0.10,
+                step_height_range=(0.05, 0.10),
+                step_width=0.35,
+                platform_width=1.2,
+                border_width=0.0,
+            ),
+            "small_ridges": terrain_gen.MeshRailsTerrainCfg(
+                proportion=0.05,
+                rail_thickness_range=(0.12, 0.22),
+                rail_height_range=(0.03, 0.08),
+                platform_width=1.4,
+            ),
+            "shallow_grooves": terrain_gen.HfInvertedPyramidStairsTerrainCfg(
+                proportion=0.03,
+                step_height_range=(0.03, 0.08),
+                step_width=0.40,
+                platform_width=1.4,
+                border_width=0.0,
+            ),
+        },
+    ),
+    max_init_terrain_level=0,
+    collision_group=-1,
+    physics_material=sim_utils.RigidBodyMaterialCfg(
+        friction_combine_mode="average",
+        restitution_combine_mode="average",
+        static_friction=1.0,
+        dynamic_friction=1.0,
+        restitution=0.0,
+    ),
+    visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+    debug_vis=False,
+)
 
 GOAL_STATE_PARAMS = {
     # Stage-1 neutral input: goal_valid=0 and [sin, cos] = [0, 1].
@@ -56,6 +297,7 @@ LOCAL_NAVIGATION_MAP_PARAMS = {
     "valid_row_dropout_prob": 0.0,
     "valid_col_dropout_prob": 0.0,
     "map_shift_max_cells": 0,
+    "map_update_interval": 4,
     "slope_weight": 0.4,
     "roughness_weight": 0.3,
     "step_weight": 0.3,
@@ -207,6 +449,22 @@ class RangerSimpleTerrainSceneCfg(RangerSceneCfg):
 
     ground = None
     terrain = SIMPLE_TERRAIN_CFG
+
+
+@configclass
+class RangerSimpleMixedTerrainSceneCfg(RangerSceneCfg):
+    """Scene configuration with conservative flat/slope/roughness/bump terrain mix."""
+
+    ground = None
+    terrain = SIMPLE_MIXED_TERRAIN_CFG
+
+
+@configclass
+class RangerModerateMixedTerrainSceneCfg(RangerSceneCfg):
+    """Scene configuration with moderate mixed terrain for Stage-B clean-map training."""
+
+    ground = None
+    terrain = MODERATE_MIXED_TERRAIN_CFG
 
 
 ##
@@ -510,8 +768,8 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 2
         self.episode_length_s = 5
         # viewer settings
-        self.viewer.eye = (-10.0, 20.0, 5.0)
-        self.viewer.lookat = (-10.0, 7.0, 0.0)
+        self.viewer.eye = (-7.0, 20.0, 5.0)
+        self.viewer.lookat = (-7.0, 7.0, 0.0)
         # simulation settings
         self.sim.dt = 1 / 120
         self.sim.render_interval = self.decimation
@@ -681,8 +939,8 @@ class RangerSimpleTerrainVisualEnvCfg(RangerSimpleTerrainEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
-        self.viewer.eye = (-10.0, 20.0, 5.0)
-        self.viewer.lookat = (-10.0, 7.0, 0.0)
+        self.viewer.eye = (-7.0, 20.0, 5.0)
+        self.viewer.lookat = (-7.0, 7.0, 0.0)
 
 
 @configclass
@@ -766,6 +1024,80 @@ class RangerMapPostureComplexNoiseEnvCfg(RangerMapPostureEnvCfg):
 
 
 @configclass
+class RangerMapPostureSimpleMixedTerrainEnvCfg(RangerMapPostureEnvCfg):
+    """Stage-A clean-map posture fine-tuning on a conservative mixed terrain set."""
+
+    scene: RangerSimpleMixedTerrainSceneCfg = RangerSimpleMixedTerrainSceneCfg(num_envs=4096, env_spacing=4.0)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        local_map_params = self.observations.policy.local_navigation_map.params
+        local_map_params["use_neutral_map"] = False
+        local_map_params["apply_noise"] = False
+
+
+@configclass
+class RangerMapPostureModerateMixedTerrainEnvCfg(RangerMapPostureEnvCfg):
+    """Stage-B clean-map posture fine-tuning on moderate mixed terrain."""
+
+    scene: RangerModerateMixedTerrainSceneCfg = RangerModerateMixedTerrainSceneCfg(num_envs=4096, env_spacing=4.0)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        local_map_params = self.observations.policy.local_navigation_map.params
+        local_map_params["use_neutral_map"] = False
+        local_map_params["apply_noise"] = False
+
+        self.rewards.roll_angle.weight = -5.0
+        self.rewards.pitch_angle.weight = -7.5
+        self.rewards.base_vertical_velocity.weight = -1.25
+        self.rewards.base_roll_pitch_rate.weight = -0.45
+        self.rewards.action_rate.weight = -0.06
+        self.rewards.flat_stroke_nominal.weight = -10.0
+        self.rewards.flat_stroke_nominal.params["stroke_nominal"] = 0.4
+        self.rewards.flat_stroke_high.weight = -18.0
+        self.rewards.flat_stroke_high.params["stroke_mean_limit"] = 0.50
+        self.rewards.base_height_low.weight = -8.0
+        self.rewards.base_height_low.params["target_height"] = 0.78
+        self.rewards.flat_root_height.weight = -10.0
+        self.rewards.flat_root_height.params["root_height_nominal"] = 0.88
+        self.rewards.flat_base_clearance.weight = -4.0
+        self.rewards.flat_base_clearance.params["clearance_nominal"] = 0.88
+        self.rewards.stroke_soft_limit_0_50 = RewTerm(
+            func=mdp.stroke_soft_limit_penalty,
+            weight=-8.0,
+            params={"limit": 0.50, "quadratic_gain": 4.0},
+        )
+        self.rewards.stroke_soft_limit_0_55 = RewTerm(
+            func=mdp.stroke_soft_limit_penalty,
+            weight=-18.0,
+            params={"limit": 0.55, "quadratic_gain": 4.0},
+        )
+        self.rewards.actual_stroke_nominal = RewTerm(
+            func=mdp.actual_stroke_nominal_l2,
+            weight=-16.0,
+            params={"stroke_nominal": 0.40},
+        )
+        self.rewards.actual_stroke_soft_limit_0_50 = RewTerm(
+            func=mdp.actual_stroke_soft_limit_penalty,
+            weight=-12.0,
+            params={"limit": 0.50, "quadratic_gain": 4.0},
+        )
+        self.rewards.actual_stroke_soft_limit_0_55 = RewTerm(
+            func=mdp.actual_stroke_soft_limit_penalty,
+            weight=-25.0,
+            params={"limit": 0.55, "quadratic_gain": 4.0},
+        )
+        self.rewards.actual_stroke_rate = RewTerm(
+            func=mdp.actual_stroke_rate_l2,
+            weight=-0.8,
+            params={"action_name": "leg_hydraulic"},
+        )
+
+
+@configclass
 class RangerMapPostureVisualEnvCfg(RangerMapPostureEnvCfg):
     """Stage-4 posture task tuned for interactive visualization."""
 
@@ -775,5 +1107,5 @@ class RangerMapPostureVisualEnvCfg(RangerMapPostureEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 4
         self.scene.env_spacing = 8.0
-        self.viewer.eye = (-10.0, 20.0, 5.0)
-        self.viewer.lookat = (-10.0, 0.0, 0.8)
+        self.viewer.eye = (-7.0, 20.0, 5.0)
+        self.viewer.lookat = (-7.0, 7.0, 0.0)

@@ -261,6 +261,13 @@ class HydraulicActuatorAction(ActionTerm):
         return self._stroke_command
 
     @property
+    def stroke_measured(self) -> torch.Tensor:
+        """Current equivalent hydraulic stroke estimated from measured joint positions."""
+
+        joint_pos = self._asset.data.joint_pos[:, self._joint_ids] * self._joint_position_sign
+        return self._interp_joint_pos_to_stroke(joint_pos)
+
+    @property
     def position_target(self) -> torch.Tensor:
         """Current mapped joint position target from the stroke command."""
         return self._position_target
@@ -330,6 +337,21 @@ class HydraulicActuatorAction(ActionTerm):
         ratio = (flat_stroke - stroke_lower) / (stroke_upper - stroke_lower)
         joint_pos = joint_lower + ratio * (joint_upper - joint_lower)
         return joint_pos.reshape_as(stroke)
+
+    def _interp_joint_pos_to_stroke(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        joint_pos_clamped = torch.clamp(joint_pos, min=self._joint_pos_table[0], max=self._joint_pos_table[-1])
+        flat_joint_pos = joint_pos_clamped.reshape(-1)
+        upper_ids = torch.bucketize(flat_joint_pos, self._joint_pos_table)
+        upper_ids = torch.clamp(upper_ids, min=1, max=self._joint_pos_table.numel() - 1)
+        lower_ids = upper_ids - 1
+
+        joint_lower = self._joint_pos_table[lower_ids]
+        joint_upper = self._joint_pos_table[upper_ids]
+        stroke_lower = self._stroke_table[lower_ids]
+        stroke_upper = self._stroke_table[upper_ids]
+        ratio = (flat_joint_pos - joint_lower) / (joint_upper - joint_lower)
+        stroke = stroke_lower + ratio * (stroke_upper - stroke_lower)
+        return stroke.reshape_as(joint_pos)
 
 
 @configclass

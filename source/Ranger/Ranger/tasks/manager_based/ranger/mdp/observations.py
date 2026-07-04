@@ -17,6 +17,341 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 
 
+SPEED_COMMAND_ATTR = "_ranger_speed_command"
+SPEED_COMMAND_TARGET_ATTR = "_ranger_speed_command_target"
+SPEED_COMMAND_TIMER_ATTR = "_ranger_speed_command_timer"
+SPEED_COMMAND_DURATION_ATTR = "_ranger_speed_command_duration"
+GOAL_HEADING_TARGET_ATTR = "_ranger_goal_heading_target_pos_w"
+GOAL_HEADING_PREV_HEADING_ERROR_ATTR = "_ranger_goal_heading_prev_heading_error"
+
+
+def _as_env_ids(env: ManagerBasedEnv, env_ids) -> torch.Tensor:
+    if env_ids is None or isinstance(env_ids, slice):
+        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    if isinstance(env_ids, torch.Tensor):
+        return env_ids.to(device=env.device, dtype=torch.long)
+    return torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+
+def _ensure_speed_command_buffers(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    command = getattr(env, SPEED_COMMAND_ATTR, None)
+    command_target = getattr(env, SPEED_COMMAND_TARGET_ATTR, None)
+    command_timer = getattr(env, SPEED_COMMAND_TIMER_ATTR, None)
+    command_duration = getattr(env, SPEED_COMMAND_DURATION_ATTR, None)
+    needs_init = (
+        command is None
+        or command_target is None
+        or command_timer is None
+        or command_duration is None
+        or command.shape != (env.num_envs, 2)
+        or command_target.shape != (env.num_envs, 2)
+        or command_timer.shape != (env.num_envs,)
+        or command_duration.shape != (env.num_envs,)
+    )
+    if needs_init:
+        command = torch.zeros((env.num_envs, 2), device=env.device, dtype=torch.float32)
+        command_target = torch.zeros((env.num_envs, 2), device=env.device, dtype=torch.float32)
+        command_timer = torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+        command_duration = torch.ones(env.num_envs, device=env.device, dtype=torch.float32)
+        setattr(env, SPEED_COMMAND_ATTR, command)
+        setattr(env, SPEED_COMMAND_TARGET_ATTR, command_target)
+        setattr(env, SPEED_COMMAND_TIMER_ATTR, command_timer)
+        setattr(env, SPEED_COMMAND_DURATION_ATTR, command_duration)
+    return command, command_target, command_timer, command_duration
+
+
+def _sample_speed_command_targets(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    stage: str,
+    v_x_range: tuple[float, float],
+    yaw_rate_range: tuple[float, float],
+    command_duration_range: tuple[float, float],
+    small_yaw_prob: float = 0.0,
+    small_yaw_range: tuple[float, float] = (0.03, 0.08),
+    v_x_bins: tuple[tuple[float, float], ...] | None = None,
+) -> None:
+    command, command_target, command_timer, command_duration = _ensure_speed_command_buffers(env)
+    if env_ids.numel() == 0:
+        return
+
+    num = env_ids.numel()
+    if v_x_bins:
+        selector = torch.randint(len(v_x_bins), (num,), device=env.device)
+        v_x_target = torch.empty(num, device=env.device, dtype=torch.float32)
+        for bin_id, speed_range in enumerate(v_x_bins):
+            mask = selector == bin_id
+            if torch.any(mask):
+                v_x_target[mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                    float(speed_range[0]), float(speed_range[1])
+                )[mask]
+        command_target[env_ids, 0] = v_x_target
+    else:
+        command_target[env_ids, 0] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+            float(v_x_range[0]), float(v_x_range[1])
+        )
+    if stage.upper() == "A":
+        selector = torch.rand(num, device=env.device)
+        yaw_target = torch.zeros(num, device=env.device, dtype=torch.float32)
+        half_prob = 0.5 * max(float(small_yaw_prob), 0.0)
+        neg_mask = selector < half_prob
+        pos_mask = (selector >= half_prob) & (selector < 2.0 * half_prob)
+        if torch.any(neg_mask):
+            yaw_target[neg_mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                -float(small_yaw_range[1]), -float(small_yaw_range[0])
+            )[neg_mask]
+        if torch.any(pos_mask):
+            yaw_target[pos_mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                float(small_yaw_range[0]), float(small_yaw_range[1])
+            )[pos_mask]
+        command_target[env_ids, 1] = yaw_target
+    else:
+        selector = torch.rand(num, device=env.device)
+        yaw_target = torch.zeros(num, device=env.device, dtype=torch.float32)
+        neg_mask = (selector >= 0.4) & (selector < 0.7)
+        pos_mask = selector >= 0.7
+        if torch.any(neg_mask):
+            yaw_target[neg_mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                float(yaw_rate_range[0]), -0.12
+            )[neg_mask]
+        if torch.any(pos_mask):
+            yaw_target[pos_mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                0.12, float(yaw_rate_range[1])
+            )[pos_mask]
+        command_target[env_ids, 1] = yaw_target
+
+    command_timer[env_ids] = 0.0
+    command_duration[env_ids] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+        float(command_duration_range[0]), float(command_duration_range[1])
+    )
+    just_initialized = torch.all(command[env_ids] == 0.0, dim=1)
+    if torch.any(just_initialized):
+        command[env_ids[just_initialized]] = command_target[env_ids[just_initialized]]
+
+
+def reset_speed_command(
+    env: ManagerBasedEnv,
+    env_ids,
+    stage: str = "A",
+    v_x_range: tuple[float, float] = (0.05, 0.4),
+    yaw_rate_range: tuple[float, float] = (-0.4, 0.4),
+    command_duration_range: tuple[float, float] = (2.0, 5.0),
+    small_yaw_prob: float = 0.0,
+    small_yaw_range: tuple[float, float] = (0.03, 0.08),
+    v_x_bins: tuple[tuple[float, float], ...] | None = None,
+) -> None:
+    """Initialize per-env speed-command buffers at reset."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    command, _, _, _ = _ensure_speed_command_buffers(env)
+    command[env_ids] = 0.0
+    _sample_speed_command_targets(
+        env=env,
+        env_ids=env_ids,
+        stage=stage,
+        v_x_range=v_x_range,
+        yaw_rate_range=yaw_rate_range,
+        command_duration_range=command_duration_range,
+        small_yaw_prob=small_yaw_prob,
+        small_yaw_range=small_yaw_range,
+        v_x_bins=v_x_bins,
+    )
+
+
+def update_speed_command(
+    env: ManagerBasedEnv,
+    stage: str = "A",
+    v_x_range: tuple[float, float] = (0.05, 0.4),
+    yaw_rate_range: tuple[float, float] = (-0.4, 0.4),
+    command_duration_range: tuple[float, float] = (2.0, 5.0),
+    smoothing_alpha: float = 0.1,
+    small_yaw_prob: float = 0.0,
+    small_yaw_range: tuple[float, float] = (0.03, 0.08),
+    v_x_bins: tuple[tuple[float, float], ...] | None = None,
+) -> torch.Tensor:
+    """Update and return the smoothed dynamic speed command."""
+
+    command, command_target, command_timer, command_duration = _ensure_speed_command_buffers(env)
+    dt = float(getattr(env, "step_dt", 1.0 / 60.0))
+    command_timer += dt
+    expired = command_timer >= command_duration
+    if torch.any(expired):
+        _sample_speed_command_targets(
+            env=env,
+            env_ids=expired.nonzero(as_tuple=False).squeeze(-1),
+            stage=stage,
+            v_x_range=v_x_range,
+            yaw_rate_range=yaw_rate_range,
+            command_duration_range=command_duration_range,
+            small_yaw_prob=small_yaw_prob,
+            small_yaw_range=small_yaw_range,
+            v_x_bins=v_x_bins,
+        )
+    alpha = float(smoothing_alpha)
+    command[:] = command + alpha * (command_target - command)
+    return command
+
+
+def speed_command(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return current smoothed ``[v_x_cmd, yaw_rate_cmd]`` without updating it."""
+
+    command, _, _, _ = _ensure_speed_command_buffers(env)
+    return command
+
+
+def speed_command_target(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return current command target ``[v_x_cmd_target, yaw_rate_cmd_target]``."""
+
+    _, command_target, _, _ = _ensure_speed_command_buffers(env)
+    return command_target
+
+
+def speed_command_time_left(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return seconds until each command target is resampled."""
+
+    _, _, command_timer, command_duration = _ensure_speed_command_buffers(env)
+    return torch.clamp(command_duration - command_timer, min=0.0)
+
+
+def speed_command_state(
+    env: ManagerBasedEnv,
+    stage: str = "A",
+    v_x_range: tuple[float, float] = (0.05, 0.4),
+    yaw_rate_range: tuple[float, float] = (-0.4, 0.4),
+    command_duration_range: tuple[float, float] = (2.0, 5.0),
+    smoothing_alpha: float = 0.1,
+    max_command_duration: float = 5.0,
+    small_yaw_prob: float = 0.0,
+    small_yaw_range: tuple[float, float] = (0.03, 0.08),
+    v_x_bins: tuple[tuple[float, float], ...] | None = None,
+) -> torch.Tensor:
+    """Return six-dimensional dynamic velocity-command observation."""
+
+    command = update_speed_command(
+        env=env,
+        stage=stage,
+        v_x_range=v_x_range,
+        yaw_rate_range=yaw_rate_range,
+        command_duration_range=command_duration_range,
+        smoothing_alpha=smoothing_alpha,
+        small_yaw_prob=small_yaw_prob,
+        small_yaw_range=small_yaw_range,
+        v_x_bins=v_x_bins,
+    )
+    _, command_target, _, _ = _ensure_speed_command_buffers(env)
+    time_left = speed_command_time_left(env)
+    obs = torch.zeros((env.num_envs, 6), device=env.device, dtype=torch.float32)
+    obs[:, 0] = torch.clamp(command[:, 0] / 0.45, min=-1.0, max=1.0)
+    obs[:, 1] = torch.clamp(command[:, 1], min=-1.0, max=1.0)
+    obs[:, 2] = torch.sin(command[:, 1])
+    obs[:, 3] = torch.cos(command[:, 1])
+    obs[:, 4] = torch.clamp(command_target[:, 0] / 0.45, min=-1.0, max=1.0)
+    obs[:, 5] = torch.clamp(time_left / max(float(max_command_duration), 1.0e-6), min=0.0, max=1.0)
+    return obs
+
+
+def _ensure_goal_heading_target(env: ManagerBasedEnv) -> torch.Tensor:
+    target_pos_w = getattr(env, GOAL_HEADING_TARGET_ATTR, None)
+    if target_pos_w is None or target_pos_w.shape != (env.num_envs, 3):
+        target_pos_w = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)
+        setattr(env, GOAL_HEADING_TARGET_ATTR, target_pos_w)
+    return target_pos_w
+
+
+def reset_goal_heading_target(
+    env: ManagerBasedEnv,
+    env_ids,
+    distance_range: tuple[float, float] = (2.0, 5.0),
+    heading_range: tuple[float, float] = (-0.7853981633974483, 0.7853981633974483),
+    heading_bins: tuple[tuple[float, float], ...] | None = None,
+    heading_bin_probs: tuple[float, ...] | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Sample a per-episode target point in front of the robot's reset heading."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w = _ensure_goal_heading_target(env)
+    num = env_ids.numel()
+    distance = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+        float(distance_range[0]), float(distance_range[1])
+    )
+    if heading_bins:
+        if heading_bin_probs is None:
+            probabilities = torch.ones(len(heading_bins), device=env.device, dtype=torch.float32)
+        else:
+            if len(heading_bin_probs) != len(heading_bins):
+                raise ValueError("heading_bin_probs must have the same length as heading_bins.")
+            probabilities = torch.tensor(heading_bin_probs, device=env.device, dtype=torch.float32)
+        probabilities = probabilities / torch.clamp(probabilities.sum(), min=1.0e-6)
+        selector = torch.multinomial(probabilities, num, replacement=True)
+        heading = torch.empty(num, device=env.device, dtype=torch.float32)
+        for bin_id, angle_range in enumerate(heading_bins):
+            mask = selector == bin_id
+            if torch.any(mask):
+                heading[mask] = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+                    float(angle_range[0]), float(angle_range[1])
+                )[mask]
+    else:
+        heading = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+            float(heading_range[0]), float(heading_range[1])
+        )
+    target_vec_b = torch.zeros((num, 3), device=env.device, dtype=torch.float32)
+    target_vec_b[:, 0] = distance * torch.cos(heading)
+    target_vec_b[:, 1] = distance * torch.sin(heading)
+    target_vec_w = math_utils.quat_apply_yaw(asset.data.root_quat_w[env_ids], target_vec_b)
+    target_pos_w[env_ids] = asset.data.root_pos_w[env_ids] + target_vec_w
+    prev_heading_error = getattr(env, GOAL_HEADING_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is not None and prev_heading_error.shape == (env.num_envs,):
+        prev_heading_error[env_ids] = float("nan")
+
+
+def goal_heading_target_pos_w(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return sampled goal-heading target positions in world frame."""
+
+    return _ensure_goal_heading_target(env)
+
+
+def goal_heading_target_body(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return target vector, distance, and heading error in the robot body frame."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w = _ensure_goal_heading_target(env)
+    target_vec_w = target_pos_w - asset.data.root_pos_w
+    target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w, target_vec_w)
+    target_xy_b = target_vec_b[:, :2]
+    distance = torch.norm(target_xy_b, dim=1)
+    heading_error = torch.atan2(target_xy_b[:, 1], target_xy_b[:, 0])
+    return target_vec_b, distance, heading_error
+
+
+def goal_heading_state(
+    env: ManagerBasedEnv,
+    goal_range: float = 5.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return six-dimensional target-heading descriptor in the body frame."""
+
+    if goal_range <= 0.0:
+        raise ValueError(f"goal_range must be positive. Received: {goal_range}")
+
+    target_vec_b, distance, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
+    obs = torch.zeros((env.num_envs, 6), device=env.device, dtype=torch.float32)
+    obs[:, 0] = torch.clamp(target_vec_b[:, 0] / float(goal_range), min=-1.0, max=1.0)
+    obs[:, 1] = torch.clamp(target_vec_b[:, 1] / float(goal_range), min=-1.0, max=1.0)
+    obs[:, 2] = torch.clamp(distance / float(goal_range), min=0.0, max=1.0)
+    obs[:, 3] = torch.sin(heading_error)
+    obs[:, 4] = torch.cos(heading_error)
+    obs[:, 5] = 1.0
+    return obs
+
+
 def base_lin_vel_normalized(
     env: ManagerBasedEnv,
     scale: float = 2.0,

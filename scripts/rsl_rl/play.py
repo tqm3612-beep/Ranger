@@ -66,7 +66,11 @@ from isaaclab.envs import (
 )
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+try:
+    from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
+except ModuleNotFoundError:
+    def get_published_pretrained_checkpoint(*args, **kwargs):
+        return None
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper, export_policy_as_jit, export_policy_as_onnx
 
@@ -148,15 +152,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.pt")
+    obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
+    if obs_normalizer is None:
+        obs_normalizers = getattr(ppo_runner, "obs_normalizers", None)
+        if isinstance(obs_normalizers, dict):
+            obs_normalizer = obs_normalizers.get("policy", None)
+        else:
+            obs_normalizer = obs_normalizers
+    try:
+        export_policy_as_jit(policy_nn, obs_normalizer, path=export_model_dir, filename="policy.pt")
+    except Exception as e:
+        print(f"[WARN] Failed to export JIT policy, continue play without export: {e}")
     export_policy_as_onnx(
-        policy_nn, normalizer=ppo_runner.obs_normalizer, path=export_model_dir, filename="policy.onnx"
+        policy_nn, normalizer=obs_normalizer, path=export_model_dir, filename="policy.onnx"
     )
 
     dt = env.unwrapped.step_dt
 
     # reset environment
-    obs, _ = env.get_observations()
+    obs_result = env.get_observations()
+    obs = obs_result[0] if isinstance(obs_result, tuple) else obs_result
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -166,7 +181,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            step_result = env.step(actions)
+            if len(step_result) == 5:
+                obs, _, _, _, _ = step_result
+            else:
+                obs, _, _, _ = step_result
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

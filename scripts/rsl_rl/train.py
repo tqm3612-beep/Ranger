@@ -84,7 +84,20 @@ from isaaclab.envs import (
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.io import dump_pickle, dump_yaml
+from isaaclab.utils.io import dump_yaml
+
+try:
+    from isaaclab.utils.io import dump_pickle
+except ImportError:
+    try:
+        import cloudpickle as pickle
+    except ImportError:
+        import pickle
+
+    def dump_pickle(filename, data):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, "wb") as f:
+            pickle.dump(data, f)
 
 from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
 
@@ -142,6 +155,36 @@ def _load_forward_finetune_weights(runner: OnPolicyRunner, checkpoint_path: str)
 
     runner.current_learning_iteration = 0
     print("Loaded stand policy weights for forward fine-tuning; reset action std to 0.5.")
+
+
+def _reset_action_std_from_env(runner: OnPolicyRunner) -> None:
+    """Optionally reset policy exploration std after checkpoint loading."""
+
+    reset_std = os.environ.get("RANGER_RESET_ACTION_STD")
+    if reset_std is None:
+        return
+
+    try:
+        reset_std_value = float(reset_std)
+    except ValueError as exc:
+        raise ValueError(f"RANGER_RESET_ACTION_STD must be a positive float, got: {reset_std!r}") from exc
+    if reset_std_value <= 0.0:
+        raise ValueError(f"RANGER_RESET_ACTION_STD must be positive, got: {reset_std_value}")
+
+    actor_critic = runner.alg.policy
+    with torch.no_grad():
+        if hasattr(actor_critic, "std"):
+            actor_critic.std.fill_(reset_std_value)
+        elif hasattr(actor_critic, "log_std"):
+            log_std_value = torch.log(
+                torch.tensor(reset_std_value, device=actor_critic.log_std.device, dtype=actor_critic.log_std.dtype)
+            )
+            actor_critic.log_std.fill_(log_std_value)
+        else:
+            print("[WARN] RANGER_RESET_ACTION_STD was set, but actor_critic has no std/log_std attribute.")
+            return
+
+    print(f"[INFO] Reset action std to {reset_std_value} from RANGER_RESET_ACTION_STD.")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -220,6 +263,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             # load previously trained model
             runner.load(resume_path)
+        _reset_action_std_from_env(runner)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

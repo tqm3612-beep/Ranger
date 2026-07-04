@@ -63,6 +63,26 @@ gym.register(
 )
 
 gym.register(
+    id="Template-Ranger-SpeedCommand-Flat-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerSpeedCommandFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Template-Ranger-GoalHeading-Flat-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerGoalHeadingFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Template-Ranger-Forward-Visual-v0",
     entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,

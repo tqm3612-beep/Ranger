@@ -352,6 +352,23 @@ def goal_heading_state(
     return obs
 
 
+def turn_to_target_goal_state(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return the raw six-dimensional turn-to-target descriptor in the body frame."""
+
+    target_vec_b, distance, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
+    obs = torch.zeros((env.num_envs, 6), device=env.device, dtype=torch.float32)
+    obs[:, 0] = target_vec_b[:, 0]
+    obs[:, 1] = target_vec_b[:, 1]
+    obs[:, 2] = distance
+    obs[:, 3] = torch.sin(heading_error)
+    obs[:, 4] = torch.cos(heading_error)
+    obs[:, 5] = 1.0
+    return obs
+
+
 def base_lin_vel_normalized(
     env: ManagerBasedEnv,
     scale: float = 2.0,

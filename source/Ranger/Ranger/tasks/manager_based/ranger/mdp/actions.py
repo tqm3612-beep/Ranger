@@ -137,13 +137,38 @@ class WheelMotorCSVAction(ActionTerm):
     def apply_actions(self) -> None:
         self._asset.set_joint_effort_target(self._processed_actions, joint_ids=self._joint_ids)
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+    def _canonicalize_env_ids(self, env_ids: Sequence[int] | torch.Tensor | None) -> torch.Tensor:
         if env_ids is None:
-            env_ids = slice(None)
-        self._raw_actions[env_ids] = 0.0
-        self._processed_actions[env_ids] = 0.0
-        self._velocity_target[env_ids] = 0.0
-        self._torque_actual[env_ids] = 0.0
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        if isinstance(env_ids, torch.Tensor):
+            return env_ids.to(device=self.device, dtype=torch.long).flatten()
+        return torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
+
+    def _validate_per_env_buffer(self, name: str, buffer: torch.Tensor, env_ids: torch.Tensor) -> None:
+        if buffer.ndim != 2 or buffer.shape[0] != self.num_envs or buffer.shape[1] != self.action_dim:
+            env_min = int(env_ids.min().item()) if env_ids.numel() > 0 else -1
+            env_max = int(env_ids.max().item()) if env_ids.numel() > 0 else -1
+            raise RuntimeError(
+                f"{self.__class__.__name__}.{name} has invalid shape {tuple(buffer.shape)}; "
+                f"expected ({self.num_envs}, {self.action_dim}), env_ids_min={env_min}, env_ids_max={env_max}"
+            )
+        if env_ids.numel() > 0 and (int(env_ids.min().item()) < 0 or int(env_ids.max().item()) >= buffer.shape[0]):
+            raise RuntimeError(
+                f"{self.__class__.__name__}.{name} env_ids out of bounds for shape {tuple(buffer.shape)}; "
+                f"num_envs={self.num_envs}, env_ids_min={int(env_ids.min().item())}, "
+                f"env_ids_max={int(env_ids.max().item())}"
+            )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = self._canonicalize_env_ids(env_ids)
+        self._validate_per_env_buffer("_raw_actions", self._raw_actions, env_ids)
+        self._validate_per_env_buffer("_processed_actions", self._processed_actions, env_ids)
+        self._validate_per_env_buffer("_velocity_target", self._velocity_target, env_ids)
+        self._validate_per_env_buffer("_torque_actual", self._torque_actual, env_ids)
+        self._raw_actions[env_ids, :] = 0.0
+        self._processed_actions[env_ids, :] = 0.0
+        self._velocity_target[env_ids, :] = 0.0
+        self._torque_actual[env_ids, :] = 0.0
 
 
 class HydraulicActuatorAction(ActionTerm):
@@ -168,13 +193,18 @@ class HydraulicActuatorAction(ActionTerm):
             raise ValueError(f"No joints matched {self.cfg.joint_names} for HydraulicActuatorAction.")
 
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
+        self._clipped_actions = torch.zeros_like(self._raw_actions)
         self._processed_actions = torch.zeros_like(self._raw_actions)
+        self._stroke_desired = torch.zeros_like(self._raw_actions)
         self._stroke_actual = torch.zeros_like(self._raw_actions)
         self._position_target = torch.zeros_like(self._raw_actions)
         self._effort_actual = torch.zeros_like(self._raw_actions)
 
         self._stroke_table = torch.tensor(self.cfg.stroke_table, dtype=torch.float32, device=self.device)
         self._joint_pos_table = torch.tensor(self.cfg.joint_pos_table, dtype=torch.float32, device=self.device)
+        self._joint_target_sign_lf_lr_rf_rr = torch.tensor(
+            self.cfg.joint_target_sign, dtype=torch.float32, device=self.device
+        )
         if self._stroke_table.ndim != 1 or self._joint_pos_table.ndim != 1:
             raise ValueError("stroke_table and joint_pos_table must be one-dimensional.")
         if self._stroke_table.numel() != self._joint_pos_table.numel():
@@ -183,6 +213,14 @@ class HydraulicActuatorAction(ActionTerm):
             raise ValueError("stroke_table and joint_pos_table must contain at least two points.")
         if not torch.all(self._stroke_table[1:] > self._stroke_table[:-1]):
             raise ValueError("stroke_table must be strictly increasing.")
+        if self._joint_target_sign_lf_lr_rf_rr.numel() != self._num_joints:
+            raise ValueError(
+                "joint_target_sign must have the same length as the resolved hydraulic joints "
+                f"({self._num_joints}), got {self._joint_target_sign_lf_lr_rf_rr.numel()}."
+            )
+        # Config uses semantic [lf, lr, rf, rr] order while the action term resolves
+        # joints in raw articulation order [lr, lf, rf, rr].
+        self._joint_target_sign = self._joint_target_sign_lf_lr_rf_rr[[1, 0, 2, 3]].unsqueeze(0)
 
         self._stroke_min = float(self.cfg.stroke_min)
         self._stroke_max = float(self.cfg.stroke_max)
@@ -203,8 +241,10 @@ class HydraulicActuatorAction(ActionTerm):
 
         self._stroke_mid = 0.5 * (self._stroke_min + self._stroke_max)
         self._stroke_half_range = 0.5 * (self._stroke_max - self._stroke_min)
+        self._clipped_actions.zero_()
+        self._stroke_desired[:] = self._stroke_mid
         self._stroke_actual[:] = self._stroke_mid
-        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual)
+        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual) * self._joint_target_sign
 
         self._clip = _build_clip_tensor(
             clip=self.cfg.clip,
@@ -224,8 +264,18 @@ class HydraulicActuatorAction(ActionTerm):
 
     @property
     def processed_actions(self) -> torch.Tensor:
-        """Current torque command applied on the equivalent hydraulic joints."""
+        """Current simulator command buffer for the hydraulic action term."""
         return self._processed_actions
+
+    @property
+    def clipped_actions(self) -> torch.Tensor:
+        """Normalized action after safety clipping and before stroke update."""
+        return self._clipped_actions
+
+    @property
+    def stroke_desired(self) -> torch.Tensor:
+        """Desired stroke before first-order and rate-limit dynamics."""
+        return self._stroke_desired
 
     @property
     def stroke_actual(self) -> torch.Tensor:
@@ -244,43 +294,83 @@ class HydraulicActuatorAction(ActionTerm):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
+        clipped_actions = self._raw_actions
         if self._clip is not None:
-            self._raw_actions[:] = torch.clamp(self._raw_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1])
+            clipped_actions = torch.clamp(clipped_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1])
+        self._clipped_actions[:] = torch.clamp(clipped_actions, min=-1.0, max=1.0)
 
         joint_pos = self._asset.data.joint_pos[:, self._joint_ids]
         joint_vel = self._asset.data.joint_vel[:, self._joint_ids]
 
-        stroke_des = self._stroke_mid + torch.clamp(self._raw_actions, min=-1.0, max=1.0) * self._stroke_half_range
-        stroke_des = torch.clamp(stroke_des, min=self._stroke_min, max=self._stroke_max)
+        stroke_des = self._stroke_mid + self._clipped_actions * self._stroke_half_range
+        self._stroke_desired[:] = torch.clamp(stroke_des, min=self._stroke_min, max=self._stroke_max)
 
         if self._time_constant > 0.0:
             alpha = self._env.step_dt / (self._time_constant + self._env.step_dt)
-            stroke_target = self._stroke_actual + alpha * (stroke_des - self._stroke_actual)
+            stroke_target = self._stroke_actual + alpha * (self._stroke_desired - self._stroke_actual)
         else:
-            stroke_target = stroke_des
+            stroke_target = self._stroke_desired
 
         max_delta = self._stroke_rate_limit * self._env.step_dt
         stroke_delta = torch.clamp(stroke_target - self._stroke_actual, min=-max_delta, max=max_delta)
         self._stroke_actual[:] = torch.clamp(
             self._stroke_actual + stroke_delta, min=self._stroke_min, max=self._stroke_max
         )
-        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual)
+        self._position_target[:] = self._interp_stroke_to_joint_pos(self._stroke_actual) * self._joint_target_sign
 
         effort = self._impedance_kp * (self._position_target - joint_pos) - self._impedance_kd * joint_vel
         self._effort_actual[:] = torch.clamp(effort, min=-self._max_effort, max=self._max_effort)
-        self._processed_actions[:] = self._effort_actual
+
+        # The Ranger leg joints are driven by IsaacLab implicit actuators, which
+        # follow the articulation joint position targets. Keep the internally
+        # computed effort as debug state only and drive physics through the
+        # articulated position target path.
+        self._processed_actions.zero_()
 
     def apply_actions(self) -> None:
+        self._asset.set_joint_position_target(self._position_target, joint_ids=self._joint_ids)
         self._asset.set_joint_effort_target(self._processed_actions, joint_ids=self._joint_ids)
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+    def _canonicalize_env_ids(self, env_ids: Sequence[int] | torch.Tensor | None) -> torch.Tensor:
         if env_ids is None:
-            env_ids = slice(None)
-        self._raw_actions[env_ids] = 0.0
-        self._processed_actions[env_ids] = 0.0
-        self._effort_actual[env_ids] = 0.0
-        self._stroke_actual[env_ids] = self._stroke_mid
-        self._position_target[env_ids] = self._interp_stroke_to_joint_pos(self._stroke_actual[env_ids])
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        if isinstance(env_ids, torch.Tensor):
+            return env_ids.to(device=self.device, dtype=torch.long).flatten()
+        return torch.as_tensor(env_ids, device=self.device, dtype=torch.long).flatten()
+
+    def _validate_per_env_buffer(self, name: str, buffer: torch.Tensor, env_ids: torch.Tensor) -> None:
+        if buffer.ndim != 2 or buffer.shape[0] != self.num_envs or buffer.shape[1] != self.action_dim:
+            env_min = int(env_ids.min().item()) if env_ids.numel() > 0 else -1
+            env_max = int(env_ids.max().item()) if env_ids.numel() > 0 else -1
+            raise RuntimeError(
+                f"{self.__class__.__name__}.{name} has invalid shape {tuple(buffer.shape)}; "
+                f"expected ({self.num_envs}, {self.action_dim}), env_ids_min={env_min}, env_ids_max={env_max}"
+            )
+        if env_ids.numel() > 0 and (int(env_ids.min().item()) < 0 or int(env_ids.max().item()) >= buffer.shape[0]):
+            raise RuntimeError(
+                f"{self.__class__.__name__}.{name} env_ids out of bounds for shape {tuple(buffer.shape)}; "
+                f"num_envs={self.num_envs}, env_ids_min={int(env_ids.min().item())}, "
+                f"env_ids_max={int(env_ids.max().item())}"
+            )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        env_ids = self._canonicalize_env_ids(env_ids)
+        self._validate_per_env_buffer("_raw_actions", self._raw_actions, env_ids)
+        self._validate_per_env_buffer("_clipped_actions", self._clipped_actions, env_ids)
+        self._validate_per_env_buffer("_processed_actions", self._processed_actions, env_ids)
+        self._validate_per_env_buffer("_stroke_desired", self._stroke_desired, env_ids)
+        self._validate_per_env_buffer("_stroke_actual", self._stroke_actual, env_ids)
+        self._validate_per_env_buffer("_position_target", self._position_target, env_ids)
+        self._validate_per_env_buffer("_effort_actual", self._effort_actual, env_ids)
+        self._raw_actions[env_ids, :] = 0.0
+        self._clipped_actions[env_ids, :] = 0.0
+        self._processed_actions[env_ids, :] = 0.0
+        self._effort_actual[env_ids, :] = 0.0
+        self._stroke_desired[env_ids, :] = self._stroke_mid
+        self._stroke_actual[env_ids, :] = self._stroke_mid
+        self._position_target[env_ids, :] = (
+            self._interp_stroke_to_joint_pos(self._stroke_actual[env_ids, :]) * self._joint_target_sign
+        )
 
     def _interp_stroke_to_joint_pos(self, stroke: torch.Tensor) -> torch.Tensor:
         stroke_clamped = torch.clamp(stroke, min=self._stroke_table[0], max=self._stroke_table[-1])
@@ -332,6 +422,7 @@ class HydraulicActuatorActionCfg(ActionTermCfg):
 
     stroke_table: tuple[float, ...] = (0.0, 0.5, 1.0)
     joint_pos_table: tuple[float, ...] = (-1.0, 0.0, 1.0)
+    joint_target_sign: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)
 
     max_effort: float = 300.0
     impedance_kp: float = 250.0

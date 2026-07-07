@@ -34,17 +34,17 @@ gym.register(
 
 gym.register(
     id="Template-Ranger-Stand-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStandEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:StandPPORunnerCfg",
     },
 )
 
 gym.register(
     id="Template-Ranger-Stand-Visual-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStandVisualEnvCfg",
@@ -88,6 +88,16 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerForwardVisualEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Template-Ranger-TurnToTarget-Flat-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerTurnToTargetFlatEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )

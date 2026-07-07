@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -91,7 +93,7 @@ class RangerSceneCfg(InteractiveSceneCfg):
         collision_group=-1,
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, -0.01)),
         spawn=sim_utils.MeshCuboidCfg(
-            size=(100.0, 100.0, 0.02),
+            size=(300.0, 300.0, 0.02),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
             physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -162,6 +164,16 @@ class RangerSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         track_air_time=True,
+        debug_vis=False,
+    )
+
+    # Debug-only privileged sensor for auditing whether non-wheel collision is carrying load.
+    # This is intentionally excluded from rewards and observations.
+    all_body_contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*",
+        update_period=0.0,
+        history_length=1,
+        track_air_time=False,
         debug_vis=False,
     )
 
@@ -388,6 +400,31 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
         self.scene.d435i_camera.update_period = self.decimation * self.sim.dt
         self.scene.wheel_contact_forces.update_period = self.sim.dt
+        self.scene.all_body_contact_forces.update_period = self.sim.dt
+        self.stand_training_task = False
+        self.enable_reset_settle = False
+        self.reset_settle_steps = 0
+        self.reset_settle_leg_action = -0.34
+        self.enable_initial_stroke_randomization = False
+        self.initial_stroke_noise_range = 0.0
+        self.initial_stroke_range = (0.50, 0.50)
+        self.initial_stroke_shared_across_legs = True
+        self.sync_reset_root_height_to_initial_stroke = False
+        self.initial_stroke_root_height_reference = 0.884
+        self.initial_stroke_root_height_nominal_stroke = 0.50
+        self.initial_stroke_root_height_slope = 0.38
+        self.terrain_like_reset_enabled = False
+        self.terrain_like_reset_base_stroke = 0.50
+        self.terrain_like_reset_common_offset_range = (-0.02, 0.04)
+        self.terrain_like_reset_pattern_amplitude_range = (0.03, 0.06)
+        self.terrain_like_reset_stroke_clamp_range = (0.44, 0.58)
+        self.terrain_like_reset_root_height_margin = 0.015
+        self.terrain_like_reset_slope_deg_range = (3.0, 5.0)
+        self.terrain_like_reset_twist_deg_range = (2.0, 5.0)
+        self.terrain_like_reset_yaw_deg_range = (-3.0, 3.0)
+        self.terrain_like_reset_linear_xy_velocity_range = (-0.10, 0.10)
+        self.terrain_like_reset_angular_velocity_range = (-0.2, 0.2)
+        self.debug_full_stdout_metrics = False
         print(f"[RangerEnvCfg] Expected policy observation shape: {_expected_policy_obs_dim()} (legacy 1410 -> current 1689)")
         print(f"[RangerEnvCfg] Expected action shape: {_expected_action_dim()} (4 leg + 4 wheel)")
 
@@ -399,6 +436,10 @@ class RangerStandEnvCfg(RangerEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.episode_length_s = 4.0
+        self.stand_training_task = True
+        self.scene.robot.init_state.pos = (0.0, 0.0, 0.884)
+        self.actions.leg_hydraulic.joint_pos_table = (-0.5, 0.0, 0.5)
+        self.actions.leg_hydraulic.joint_target_sign = (-1.0, 1.0, 1.0, -1.0)
 
         # Stage-1 uses the fixed neutral goal/map interface while we focus on posture stability.
         self.observations.policy.goal_state.params["goal_enabled"] = False
@@ -406,32 +447,264 @@ class RangerStandEnvCfg(RangerEnvCfg):
 
         # Keep resets close to the nominal support pose so the policy can first learn to settle.
         self.events.reset_robot_joints.params["position_range"] = (-0.005, 0.005)
-        self.events.reset_robot_joints.params["velocity_range"] = (-0.01, 0.01)
+        self.events.reset_robot_joints.params["velocity_range"] = (0.0, 0.0)
+        self.events.reset_base.params["velocity_range"] = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        }
+        self.events.reset_base.params["pose_range"] = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        }
+        self.enable_initial_stroke_randomization = True
+        self.initial_stroke_noise_range = 0.0
+        self.initial_stroke_range = (0.47, 0.55)
+        self.initial_stroke_shared_across_legs = True
+        self.sync_reset_root_height_to_initial_stroke = True
+        self.initial_stroke_root_height_reference = 0.884
+        self.initial_stroke_root_height_nominal_stroke = 0.50
+        self.initial_stroke_root_height_slope = 0.38
+        self.terrain_like_reset_enabled = True
+        self.terrain_like_reset_base_stroke = 0.50
+        self.terrain_like_reset_common_offset_range = (-0.02, 0.04)
+        self.terrain_like_reset_pattern_amplitude_range = (0.03, 0.06)
+        self.terrain_like_reset_stroke_clamp_range = (0.44, 0.58)
+        self.terrain_like_reset_root_height_margin = 0.015
+        self.terrain_like_reset_slope_deg_range = (3.0, 5.0)
+        self.terrain_like_reset_twist_deg_range = (2.0, 5.0)
+        self.terrain_like_reset_yaw_deg_range = (-3.0, 3.0)
+        self.terrain_like_reset_linear_xy_velocity_range = (-0.10, 0.10)
+        self.terrain_like_reset_angular_velocity_range = (-0.2, 0.2)
 
-        # Relax early failure slightly so the robot has time to stabilize after touchdown.
+        # Keep a realistic healthy stand envelope; low-slung postures should not count as success.
         self.terminations.bad_orientation.params["limit_angle"] = 1.4
-        self.terminations.root_height_low.params["minimum_height"] = 0.05
+        self.terminations.root_height_low.func = mdp.root_height_below_minimum_with_grace
+        self.terminations.root_height_low.params["minimum_height"] = 0.65
+        self.terminations.root_height_low.params["grace_time_s"] = 0.5
+        self.terminations.root_height_low.params["asset_cfg"] = SceneEntityCfg("robot")
 
         # Turn off locomotion incentives and focus on stable support/contact quality first.
         self.rewards.forward_progress.weight = 0.0
         self.rewards.lateral_velocity.weight = -0.2
+        self.rewards.base_xy_velocity = RewTerm(
+            func=mdp.base_xy_speed_l2,
+            weight=-0.5,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
         self.rewards.base_vertical_velocity.weight = -1.0
         self.rewards.base_roll_pitch_rate.weight = -0.5
+        self.rewards.base_yaw_rate = RewTerm(
+            func=mdp.base_yaw_rate_l2,
+            weight=-0.3,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.yaw_drift_from_reset = RewTerm(
+            func=mdp.stand_yaw_drift_abs,
+            weight=-0.2,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
         self.rewards.upright.weight = -3.0
         self.rewards.wheel_joint_velocity.weight = -0.002
-        self.rewards.action_rate.weight = -0.02
+        self.rewards.action_rate.weight = -0.04
         self.rewards.action_magnitude.weight = -0.002
+        self.rewards.roll_angle = RewTerm(func=mdp.roll_angle_l2, weight=-1.0)
+        self.rewards.pitch_angle = RewTerm(func=mdp.pitch_angle_l2, weight=-1.2)
+        self.rewards.root_height_tracking = RewTerm(
+            func=mdp.root_height_tracking_exp,
+            weight=0.5,
+            params={"target_height": 0.875, "std_sq": 0.01, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.root_height_band = RewTerm(
+            func=mdp.root_height_band_piecewise,
+            weight=2.0,
+            params={
+                "peak_min": 0.865,
+                "peak_max": 0.890,
+                "healthy_min": 0.84,
+                "healthy_max": 0.91,
+                "low_floor": 0.65,
+                "high_penalty_scale": 6.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.base_height_low = RewTerm(
+            func=mdp.base_height_below_target_l2,
+            weight=-8.0,
+            params={"target_height": 0.70, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.base_height_high = RewTerm(
+            func=mdp.base_height_above_target_l1,
+            weight=-10.0,
+            params={"target_height": 0.91, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.actual_stroke_nominal = RewTerm(
+            func=mdp.actual_stroke_nominal_l2,
+            weight=-12.0,
+            params={"stroke_nominal": 0.515, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_soft_limit = RewTerm(
+            func=mdp.actual_stroke_soft_limit_penalty,
+            weight=-4.0,
+            params={"limit": 0.45, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_range = RewTerm(
+            func=mdp.stroke_range_penalty,
+            weight=-2.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_diagonal_balance = RewTerm(
+            func=mdp.stroke_diagonal_balance_penalty,
+            weight=-1.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.hydraulic_action_magnitude = RewTerm(
+            func=mdp.hydraulic_action_magnitude_l1,
+            weight=-0.20,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.hydraulic_action_range = RewTerm(
+            func=mdp.hydraulic_action_range_penalty,
+            weight=0.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.low_stroke_negative_hydraulic_action = RewTerm(
+            func=mdp.low_stroke_negative_hydraulic_action_penalty,
+            weight=-3.0,
+            params={
+                "stroke_threshold": 0.35,
+                "stroke_margin": 0.10,
+                "action_name": "leg_hydraulic",
+            },
+        )
+        self.rewards.height_gated_low_stroke_negative_hydraulic_action = RewTerm(
+            func=mdp.height_gated_low_stroke_negative_hydraulic_action_penalty,
+            weight=-5.0,
+            params={
+                "height_threshold": 0.72,
+                "height_margin": 0.07,
+                "stroke_threshold": 0.35,
+                "stroke_margin": 0.10,
+                "asset_cfg": SceneEntityCfg("robot"),
+                "action_name": "leg_hydraulic",
+            },
+        )
+        self.rewards.high_height_low_stroke_negative_hydraulic_action = RewTerm(
+            func=mdp.high_height_low_stroke_negative_hydraulic_action_penalty,
+            weight=-4.0,
+            params={
+                "height_threshold": 0.91,
+                "height_margin": 0.10,
+                "stroke_threshold": 0.45,
+                "stroke_margin": 0.10,
+                "asset_cfg": SceneEntityCfg("robot"),
+                "action_name": "leg_hydraulic",
+            },
+        )
+        self.rewards.height_low_high_stroke_positive_hydraulic_action = RewTerm(
+            func=mdp.height_low_high_stroke_positive_hydraulic_action_penalty,
+            weight=0.0,
+            params={
+                "height_threshold": 0.72,
+                "height_margin": 0.07,
+                "stroke_high_threshold": 0.55,
+                "stroke_margin": 0.10,
+                "asset_cfg": SceneEntityCfg("robot"),
+                "action_name": "leg_hydraulic",
+            },
+        )
+        self.rewards.stroke_away_from_nominal_hydraulic_action = RewTerm(
+            func=mdp.stroke_away_from_nominal_hydraulic_action_penalty,
+            weight=-4.0,
+            params={
+                "nominal_stroke": 0.515,
+                "action_name": "leg_hydraulic",
+            },
+        )
+        self.rewards.front_rear_stroke_balance = RewTerm(
+            func=mdp.front_rear_stroke_balance_penalty,
+            weight=-3.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.front_rear_stroke_split_action = RewTerm(
+            func=mdp.front_rear_stroke_split_action_penalty,
+            weight=0.0,
+            params={
+                "diff_threshold": 0.10,
+                "diff_margin": 0.20,
+                "action_name": "leg_hydraulic",
+            },
+        )
 
         # Reward four-wheel contact coverage and balanced support forces during settling.
         self.rewards.wheel_contact_count = RewTerm(
             func=mdp.wheel_contact_count_reward,
-            weight=2.0,
+            weight=1.5,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_.*"]), "threshold": 1.0},
+        )
+        self.rewards.wheel_contact_stability = RewTerm(
+            func=mdp.wheel_all_contact_reward,
+            weight=1.0,
             params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_.*"]), "threshold": 1.0},
         )
         self.rewards.wheel_contact_balance = RewTerm(
             func=mdp.wheel_contact_force_balance_reward,
-            weight=1.0,
+            weight=0.5,
             params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_.*"]), "threshold": 1.0},
+        )
+        self.rewards.contact_force_diag_balance = RewTerm(
+            func=mdp.contact_force_diag_balance_penalty,
+            weight=-1.0,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.contact_force_left_right_balance = RewTerm(
+            func=mdp.contact_force_left_right_balance_penalty,
+            weight=-0.4,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.contact_force_range_balance = RewTerm(
+            func=mdp.contact_force_range_balance_penalty,
+            weight=-0.3,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.contact_force_min_support = RewTerm(
+            func=mdp.contact_force_min_support_penalty,
+            weight=-0.3,
+            params={
+                "min_force_threshold": 50.0,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
+        )
+        self.rewards.contact_force_min_ratio_support = RewTerm(
+            func=mdp.contact_force_min_ratio_support_penalty,
+            weight=-0.75,
+            params={
+                "min_ratio_threshold": 0.10,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
+        )
+        self.rewards.low_contact_support = RewTerm(
+            func=mdp.contact_force_min_support_penalty,
+            weight=-0.2,
+            params={
+                "min_force_threshold": 80.0,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
+        )
+        self.rewards.low_contact_ratio_support = RewTerm(
+            func=mdp.contact_force_min_ratio_support_penalty,
+            weight=-0.6,
+            params={
+                "min_ratio_threshold": 0.15,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
         )
 
 
@@ -467,6 +740,8 @@ class RangerForwardEnvCfg(RangerStandEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.stand_training_task = False
+        self.enable_initial_stroke_randomization = False
 
         # Keep the policy interface fixed while enabling a simple forward objective.
         self.observations.policy.goal_state.params["goal_enabled"] = True
@@ -684,6 +959,8 @@ class RangerGoalHeadingFlatEnvCfg(RangerStandEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.stand_training_task = False
+        self.enable_initial_stroke_randomization = False
         self.episode_length_s = 10.0
         self.scene.ground.spawn.size = (300.0, 300.0, 0.02)
 
@@ -818,6 +1095,127 @@ class RangerGoalHeadingFlatEnvCfg(RangerStandEnvCfg):
             weight=-0.005,
             params={"action_name": "wheel_motor_csv"},
         )
+
+
+@configclass
+class RangerTurnToTargetFlatEnvCfg(RangerStandEnvCfg):
+    """Minimal flat-ground turning task for verifying differential steering toward a sampled target."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.stand_training_task = False
+        self.enable_initial_stroke_randomization = False
+        self.turn_to_target_task = True
+        self.episode_length_s = 3.0
+        self.scene.ground.spawn.size = (300.0, 300.0, 0.02)
+
+        # Keep the observation shape unchanged while swapping in a per-env dynamic goal state.
+        self.observations.policy.goal_state.func = mdp.turn_to_target_goal_state
+        self.observations.policy.goal_state.params = {"asset_cfg": SceneEntityCfg("robot")}
+        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+
+        self.events.reset_goal_heading_target = EventTerm(
+            func=mdp.reset_goal_heading_target,
+            mode="reset",
+            params={
+                "distance_range": (2.0, 4.0),
+                "heading_range": (-1.0471975511965976, 1.0471975511965976),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Keep resets and limits conservative so the task can warm-start from stand policies.
+        self.events.reset_robot_joints.params["position_range"] = (-0.005, 0.005)
+        self.events.reset_robot_joints.params["velocity_range"] = (-0.01, 0.01)
+        self.terminations.bad_orientation.params["limit_angle"] = 1.2
+        self.terminations.root_height_low.params["minimum_height"] = 0.30
+
+        # Turn off forward / distance shaping and speed-command scaffolding.
+        self.rewards.forward_progress.weight = 0.0
+        self.rewards.wheel_joint_velocity.weight = 0.0
+        self.rewards.leg_joint_velocity.weight = 0.0
+        self.rewards.lateral_velocity.weight = 0.0
+        self.rewards.action_rate.weight = -0.002
+        self.rewards.action_magnitude.weight = -0.0002
+        self.rewards.wheel_contact_count.weight = 0.0
+        self.rewards.wheel_contact_balance.weight = 0.0
+        self.rewards.base_vertical_velocity.weight = -0.6
+        self.rewards.base_roll_pitch_rate.weight = -0.3
+        self.rewards.upright.weight = -2.5
+        self.rewards.termination.weight = -20.0
+
+        # Keep only mild posture-support shaping around the stand checkpoint operating region.
+        self.rewards.roll_angle = RewTerm(func=mdp.roll_angle_l2, weight=-1.5)
+        self.rewards.pitch_angle = RewTerm(func=mdp.pitch_angle_l2, weight=-2.0)
+        self.rewards.root_height_tracking = RewTerm(
+            func=mdp.root_height_tracking_exp,
+            weight=2.0,
+            params={"target_height": 0.74, "std_sq": 0.015, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.base_height_low = RewTerm(
+            func=mdp.base_height_below_target_l2,
+            weight=-8.0,
+            params={"target_height": 0.70, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.actual_stroke_nominal = RewTerm(
+            func=mdp.actual_stroke_nominal_l2,
+            weight=-4.0,
+            params={"stroke_nominal": 0.33, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_soft_limit = RewTerm(
+            func=mdp.actual_stroke_soft_limit_penalty,
+            weight=-6.0,
+            params={"limit": 0.45, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.wheel_semantic_velocity_symmetry = RewTerm(
+            func=mdp.wheel_semantic_velocity_symmetry_l2,
+            weight=0.0,
+            params={"action_name": "wheel_motor_csv"},
+        )
+
+        # Heading / yaw only.
+        self.rewards.turn_heading_alignment = RewTerm(
+            func=mdp.turn_to_target_heading_alignment_exp,
+            weight=3.0,
+            params={"sigma": 0.6, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.turn_heading_progress = RewTerm(
+            func=mdp.turn_to_target_heading_progress,
+            weight=8.0,
+            params={"min_progress": -0.25, "max_progress": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.turn_yaw_tracking = RewTerm(
+            func=mdp.turn_to_target_yaw_tracking_exp,
+            weight=2.5,
+            params={"k_yaw": 1.5, "yaw_rate_max": 0.5, "sigma_yaw": 0.35, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.turn_same_side_front_rear_diff = RewTerm(
+            func=mdp.wheel_same_side_front_rear_diff_l1,
+            weight=-0.05,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.turn_unloaded_wheel_spin = RewTerm(
+            func=mdp.unloaded_wheel_spin_penalty,
+            weight=-0.01,
+            params={
+                "force_threshold": 20.0,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
+        )
+        self.rewards.turn_wheel_target_overspeed = RewTerm(
+            func=mdp.wheel_target_overspeed_penalty,
+            weight=-0.002,
+            params={"safe_target_vel": 8.0, "action_name": "wheel_motor_csv"},
+        )
+        self.rewards.turn_wheel_target_common_mode = RewTerm(
+            func=mdp.wheel_target_common_mode_penalty,
+            weight=-0.015,
+            params={"action_name": "wheel_motor_csv"},
+        )
+        self.enable_reset_settle = True
+        self.reset_settle_steps = 60
+        self.reset_settle_leg_action = -0.34
 
 
 @configclass

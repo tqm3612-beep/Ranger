@@ -113,8 +113,9 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._is_goal_heading_task = hasattr(self.cfg.events, "reset_goal_heading_target")
         self._is_turn_to_target_task = bool(getattr(self.cfg, "turn_to_target_task", False))
         self._is_stand_training_task = bool(getattr(self.cfg, "stand_training_task", False))
-        self._speed_command_obs_start = 37
-        self._speed_command_obs_end = 43
+        self._stand_debug_metrics_enabled = os.getenv("RANGER_DEBUG_METRICS", "0") == "1"
+        self._command_obs_start = 26
+        self._command_obs_end = 34
         self._goal_heading_prev_distance = torch.full((self.num_envs,), float("nan"), device=self.device)
         self._goal_heading_debug_prev_abs_error = torch.full((self.num_envs,), float("nan"), device=self.device)
         self._turn_sanity_action = os.environ.get("RANGER_TURN_SANITY_ACTION", "").strip().lower()
@@ -946,20 +947,20 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             policy_obs = None
             obs_buf = getattr(self, "obs_buf", None)
             if hasattr(obs_buf, "get"):
-                policy_obs = obs_buf.get("policy", None)
+                policy_obs = obs_buf.get("policy_state", None)
             elif isinstance(obs_buf, torch.Tensor):
                 policy_obs = obs_buf
             if (
                 policy_obs is not None
                 and policy_obs.ndim == 2
-                and policy_obs.shape[1] >= self._speed_command_obs_end
+                and policy_obs.shape[1] >= self._command_obs_end
             ):
-                policy_cmd_obs = policy_obs[:, self._speed_command_obs_start : self._speed_command_obs_end]
+                policy_cmd_obs = policy_obs[:, self._command_obs_start : self._command_obs_end]
             else:
-                policy_cmd_obs = torch.zeros((self.num_envs, 6), device=self.device, dtype=torch.float32)
+                policy_cmd_obs = torch.zeros((self.num_envs, 8), device=self.device, dtype=torch.float32)
             policy_obs_cmd_v_x_feature = policy_cmd_obs[:, 0]
-            policy_obs_cmd_v_x_target_feature = policy_cmd_obs[:, 4]
-            policy_obs_cmd_time_left_feature = policy_cmd_obs[:, 5]
+            policy_obs_cmd_v_x_target_feature = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
+            policy_obs_cmd_time_left_feature = torch.zeros(self.num_envs, device=self.device, dtype=torch.float32)
             policy_obs_cmd_valid = torch.ones(self.num_envs, device=self.device, dtype=torch.float32)
             return {
                 "v_x_cmd": command[:, 0],
@@ -2328,6 +2329,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         return logs
 
     def _filter_forward_debug_logs_for_stdout(self, logs: dict[str, float]) -> dict[str, float]:
+        if self._is_stand_training_task and not self._stand_debug_metrics_enabled:
+            return {}
         if not self._is_stand_training_task or bool(getattr(self.cfg, "debug_full_stdout_metrics", False)):
             return logs
 
@@ -3004,6 +3007,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             self._stand_last50_root_lin_vel_z[env_ids] = 0.0
             self._stand_last50_wheel_contact_over_weight[env_ids] = 0.0
             self._stand_last50_non_wheel_contact_over_weight[env_ids] = 0.0
+        if self._is_stand_training_task and not self._stand_debug_metrics_enabled:
+            return
         self.extras.setdefault("full_log", {})
         self.extras["full_log"].update(debug_logs)
         self.extras["log"].update(self._filter_forward_debug_logs_for_stdout(debug_logs))

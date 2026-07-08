@@ -56,6 +56,7 @@ import time
 import torch
 
 from rsl_rl.runners import OnPolicyRunner
+import rsl_rl.runners.on_policy_runner as rsl_on_policy_runner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -79,6 +80,9 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
+from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic
+
+rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -163,9 +167,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         export_policy_as_jit(policy_nn, obs_normalizer, path=export_model_dir, filename="policy.pt")
     except Exception as e:
         print(f"[WARN] Failed to export JIT policy, continue play without export: {e}")
-    export_policy_as_onnx(
-        policy_nn, normalizer=obs_normalizer, path=export_model_dir, filename="policy.onnx"
-    )
+    try:
+        export_policy_as_onnx(policy_nn, normalizer=obs_normalizer, path=export_model_dir, filename="policy.onnx")
+    except Exception as e:
+        print(f"[WARN] Failed to export ONNX policy, continue play without export: {e}")
 
     dt = env.unwrapped.step_dt
 

@@ -2,3 +2,7 @@
 # All rights reserved.
 #
 # SPDX-License-Identifier: BSD-3-Clause
+
+from .rsl_rl_custom_policy import RangerTerrainActorCritic
+
+__all__ = ["RangerTerrainActorCritic"]

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn.functional as F
 
@@ -23,6 +24,33 @@ SPEED_COMMAND_TIMER_ATTR = "_ranger_speed_command_timer"
 SPEED_COMMAND_DURATION_ATTR = "_ranger_speed_command_duration"
 GOAL_HEADING_TARGET_ATTR = "_ranger_goal_heading_target_pos_w"
 GOAL_HEADING_PREV_HEADING_ERROR_ATTR = "_ranger_goal_heading_prev_heading_error"
+SUSPENSION_STROKE_PREV_ATTR = "_ranger_suspension_stroke_prev"
+SUSPENSION_STROKE_RATE_ATTR = "_ranger_suspension_stroke_rate"
+SUSPENSION_STROKE_RATE_STEP_ATTR = "_ranger_suspension_stroke_rate_step"
+COMMAND_OBS_CACHE_ATTR = "_ranger_command_obs_cache"
+COMMAND_OBS_CACHE_STEP_ATTR = "_ranger_command_obs_cache_step"
+WHEEL_CONTACT_SENSOR_BODY_IDS_ATTR = "_ranger_wheel_contact_sensor_body_ids"
+
+
+def _obs_debug_enabled() -> bool:
+    return os.getenv("RANGER_OBS_DEBUG", "0") == "1"
+
+
+def _obs_debug(msg: str) -> None:
+    if _obs_debug_enabled():
+        print(f"[OBS_DEBUG] {msg}", flush=True)
+
+
+def _policy_state_disabled() -> bool:
+    return os.getenv("RANGER_DISABLE_POLICY_STATE", "0") == "1"
+
+
+def _policy_map_disabled() -> bool:
+    return os.getenv("RANGER_DISABLE_POLICY_MAP", "0") == "1"
+
+
+def _critic_privileged_disabled() -> bool:
+    return os.getenv("RANGER_DISABLE_CRITIC_PRIVILEGED", "0") == "1"
 
 
 def _as_env_ids(env: ManagerBasedEnv, env_ids) -> torch.Tensor:
@@ -165,6 +193,7 @@ def update_speed_command(
     yaw_rate_range: tuple[float, float] = (-0.4, 0.4),
     command_duration_range: tuple[float, float] = (2.0, 5.0),
     smoothing_alpha: float = 0.1,
+    max_command_duration: float = 5.0,
     small_yaw_prob: float = 0.0,
     small_yaw_range: tuple[float, float] = (0.03, 0.08),
     v_x_bins: tuple[tuple[float, float], ...] | None = None,
@@ -376,8 +405,15 @@ def base_lin_vel_normalized(
 ) -> torch.Tensor:
     """Return normalized base linear velocity in the body frame."""
 
+    _obs_debug("enter critic_privileged/base_lin_vel")
+    if _critic_privileged_disabled():
+        out = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit critic_privileged/base_lin_vel disabled shape={tuple(out.shape)}")
+        return out
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.clamp(asset.data.root_lin_vel_b / scale, min=-1.0, max=1.0)
+    out = torch.clamp(asset.data.root_lin_vel_b / scale, min=-1.0, max=1.0)
+    _obs_debug(f"exit critic_privileged/base_lin_vel shape={tuple(out.shape)}")
+    return out
 
 
 def base_ang_vel_normalized(
@@ -387,8 +423,15 @@ def base_ang_vel_normalized(
 ) -> torch.Tensor:
     """Return normalized base angular velocity in the body frame."""
 
+    _obs_debug("enter policy_state/base_ang_vel")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/base_ang_vel disabled shape={tuple(out.shape)}")
+        return out
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.clamp(asset.data.root_ang_vel_b / scale, min=-1.0, max=1.0)
+    out = torch.clamp(asset.data.root_ang_vel_b / scale, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/base_ang_vel shape={tuple(out.shape)}")
+    return out
 
 
 def projected_gravity_normalized(
@@ -397,8 +440,15 @@ def projected_gravity_normalized(
 ) -> torch.Tensor:
     """Return clipped projected gravity vector."""
 
+    _obs_debug("enter policy_state/projected_gravity")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/projected_gravity disabled shape={tuple(out.shape)}")
+        return out
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.clamp(asset.data.projected_gravity_b, min=-1.0, max=1.0)
+    out = torch.clamp(asset.data.projected_gravity_b, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/projected_gravity shape={tuple(out.shape)}")
+    return out
 
 
 def joint_pos_rel_normalized(
@@ -408,9 +458,16 @@ def joint_pos_rel_normalized(
 ) -> torch.Tensor:
     """Return normalized relative joint positions for the selected joints."""
 
+    _obs_debug(f"enter policy_state/joint_pos_rel joint_count={len(asset_cfg.joint_ids)}")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, len(asset_cfg.joint_ids)), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/joint_pos_rel disabled shape={tuple(out.shape)}")
+        return out
     asset: Articulation = env.scene[asset_cfg.name]
     joint_pos_rel = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
-    return torch.clamp(joint_pos_rel / scale, min=-1.0, max=1.0)
+    out = torch.clamp(joint_pos_rel / scale, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/joint_pos_rel shape={tuple(out.shape)}")
+    return out
 
 
 def joint_vel_rel_normalized(
@@ -420,9 +477,16 @@ def joint_vel_rel_normalized(
 ) -> torch.Tensor:
     """Return normalized relative joint velocities for the selected joints."""
 
+    _obs_debug(f"enter policy_state/joint_vel_rel joint_count={len(asset_cfg.joint_ids)}")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, len(asset_cfg.joint_ids)), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/joint_vel_rel disabled shape={tuple(out.shape)}")
+        return out
     asset: Articulation = env.scene[asset_cfg.name]
     joint_vel_rel = asset.data.joint_vel[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
-    return torch.clamp(joint_vel_rel / scale, min=-1.0, max=1.0)
+    out = torch.clamp(joint_vel_rel / scale, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/joint_vel_rel shape={tuple(out.shape)}")
+    return out
 
 
 def hydraulic_stroke_state(env: ManagerBasedEnv, action_name: str = "leg_hydraulic") -> torch.Tensor:
@@ -432,6 +496,72 @@ def hydraulic_stroke_state(env: ManagerBasedEnv, action_name: str = "leg_hydraul
     if not hasattr(action_term, "stroke_actual"):
         raise AttributeError(f"Action term '{action_name}' does not expose 'stroke_actual'.")
     return action_term.stroke_actual
+
+
+def suspension_stroke_state(env: ManagerBasedEnv, action_name: str = "leg_hydraulic") -> torch.Tensor:
+    """Return the measured suspension/EHA stroke in normalized physical stroke units."""
+
+    _obs_debug("enter policy_state/suspension_stroke")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 4), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/suspension_stroke disabled shape={tuple(out.shape)}")
+        return out
+    out = hydraulic_stroke_state(env=env, action_name=action_name)
+    _obs_debug(f"exit policy_state/suspension_stroke shape={tuple(out.shape)}")
+    return out
+
+
+def suspension_stroke_rate_state(
+    env: ManagerBasedEnv,
+    action_name: str = "leg_hydraulic",
+    clip: float | None = 5.0,
+) -> torch.Tensor:
+    """Return per-step suspension stroke rate using a per-env cached finite difference."""
+
+    _obs_debug("enter policy_state/suspension_stroke_rate")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 4), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/suspension_stroke_rate disabled shape={tuple(out.shape)}")
+        return out
+    stroke = suspension_stroke_state(env=env, action_name=action_name)
+    prev_stroke = getattr(env, SUSPENSION_STROKE_PREV_ATTR, None)
+    stroke_rate = getattr(env, SUSPENSION_STROKE_RATE_ATTR, None)
+    last_step = getattr(env, SUSPENSION_STROKE_RATE_STEP_ATTR, None)
+
+    if (
+        prev_stroke is None
+        or stroke_rate is None
+        or prev_stroke.shape != stroke.shape
+        or stroke_rate.shape != stroke.shape
+        or last_step is None
+    ):
+        prev_stroke = stroke.clone()
+        stroke_rate = torch.zeros_like(stroke)
+        setattr(env, SUSPENSION_STROKE_PREV_ATTR, prev_stroke)
+        setattr(env, SUSPENSION_STROKE_RATE_ATTR, stroke_rate)
+        setattr(env, SUSPENSION_STROKE_RATE_STEP_ATTR, int(env.common_step_counter))
+        _obs_debug(f"exit policy_state/suspension_stroke_rate init shape={tuple(stroke_rate.shape)}")
+        return stroke_rate
+
+    current_step = int(env.common_step_counter)
+    if int(last_step) != current_step:
+        dt = max(float(getattr(env, "step_dt", 1.0 / 60.0)), 1.0e-6)
+        stroke_rate[:] = (stroke - prev_stroke) / dt
+        reset_mask = env.episode_length_buf == 0
+        if torch.any(reset_mask):
+            stroke_rate[reset_mask] = 0.0
+        if clip is not None:
+            stroke_rate[:] = torch.clamp(stroke_rate, min=-float(clip), max=float(clip))
+        prev_stroke[:] = stroke
+        setattr(env, SUSPENSION_STROKE_RATE_STEP_ATTR, current_step)
+    else:
+        reset_mask = env.episode_length_buf == 0
+        if torch.any(reset_mask):
+            stroke_rate[reset_mask] = 0.0
+            prev_stroke[reset_mask] = stroke[reset_mask]
+
+    _obs_debug(f"exit policy_state/suspension_stroke_rate shape={tuple(stroke_rate.shape)}")
+    return stroke_rate
 
 
 def hydraulic_stroke_state_normalized(
@@ -522,12 +652,185 @@ def goal_state(
     return goal_obs
 
 
+def command_observation(
+    env: ManagerBasedEnv,
+    command_mode: str = "zero",
+    goal_source: str = "none",
+    stage: str = "A",
+    v_x_range: tuple[float, float] = (0.05, 0.4),
+    yaw_rate_range: tuple[float, float] = (-0.4, 0.4),
+    command_duration_range: tuple[float, float] = (2.0, 5.0),
+    smoothing_alpha: float = 0.1,
+    max_command_duration: float = 5.0,
+    small_yaw_prob: float = 0.0,
+    small_yaw_range: tuple[float, float] = (0.03, 0.08),
+    v_x_bins: tuple[tuple[float, float], ...] | None = None,
+    goal_x_body: float = 0.0,
+    goal_y_body: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return the fixed eight-dimensional command/goal observation for actor state."""
+
+    _obs_debug("enter policy_state/command_state")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 8), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/command_state disabled shape={tuple(out.shape)}")
+        return out
+
+    del max_command_duration
+
+    current_step = int(env.common_step_counter)
+    cached_obs = getattr(env, COMMAND_OBS_CACHE_ATTR, None)
+    cached_step = getattr(env, COMMAND_OBS_CACHE_STEP_ATTR, None)
+    if (
+        cached_obs is not None
+        and cached_obs.shape == (env.num_envs, 8)
+        and cached_step == current_step
+        and not torch.any(env.episode_length_buf == 0)
+    ):
+        _obs_debug(f"exit policy_state/command_state cached shape={tuple(cached_obs.shape)}")
+        return cached_obs
+
+    obs = torch.zeros((env.num_envs, 8), device=env.device, dtype=torch.float32)
+
+    command_mode = command_mode.lower()
+    if command_mode == "speed_command":
+        command = update_speed_command(
+            env=env,
+            stage=stage,
+            v_x_range=v_x_range,
+            yaw_rate_range=yaw_rate_range,
+            command_duration_range=command_duration_range,
+            smoothing_alpha=smoothing_alpha,
+            small_yaw_prob=small_yaw_prob,
+            small_yaw_range=small_yaw_range,
+            v_x_bins=v_x_bins,
+        )
+        obs[:, 0] = command[:, 0]
+        obs[:, 1] = 0.0
+        obs[:, 2] = command[:, 1]
+    elif command_mode != "zero":
+        raise ValueError(f"Unsupported command_mode: {command_mode}")
+
+    goal_source = goal_source.lower()
+    if goal_source == "dynamic":
+        target_vec_b, distance, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
+        obs[:, 3] = target_vec_b[:, 0]
+        obs[:, 4] = target_vec_b[:, 1]
+        obs[:, 5] = distance
+        obs[:, 6] = torch.sin(heading_error)
+        obs[:, 7] = torch.cos(heading_error)
+    elif goal_source == "fixed":
+        goal_x_body_tensor = torch.full((env.num_envs,), float(goal_x_body), device=env.device)
+        goal_y_body_tensor = torch.full((env.num_envs,), float(goal_y_body), device=env.device)
+        distance = torch.sqrt(goal_x_body_tensor.square() + goal_y_body_tensor.square())
+        heading_error = torch.atan2(goal_y_body_tensor, goal_x_body_tensor)
+        obs[:, 3] = goal_x_body_tensor
+        obs[:, 4] = goal_y_body_tensor
+        obs[:, 5] = distance
+        obs[:, 6] = torch.sin(heading_error)
+        obs[:, 7] = torch.cos(heading_error)
+    elif goal_source == "none":
+        obs[:, 7] = 1.0
+    else:
+        raise ValueError(f"Unsupported goal_source: {goal_source}")
+
+    setattr(env, COMMAND_OBS_CACHE_ATTR, obs)
+    setattr(env, COMMAND_OBS_CACHE_STEP_ATTR, current_step)
+    _obs_debug(f"exit policy_state/command_state shape={tuple(obs.shape)}")
+    return obs
+
+
 def last_action_normalized(env: ManagerBasedEnv, action_name: str | None = None) -> torch.Tensor:
     """Return clipped previous action history."""
 
+    _obs_debug("enter policy_state/previous_action")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, 8), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/previous_action disabled shape={tuple(out.shape)}")
+        return out
     if action_name is None:
-        return torch.clamp(env.action_manager.action, min=-1.0, max=1.0)
-    return torch.clamp(env.action_manager.get_term(action_name).raw_actions, min=-1.0, max=1.0)
+        out = torch.clamp(env.action_manager.action, min=-1.0, max=1.0)
+    else:
+        out = torch.clamp(env.action_manager.get_term(action_name).raw_actions, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/previous_action shape={tuple(out.shape)}")
+    return out
+
+
+def _wheel_contact_sensor_body_ids(env: ManagerBasedEnv, sensor_name: str = "wheel_contact_forces") -> torch.Tensor:
+    cached_body_ids = getattr(env, WHEEL_CONTACT_SENSOR_BODY_IDS_ATTR, None)
+    if cached_body_ids is not None and cached_body_ids.numel() == 4:
+        return cached_body_ids
+
+    contact_sensor = env.scene.sensors[sensor_name]
+    body_ids, _ = contact_sensor.find_bodies(["w_lb", "w_lf", "w_rf", "w_rb"], preserve_order=True)
+    cached_body_ids = torch.as_tensor(body_ids, device=env.device, dtype=torch.long)
+    setattr(env, WHEEL_CONTACT_SENSOR_BODY_IDS_ATTR, cached_body_ids)
+    return cached_body_ids
+
+
+def wheel_contact_force_over_weight(
+    env: ManagerBasedEnv,
+    sensor_name: str = "wheel_contact_forces",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return wheel-contact force norm per wheel normalized by total robot weight."""
+
+    _obs_debug("enter critic_privileged/wheel_contact_force")
+    if _critic_privileged_disabled():
+        out = torch.zeros((env.num_envs, 4), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit critic_privileged/wheel_contact_force disabled shape={tuple(out.shape)}")
+        return out
+    contact_sensor = env.scene.sensors[sensor_name]
+    body_ids = _wheel_contact_sensor_body_ids(env, sensor_name=sensor_name)
+    net_contact_forces = contact_sensor.data.net_forces_w_history[:, :, body_ids, :]
+    contact_force = torch.max(torch.norm(net_contact_forces, dim=-1), dim=1)[0]
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    expected_weight = torch.sum(asset.root_physx_view.get_masses(), dim=1).to(env.device) * 9.81
+    out = contact_force / torch.clamp(expected_weight.unsqueeze(1), min=1.0e-6)
+    _obs_debug(f"exit critic_privileged/wheel_contact_force shape={tuple(out.shape)}")
+    return out
+
+
+def wheel_contact_bool(
+    env: ManagerBasedEnv,
+    sensor_name: str = "wheel_contact_forces",
+    threshold: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return binary wheel contact state in semantic ``[lr, lf, rf, rr]`` sensor order."""
+
+    _obs_debug("enter critic_privileged/wheel_contact_bool")
+    if _critic_privileged_disabled():
+        out = torch.zeros((env.num_envs, 4), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit critic_privileged/wheel_contact_bool disabled shape={tuple(out.shape)}")
+        return out
+    del asset_cfg
+    contact_sensor = env.scene.sensors[sensor_name]
+    body_ids = _wheel_contact_sensor_body_ids(env, sensor_name=sensor_name)
+    net_contact_forces = contact_sensor.data.net_forces_w_history[:, :, body_ids, :]
+    force_norm = torch.max(torch.norm(net_contact_forces, dim=-1), dim=1)[0]
+    out = (force_norm > float(threshold)).to(torch.float32)
+    _obs_debug(f"exit critic_privileged/wheel_contact_bool shape={tuple(out.shape)}")
+    return out
+
+
+def root_height_state(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return root height used by the environment in world z coordinates."""
+
+    _obs_debug("enter critic_privileged/root_height")
+    if _critic_privileged_disabled():
+        out = torch.zeros((env.num_envs, 1), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit critic_privileged/root_height disabled shape={tuple(out.shape)}")
+        return out
+    asset: Articulation = env.scene[asset_cfg.name]
+    out = asset.data.root_pos_w[:, 2:3]
+    _obs_debug(f"exit critic_privileged/root_height shape={tuple(out.shape)}")
+    return out
 
 
 def local_sensor_visibility_maps(
@@ -579,13 +882,39 @@ def local_navigation_map_layers(
 ) -> dict[str, torch.Tensor]:
     """Return the unflattened local navigation layers for planning-aware policies."""
 
+    _obs_debug("enter policy_map/local_navigation_map_layers")
+    if _policy_map_disabled():
+        num_x, num_y = _navigation_map_grid_shape(x_range=x_range, y_range=y_range, resolution=resolution)
+        zeros = torch.zeros((env.num_envs, num_x, num_y), device=env.device, dtype=torch.float32)
+        out = {
+            "height": zeros,
+            "slope": zeros,
+            "roughness": zeros,
+            "step": zeros,
+            "geometric_traversability": zeros,
+            "valid_mask": zeros,
+            "semantic_traversability": zeros,
+            "confidence": zeros,
+            "traversability": zeros,
+        }
+        _obs_debug(
+            "exit policy_map/local_navigation_map_layers disabled "
+            f"grid_shape={tuple(out['height'].shape)}"
+        )
+        return out
+
     if use_neutral_map:
-        return _build_neutral_navigation_map_layers(
+        out = _build_neutral_navigation_map_layers(
             env=env,
             x_range=x_range,
             y_range=y_range,
             resolution=resolution,
         )
+        _obs_debug(
+            "exit policy_map/local_navigation_map_layers neutral "
+            f"grid_shape={tuple(out['height'].shape)}"
+        )
+        return out
 
     height_map_raw, valid_mask = _build_local_height_map(
         env=env,
@@ -630,7 +959,8 @@ def local_navigation_map_layers(
         risk_noise_std=risk_noise_std,
         valid_dropout_prob=valid_dropout_prob,
     )
-    traversability_map = _compute_traversability_map(
+    _obs_debug("enter policy_map/geometric_traversability")
+    geometric_traversability = _compute_traversability_map(
         slope_map=slope_map,
         roughness_map=roughness_map,
         step_map=step_map,
@@ -640,15 +970,26 @@ def local_navigation_map_layers(
         step_weight=step_weight,
         unknown_penalty=unknown_penalty,
     )
+    _obs_debug(f"exit policy_map/geometric_traversability shape={tuple(geometric_traversability.shape)}")
+    semantic_traversability = torch.zeros_like(geometric_traversability)
+    confidence = valid_mask.to(height_map.dtype)
+    _obs_debug(f"policy_map/valid_mask shape={tuple(valid_mask.shape)}")
+    _obs_debug(f"policy_map/confidence shape={tuple(confidence.shape)}")
 
-    return {
+    out = {
         "height": height_map,
         "slope": slope_map,
         "roughness": roughness_map,
         "step": step_map,
-        "traversability": traversability_map,
+        "geometric_traversability": geometric_traversability,
         "valid_mask": valid_mask.to(height_map.dtype),
+        "semantic_traversability": semantic_traversability,
+        "confidence": confidence,
+        # Backward-compatible alias for existing debug utilities that still reference the old name.
+        "traversability": geometric_traversability,
     }
+    _obs_debug(f"exit policy_map/local_navigation_map_layers grid_shape={tuple(height_map.shape)}")
+    return out
 
 
 def local_navigation_map(
@@ -674,8 +1015,13 @@ def local_navigation_map(
     unknown_penalty: float = 1.0,
     use_neutral_map: bool = False,
 ) -> torch.Tensor:
-    """Build a local six-layer navigation map from ray-based terrain perception."""
+    """Build the fixed eight-channel local navigation map used by the V1 terrain-CNN policy."""
 
+    _obs_debug("enter policy_map")
+    if _policy_map_disabled():
+        out = torch.zeros((env.num_envs, 2184), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_map disabled shape={tuple(out.shape)}")
+        return out
     layers_dict = local_navigation_map_layers(
         env=env,
         sensor_names=sensor_names,
@@ -705,12 +1051,16 @@ def local_navigation_map(
             layers_dict["slope"],
             layers_dict["roughness"],
             layers_dict["step"],
-            layers_dict["traversability"],
+            layers_dict["geometric_traversability"],
             layers_dict["valid_mask"],
+            layers_dict["semantic_traversability"],
+            layers_dict["confidence"],
         ),
         dim=1,
     )
-    return layers.reshape(env.num_envs, -1)
+    out = layers.reshape(env.num_envs, -1)
+    _obs_debug(f"exit policy_map shape={tuple(out.shape)}")
+    return out
 
 
 def local_geometric_map_layers(
@@ -991,8 +1341,11 @@ def _build_neutral_navigation_map_layers(
         "slope": zeros,
         "roughness": zeros,
         "step": zeros,
-        "traversability": ones,
+        "geometric_traversability": ones,
         "valid_mask": ones,
+        "semantic_traversability": zeros,
+        "confidence": ones,
+        "traversability": ones,
     }
 
 
@@ -1008,6 +1361,7 @@ def _compute_traversability_map(
 ) -> torch.Tensor:
     """Fuse geometric risk layers into a simple traversability intensity."""
 
+    _obs_debug("enter policy_map/_compute_traversability_map")
     valid_mask_float = valid_mask.to(slope_map.dtype)
     cost = (
         slope_weight * slope_map
@@ -1017,7 +1371,9 @@ def _compute_traversability_map(
     )
     cost = torch.clamp(cost, min=0.0, max=1.0)
     traversability = 1.0 - cost
-    return torch.where(valid_mask, traversability, torch.zeros_like(traversability))
+    out = torch.where(valid_mask, traversability, torch.zeros_like(traversability))
+    _obs_debug(f"exit policy_map/_compute_traversability_map shape={tuple(out.shape)}")
+    return out
 
 
 def _navigation_map_grid_shape(

@@ -33,9 +33,11 @@ import Ranger.tasks  # noqa: F401
 from Ranger.assets.ranger.ranger_cfg import RANGER_URDF_PATH, RANGER_USD_PATH
 from Ranger.tasks.manager_based.ranger import mdp
 from Ranger.tasks.manager_based.ranger.ranger_env_cfg import (
-    GOAL_STATE_PARAMS,
+    COMMAND_OBS_PARAMS,
     LOCAL_NAVIGATION_MAP_PARAMS,
     _expected_policy_obs_dim,
+    _expected_policy_map_obs_dim,
+    _expected_policy_state_obs_dim,
 )
 
 
@@ -89,40 +91,62 @@ def main() -> None:
                 actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
                 obs_dict, _, _, _, _ = env.step(actions)
 
-        policy_obs = obs_dict["policy"]
+        policy_state_obs = obs_dict["policy_state"]
+        policy_map_obs = obs_dict["policy_map"]
         obs_manager = env.unwrapped.observation_manager
+        expected_state_shape = _expected_policy_state_obs_dim()
+        expected_map_shape = _expected_policy_map_obs_dim()
         expected_shape = _expected_policy_obs_dim()
 
-        if tuple(obs_manager.group_obs_dim["policy"]) != (expected_shape,):
+        if tuple(obs_manager.group_obs_dim["policy_state"]) != (expected_state_shape,):
             raise RuntimeError(
-                f"ObservationManager policy shape mismatch: {obs_manager.group_obs_dim['policy']} vs expected {(expected_shape,)}"
+                "ObservationManager policy_state shape mismatch: "
+                f"{obs_manager.group_obs_dim['policy_state']} vs expected {(expected_state_shape,)}"
             )
-        if policy_obs.shape[1] != expected_shape:
-            raise RuntimeError(f"Policy observation tensor has shape {tuple(policy_obs.shape)}, expected second dim {expected_shape}.")
-        _require_all_finite("policy_obs", policy_obs)
+        if tuple(obs_manager.group_obs_dim["policy_map"]) != (expected_map_shape,):
+            raise RuntimeError(
+                f"ObservationManager policy_map shape mismatch: {obs_manager.group_obs_dim['policy_map']} "
+                f"vs expected {(expected_map_shape,)}"
+            )
+        if policy_state_obs.shape[1] != expected_state_shape or policy_map_obs.shape[1] != expected_map_shape:
+            raise RuntimeError(
+                "Policy observation tensor shapes mismatch: "
+                f"policy_state={tuple(policy_state_obs.shape)} policy_map={tuple(policy_map_obs.shape)}"
+            )
+        _require_all_finite("policy_state_obs", policy_state_obs)
+        _require_all_finite("policy_map_obs", policy_map_obs)
 
-        goal_obs = mdp.goal_state(env.unwrapped, **GOAL_STATE_PARAMS)
+        command_obs = mdp.command_observation(env.unwrapped, **COMMAND_OBS_PARAMS)
         nav_layers = mdp.local_navigation_map_layers(env.unwrapped, **LOCAL_NAVIGATION_MAP_PARAMS)
 
-        _print_stats("policy_obs", policy_obs)
-        _print_stats("goal_state", goal_obs)
+        _print_stats("policy_state_obs", policy_state_obs)
+        _print_stats("policy_map_obs", policy_map_obs)
+        _print_stats("command_obs", command_obs)
         _print_stats("height", nav_layers["height"])
         _print_stats("slope", nav_layers["slope"])
         _print_stats("roughness", nav_layers["roughness"])
         _print_stats("step", nav_layers["step"])
-        _print_stats("traversability", nav_layers["traversability"])
+        _print_stats("geometric_traversability", nav_layers["geometric_traversability"])
         _print_stats("valid_mask", nav_layers["valid_mask"])
+        _print_stats("semantic_traversability", nav_layers["semantic_traversability"])
+        _print_stats("confidence", nav_layers["confidence"])
 
-        _require_all_finite("goal_state", goal_obs)
-        _require_range("goal_state[:,:5]", goal_obs[:, :5], -1.0, 1.0)
-        _require_binary("goal_state[:,5]", goal_obs[:, 5])
+        _require_all_finite("command_obs", command_obs)
+        _require_range("command_obs[:,6:8]", command_obs[:, 6:8], -1.0, 1.0)
 
         _require_all_finite("local_navigation_map.height", nav_layers["height"])
         _require_range("local_navigation_map.slope", nav_layers["slope"], 0.0, 1.0)
         _require_range("local_navigation_map.roughness", nav_layers["roughness"], 0.0, 1.0)
         _require_range("local_navigation_map.step", nav_layers["step"], 0.0, 1.0)
-        _require_range("local_navigation_map.traversability", nav_layers["traversability"], 0.0, 1.0)
+        _require_range(
+            "local_navigation_map.geometric_traversability",
+            nav_layers["geometric_traversability"],
+            0.0,
+            1.0,
+        )
         _require_binary("local_navigation_map.valid_mask", nav_layers["valid_mask"])
+        _require_range("local_navigation_map.semantic_traversability", nav_layers["semantic_traversability"], 0.0, 0.0)
+        _require_binary("local_navigation_map.confidence", nav_layers["confidence"])
 
         height_min = float(nav_layers["height"].min().item())
         height_max = float(nav_layers["height"].max().item())
@@ -132,8 +156,11 @@ def main() -> None:
                 f"Observed min/max: {height_min:.6f}, {height_max:.6f}"
             )
 
-        print(f"[PASS] policy observation shape = {expected_shape}")
-        print("[PASS] goal_state and local_navigation_map checks completed without NaN/Inf or range violations.")
+        print(
+            "[PASS] policy observation shapes = "
+            f"state {expected_state_shape}, map {expected_map_shape}, total actor {expected_shape}"
+        )
+        print("[PASS] command_obs and local_navigation_map checks completed without NaN/Inf or range violations.")
     finally:
         env.close()
 

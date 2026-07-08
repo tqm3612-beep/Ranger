@@ -23,13 +23,11 @@ from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
 
-GOAL_STATE_PARAMS = {
-    # Stage-1 neutral input: goal_valid=0 and [sin, cos] = [0, 1].
-    # Later stages can enable a real goal without changing the policy interface.
+COMMAND_OBS_PARAMS = {
+    "command_mode": "zero",
+    "goal_source": "none",
     "goal_x_body": 0.0,
     "goal_y_body": 0.0,
-    "goal_range": 5.0,
-    "goal_enabled": False,
 }
 
 LOCAL_NAVIGATION_MAP_PARAMS = {
@@ -51,7 +49,6 @@ LOCAL_NAVIGATION_MAP_PARAMS = {
     "roughness_weight": 0.3,
     "step_weight": 0.3,
     "unknown_penalty": 1.0,
-    # Stage-1 neutral map placeholder can be enabled later without changing observation shape.
     "use_neutral_map": False,
 }
 
@@ -62,16 +59,22 @@ def _navigation_map_grid_shape(resolution: float, x_range: tuple[float, float], 
     return num_x, num_y
 
 
-def _expected_policy_obs_dim() -> int:
-    low_dim_terms = 45
-    goal_dim = 6
-    map_layers = 6
+def _expected_policy_state_obs_dim() -> int:
+    return 42
+
+
+def _expected_policy_map_obs_dim() -> int:
+    map_layers = 8
     num_x, num_y = _navigation_map_grid_shape(
         resolution=LOCAL_NAVIGATION_MAP_PARAMS["resolution"],
         x_range=LOCAL_NAVIGATION_MAP_PARAMS["x_range"],
         y_range=LOCAL_NAVIGATION_MAP_PARAMS["y_range"],
     )
-    return low_dim_terms + goal_dim + map_layers * num_x * num_y
+    return map_layers * num_x * num_y
+
+
+def _expected_policy_obs_dim() -> int:
+    return _expected_policy_state_obs_dim() + _expected_policy_map_obs_dim()
 
 
 def _expected_action_dim() -> int:
@@ -226,15 +229,10 @@ class ObservationsCfg:
     """Observation specifications for the MDP."""
 
     @configclass
-    class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+    class PolicyStateCfg(ObsGroup):
+        """Low-dimensional actor state: proprioception + command."""
 
         # observation terms (order preserved)
-        base_lin_vel = ObsTerm(
-            func=mdp.base_lin_vel_normalized,
-            params={"scale": 2.0},
-            noise=Unoise(n_min=-0.03, n_max=0.03),
-        )
         base_ang_vel = ObsTerm(
             func=mdp.base_ang_vel_normalized,
             params={"scale": 3.0},
@@ -259,47 +257,71 @@ class ObservationsCfg:
             params={"scale": 20.0, "asset_cfg": SceneEntityCfg("robot", joint_names=["w_.*"])},
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
-        hydraulic_stroke_state = ObsTerm(
-            func=mdp.hydraulic_stroke_state_normalized,
-            params={"action_name": "leg_hydraulic", "stroke_min": 0.0, "stroke_max": 1.0},
+        suspension_stroke = ObsTerm(
+            func=mdp.suspension_stroke_state,
+            params={"action_name": "leg_hydraulic"},
             noise=Unoise(n_min=-0.01, n_max=0.01),
         )
-        hydraulic_effort_state = ObsTerm(
-            func=mdp.hydraulic_effort_state_normalized,
-            params={"action_name": "leg_hydraulic", "effort_limit": 300.0},
+        suspension_stroke_rate = ObsTerm(
+            func=mdp.suspension_stroke_rate_state,
+            params={"action_name": "leg_hydraulic", "clip": 5.0},
             noise=Unoise(n_min=-0.01, n_max=0.01),
         )
-        wheel_velocity_target = ObsTerm(
-            func=mdp.wheel_velocity_target_normalized,
-            params={"action_name": "wheel_motor_csv", "velocity_limit": 20.0},
-            noise=Unoise(n_min=-0.01, n_max=0.01),
-        )
-        wheel_torque_state = ObsTerm(
-            func=mdp.wheel_torque_state_normalized,
-            params={"action_name": "wheel_motor_csv", "effort_limit": 100.0},
-            noise=Unoise(n_min=-0.01, n_max=0.01),
-        )
-        goal_state = ObsTerm(
-            func=mdp.goal_state,
-            params=GOAL_STATE_PARAMS,
+        command_state = ObsTerm(
+            func=mdp.command_observation,
+            params=COMMAND_OBS_PARAMS,
         )
         last_action = ObsTerm(
             func=mdp.last_action_normalized,
             noise=Unoise(n_min=-0.01, n_max=0.01),
-        )
-        # Feed the policy a fixed six-layer local navigation map. Stage-1
-        # training can later swap in a neutral map without changing this shape.
-        local_navigation_map = ObsTerm(
-            func=mdp.local_navigation_map,
-            params=LOCAL_NAVIGATION_MAP_PARAMS,
         )
 
         def __post_init__(self) -> None:
             self.enable_corruption = True
             self.concatenate_terms = True
 
+    @configclass
+    class PolicyMapCfg(ObsGroup):
+        """Flattened 8-channel local terrain map for the CNN branch."""
+
+        local_navigation_map = ObsTerm(
+            func=mdp.local_navigation_map,
+            params=LOCAL_NAVIGATION_MAP_PARAMS,
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticPrivilegedCfg(ObsGroup):
+        """Compact privileged critic-only features for asymmetric actor-critic."""
+
+        base_lin_vel = ObsTerm(
+            func=mdp.base_lin_vel_normalized,
+            params={"scale": 2.0},
+        )
+        wheel_contact_force = ObsTerm(
+            func=mdp.wheel_contact_force_over_weight,
+            params={"sensor_name": "wheel_contact_forces", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        wheel_contact_bool = ObsTerm(
+            func=mdp.wheel_contact_bool,
+            params={"sensor_name": "wheel_contact_forces", "threshold": 1.0},
+        )
+        root_height = ObsTerm(
+            func=mdp.root_height_state,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     # observation groups
-    policy: PolicyCfg = PolicyCfg()
+    policy_state: PolicyStateCfg = PolicyStateCfg()
+    policy_map: PolicyMapCfg = PolicyMapCfg()
+    critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
 
 
 @configclass
@@ -425,7 +447,10 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
         self.terrain_like_reset_linear_xy_velocity_range = (-0.10, 0.10)
         self.terrain_like_reset_angular_velocity_range = (-0.2, 0.2)
         self.debug_full_stdout_metrics = False
-        print(f"[RangerEnvCfg] Expected policy observation shape: {_expected_policy_obs_dim()} (legacy 1410 -> current 1689)")
+        print(
+            "[RangerEnvCfg] Expected actor observation shape: "
+            f"state={_expected_policy_state_obs_dim()} map={_expected_policy_map_obs_dim()} total={_expected_policy_obs_dim()}"
+        )
         print(f"[RangerEnvCfg] Expected action shape: {_expected_action_dim()} (4 leg + 4 wheel)")
 
 
@@ -442,8 +467,9 @@ class RangerStandEnvCfg(RangerEnvCfg):
         self.actions.leg_hydraulic.joint_target_sign = (-1.0, 1.0, 1.0, -1.0)
 
         # Stage-1 uses the fixed neutral goal/map interface while we focus on posture stability.
-        self.observations.policy.goal_state.params["goal_enabled"] = False
-        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.observations.policy_state.command_state.params["command_mode"] = "zero"
+        self.observations.policy_state.command_state.params["goal_source"] = "none"
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
 
         # Keep resets close to the nominal support pose so the policy can first learn to settle.
         self.events.reset_robot_joints.params["position_range"] = (-0.005, 0.005)
@@ -744,10 +770,11 @@ class RangerForwardEnvCfg(RangerStandEnvCfg):
         self.enable_initial_stroke_randomization = False
 
         # Keep the policy interface fixed while enabling a simple forward objective.
-        self.observations.policy.goal_state.params["goal_enabled"] = True
-        self.observations.policy.goal_state.params["goal_x_body"] = 3.0
-        self.observations.policy.goal_state.params["goal_y_body"] = 0.0
-        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.observations.policy_state.command_state.params["command_mode"] = "zero"
+        self.observations.policy_state.command_state.params["goal_source"] = "fixed"
+        self.observations.policy_state.command_state.params["goal_x_body"] = 3.0
+        self.observations.policy_state.command_state.params["goal_y_body"] = 0.0
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
 
         # Re-enable only the simple forward-progress incentive for the next stage.
         self.rewards.forward_progress.weight = 2.0
@@ -783,9 +810,13 @@ class RangerSpeedCommandFlatEnvCfg(RangerForwardEnvCfg):
             "small_yaw_prob": 0.10 if command_stage == "A" else 0.0,
             "small_yaw_range": (0.03, 0.08),
         }
-        self.observations.policy.goal_state.func = mdp.speed_command_state
-        self.observations.policy.goal_state.params = command_params
-        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.observations.policy_state.command_state.func = mdp.command_observation
+        self.observations.policy_state.command_state.params = {
+            "command_mode": "speed_command",
+            "goal_source": "none",
+            **command_params,
+        }
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
 
         self.events.reset_speed_command = EventTerm(
             func=mdp.reset_speed_command,
@@ -804,8 +835,6 @@ class RangerSpeedCommandFlatEnvCfg(RangerForwardEnvCfg):
         # Keep the posture task alive long enough for command-conditioned wheel control to emerge.
         self.terminations.root_height_low.params["minimum_height"] = 0.30
         self.actions.wheel_motor_csv.velocity_limit = 6.0
-        self.observations.policy.wheel_velocity_target.params["velocity_limit"] = 6.0
-
         # Disable fixed-speed forward shaping from the old straight-line stage.
         self.rewards.forward_progress.weight = 0.0
         self.rewards.wheel_joint_velocity.weight = 0.0
@@ -966,9 +995,13 @@ class RangerGoalHeadingFlatEnvCfg(RangerStandEnvCfg):
 
         # Keep the network interface checkpoint-compatible while replacing the neutral goal slot
         # with a sampled target-heading descriptor. The local map remains a neutral placeholder.
-        self.observations.policy.goal_state.func = mdp.goal_heading_state
-        self.observations.policy.goal_state.params = {"goal_range": 5.0, "asset_cfg": SceneEntityCfg("robot")}
-        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.observations.policy_state.command_state.func = mdp.command_observation
+        self.observations.policy_state.command_state.params = {
+            "command_mode": "zero",
+            "goal_source": "dynamic",
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
 
         self.events.reset_goal_heading_target = EventTerm(
             func=mdp.reset_goal_heading_target,
@@ -988,8 +1021,6 @@ class RangerGoalHeadingFlatEnvCfg(RangerStandEnvCfg):
 
         # Keep wheel targets bounded for stand-checkpoint fine-tuning.
         self.actions.wheel_motor_csv.velocity_limit = 6.0
-        self.observations.policy.wheel_velocity_target.params["velocity_limit"] = 6.0
-
         # This task learns target-heading response directly, not fixed +x speed or speed-command tracking.
         self.rewards.forward_progress.weight = 0.0
         self.rewards.wheel_joint_velocity.weight = 0.0
@@ -1110,9 +1141,13 @@ class RangerTurnToTargetFlatEnvCfg(RangerStandEnvCfg):
         self.scene.ground.spawn.size = (300.0, 300.0, 0.02)
 
         # Keep the observation shape unchanged while swapping in a per-env dynamic goal state.
-        self.observations.policy.goal_state.func = mdp.turn_to_target_goal_state
-        self.observations.policy.goal_state.params = {"asset_cfg": SceneEntityCfg("robot")}
-        self.observations.policy.local_navigation_map.params["use_neutral_map"] = True
+        self.observations.policy_state.command_state.func = mdp.command_observation
+        self.observations.policy_state.command_state.params = {
+            "command_mode": "zero",
+            "goal_source": "dynamic",
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
 
         self.events.reset_goal_heading_target = EventTerm(
             func=mdp.reset_goal_heading_target,

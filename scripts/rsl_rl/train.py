@@ -75,6 +75,7 @@ import torch
 from datetime import datetime
 
 from rsl_rl.runners import OnPolicyRunner
+import rsl_rl.runners.on_policy_runner as rsl_on_policy_runner
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -106,11 +107,14 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
+from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
 
 
 def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str) -> str:

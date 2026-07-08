@@ -277,12 +277,16 @@ def main() -> None:
         layers_np = {name: tensor[env_index].detach().cpu().numpy() for name, tensor in fused_layers.items()}
 
         grid_shape = layers_np["height"].shape
-        policy_obs = obs_dict["policy"]
-        observation_dim = int(policy_obs.shape[-1])
+        policy_state_obs = obs_dict["policy_state"]
+        policy_map_obs = obs_dict["policy_map"]
+        observation_dim = int(policy_state_obs.shape[-1] + policy_map_obs.shape[-1])
         fused_valid_cells = int(layers_np["valid_mask"].sum())
 
         print(f"[INFO]: terrain case = {args_cli.terrain_case}")
-        print(f"[INFO]: policy observation dim = {observation_dim}")
+        print(
+            "[INFO]: actor observation dim = "
+            f"{observation_dim} (state={int(policy_state_obs.shape[-1])}, map={int(policy_map_obs.shape[-1])})"
+        )
         print(f"[INFO]: local map grid shape = {grid_shape}")
         print(f"[INFO]: fused valid cells = {fused_valid_cells}")
         for sensor_name, mask in visibility_np.items():

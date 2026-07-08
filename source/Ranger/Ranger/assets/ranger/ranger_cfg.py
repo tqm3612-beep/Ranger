@@ -21,19 +21,21 @@ RANGER_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
+            disable_gravity=False,
             max_linear_velocity=1000.0,
             max_angular_velocity=1000.0,
-            max_depenetration_velocity=100.0,
+            max_depenetration_velocity=10000.0,
             enable_gyroscopic_forces=True,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
-            solver_position_iteration_count=4,
-            solver_velocity_iteration_count=0,
+            enabled_self_collisions=True,
+            solver_position_iteration_count=8,
+            solver_velocity_iteration_count=4,
             sleep_threshold=0.005,
             stabilization_threshold=0.001,
         ),
     ),
+    soft_joint_pos_limit_factor=0.7,
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.75),
         joint_pos={
@@ -52,21 +54,22 @@ RANGER_CFG = ArticulationCfg(
         joint_vel={".*": 0.0},
     ),
 
-    # Actuators are configured to stay compatible with effort-based motor and hydraulic action terms.
+    # Align with robot1-style implicit actuators:
+    # legs use high-stiffness position-servo-like settings; wheels use zero-stiffness, high-damping velocity-like settings.
     actuators={
         "leg_joints": ImplicitActuatorCfg(
-            joint_names_expr=["g_.*"],
-            effort_limit_sim=800.0, # 最大等效力矩
-            velocity_limit_sim=3.0, # 最大关节角速度
-            stiffness=2e4, # 最大关节刚度
-            damping=2e3,  # 最大关节阻尼
+            joint_names_expr=["g_lb", "g_lf", "g_rf", "g_rb"],
+            effort_limit_sim=800.0,
+            velocity_limit_sim=3.0,
+            stiffness=1e6,
+            damping=100000.0,
         ),
         "wheel_joints": ImplicitActuatorCfg(
-            joint_names_expr=["w_.*"],
-            effort_limit_sim=130.0,
-            velocity_limit_sim=40.0,
-            stiffness=0,
-            damping=1.0,
+            joint_names_expr=["w_lb", "w_lf", "w_rf", "w_rb"],
+            effort_limit=130.0,
+            velocity_limit=40.0,
+            stiffness=0.0,
+            damping=1000000.0,
         ),
     },
 )

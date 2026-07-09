@@ -13,7 +13,16 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
-from .observations import GOAL_HEADING_PREV_HEADING_ERROR_ATTR, goal_heading_target_body, speed_command
+from .observations import (
+    GOAL_HEADING_PREV_HEADING_ERROR_ATTR,
+    SHORT_GOAL_PREV_HEADING_ERROR_ATTR,
+    SHORT_GOAL_PREV_DISTANCE_ATTR,
+    SHORT_GOAL_REACHED_ATTR,
+    goal_heading_target_body,
+    short_goal_target_body,
+    speed_command,
+    yaw_rate_command,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -438,6 +447,504 @@ def goal_heading_wheel_diff_l1(
     right_mean = semantic_target[:, 2:].mean(dim=1)
     expected_diff = torch.clamp(-2.0 * float(turn_gain) * torch.sin(heading_error), -float(max_abs_diff), float(max_abs_diff))
     return torch.abs((left_mean - right_mean) - expected_diff)
+
+
+def short_goal_progress_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward reduction in short-goal distance."""
+
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    prev_goal_distance = getattr(env, SHORT_GOAL_PREV_DISTANCE_ATTR, None)
+    if prev_goal_distance is None or prev_goal_distance.shape != (env.num_envs,):
+        prev_goal_distance = current_distance.clone()
+        setattr(env, SHORT_GOAL_PREV_DISTANCE_ATTR, prev_goal_distance)
+    progress = prev_goal_distance - current_distance
+    prev_goal_distance[:] = current_distance
+    return progress
+
+
+def short_goal_progress_reward_heading_gated(
+    env: ManagerBasedRLEnv,
+    heading_error_threshold: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward distance reduction only when heading error is not too large."""
+
+    progress = short_goal_progress_reward(env, asset_cfg=asset_cfg)
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    active_mask = (torch.abs(heading_error) <= float(heading_error_threshold)).to(progress.dtype)
+    return active_mask * progress
+
+
+def short_goal_success_reward(
+    env: ManagerBasedRLEnv,
+    success_distance: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward the first time each environment reaches the short goal."""
+
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    goal_reached = getattr(env, SHORT_GOAL_REACHED_ATTR, None)
+    if goal_reached is None or goal_reached.shape != (env.num_envs,):
+        goal_reached = torch.zeros((env.num_envs,), device=env.device, dtype=torch.bool)
+        setattr(env, SHORT_GOAL_REACHED_ATTR, goal_reached)
+    newly_reached = (current_distance < float(success_distance)) & (~goal_reached)
+    goal_reached |= newly_reached
+    return newly_reached.to(torch.float32)
+
+
+def short_goal_near_stop_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.5,
+    yaw_weight: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize residual planar speed and yaw rate when already near the goal."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    near_mask = (current_distance < float(stop_distance)).to(torch.float32)
+    base_xy_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+    return near_mask * (base_xy_speed + float(yaw_weight) * yaw_rate)
+
+
+def short_goal_heading_alignment(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Lightly reward facing toward the short goal."""
+
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    return torch.cos(heading_error)
+
+
+def short_goal_velocity_towards_target(
+    env: ManagerBasedRLEnv,
+    max_velocity: float = 1.0,
+    min_reward: float = -1.0,
+    max_reward: float = 1.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward planar body velocity projected onto the current short-goal direction."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    target_dir_b = target_vec_b[:, :2] / torch.clamp(distance.unsqueeze(1), min=1.0e-6)
+    velocity_towards_target = torch.sum(asset.data.root_lin_vel_b[:, :2] * target_dir_b, dim=1)
+    normalized_velocity = velocity_towards_target / max(float(max_velocity), 1.0e-6)
+    return torch.clamp(normalized_velocity, min=float(min_reward), max=float(max_reward))
+
+
+def short_goal_velocity_towards_target_heading_gated(
+    env: ManagerBasedRLEnv,
+    max_velocity: float = 1.0,
+    min_reward: float = -1.0,
+    max_reward: float = 1.5,
+    heading_error_threshold: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward target-direction velocity only when the body is roughly facing the goal."""
+
+    velocity_reward = short_goal_velocity_towards_target(
+        env,
+        max_velocity=max_velocity,
+        min_reward=min_reward,
+        max_reward=max_reward,
+        asset_cfg=asset_cfg,
+    )
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    active_mask = (torch.abs(heading_error) <= float(heading_error_threshold)).to(velocity_reward.dtype)
+    return active_mask * velocity_reward
+
+
+def short_goal_heading_error_reduction(
+    env: ManagerBasedRLEnv,
+    min_progress: float = -0.5,
+    max_progress: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward step-wise reduction in absolute heading error for short-goal turning."""
+
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
+        prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
+        setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
+
+    prev_abs_error = torch.abs(prev_heading_error)
+    current_abs_error = torch.abs(heading_error)
+    progress = torch.where(
+        torch.isfinite(prev_abs_error),
+        prev_abs_error - current_abs_error,
+        torch.zeros_like(current_abs_error),
+    )
+    prev_heading_error[:] = heading_error
+    return torch.clamp(progress, min=float(min_progress), max=float(max_progress))
+
+
+def short_goal_turn_toward_goal(
+    env: ManagerBasedRLEnv,
+    min_reward: float = -1.0,
+    max_reward: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward yaw-rate direction that turns toward the side goal."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, _, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    turn_direction = torch.sign(target_vec_b[:, 1]) * asset.data.root_ang_vel_b[:, 2]
+    return torch.clamp(turn_direction, min=float(min_reward), max=float(max_reward))
+
+
+def _short_goal_signed_yaw_targets(
+    env: ManagerBasedRLEnv,
+    target_yaw_rate: float = 0.35,
+    heading_deadband: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return desired signed yaw-rate signals for short-goal turning tasks."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    desired_sign = torch.sign(target_vec_b[:, 1])
+    heading_abs = torch.abs(heading_error)
+    active_mask = heading_abs > float(heading_deadband)
+    desired_yaw_rate = torch.where(
+        active_mask,
+        desired_sign * float(target_yaw_rate),
+        torch.zeros_like(desired_sign),
+    )
+    base_yaw_rate = asset.data.root_ang_vel_b[:, 2]
+    return desired_yaw_rate, desired_sign, active_mask, base_yaw_rate
+
+
+def short_goal_signed_yaw_rate_tracking(
+    env: ManagerBasedRLEnv,
+    target_yaw_rate: float = 0.35,
+    heading_deadband: float = 0.10,
+    sigma: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Bounded positive reward for tracking the signed yaw-rate implied by the goal side."""
+
+    desired_yaw_rate, desired_sign, active_mask, base_yaw_rate = _short_goal_signed_yaw_targets(
+        env,
+        target_yaw_rate=target_yaw_rate,
+        heading_deadband=heading_deadband,
+        asset_cfg=asset_cfg,
+    )
+    sigma_sq = max(float(sigma) * float(sigma), 1.0e-6)
+    signed_yaw = desired_sign * base_yaw_rate
+    directional_tracking = torch.exp(-torch.square(signed_yaw - float(target_yaw_rate)) / sigma_sq)
+    tracking = torch.where(signed_yaw > 0.0, directional_tracking, torch.zeros_like(directional_tracking))
+    inactive_tracking = torch.exp(-torch.square(base_yaw_rate) / sigma_sq)
+    return torch.where(active_mask, tracking, inactive_tracking)
+
+
+def short_goal_too_small_yaw_rate_when_error_large_penalty(
+    env: ManagerBasedRLEnv,
+    min_yaw_rate: float = 0.12,
+    heading_threshold: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize the low-motion local optimum when heading error is still large."""
+
+    desired_yaw_rate, desired_sign, active_mask, base_yaw_rate = _short_goal_signed_yaw_targets(
+        env,
+        target_yaw_rate=min_yaw_rate,
+        heading_deadband=heading_threshold,
+        asset_cfg=asset_cfg,
+    )
+    del desired_yaw_rate
+    signed_yaw = desired_sign * base_yaw_rate
+    wrong_direction = signed_yaw < 0.0
+    too_small = signed_yaw < float(min_yaw_rate)
+    active = active_mask & (wrong_direction | too_small)
+    penalty = torch.relu(float(min_yaw_rate) - signed_yaw) / max(float(min_yaw_rate), 1.0e-6)
+    return torch.where(active, torch.clamp(penalty, max=2.0), torch.zeros_like(penalty))
+
+
+def short_goal_wrong_direction_yaw_penalty(
+    env: ManagerBasedRLEnv,
+    heading_deadband: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize yaw-rate whose sign turns away from the side goal."""
+
+    desired_yaw_rate, desired_sign, active_mask, base_yaw_rate = _short_goal_signed_yaw_targets(
+        env,
+        target_yaw_rate=0.0,
+        heading_deadband=heading_deadband,
+        asset_cfg=asset_cfg,
+    )
+    del desired_yaw_rate
+    wrong_direction = torch.relu(-desired_sign * base_yaw_rate)
+    return torch.where(active_mask, wrong_direction, torch.zeros_like(wrong_direction))
+
+
+def _yaw_turn_support_free_mode_gate(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Return 1 only for YawTurnSupportFlat free-hydraulic mode, else 0."""
+
+    is_yaw_turn_support = bool(getattr(env, "_is_yaw_turn_support_task", False))
+    mode = str(getattr(env, "_yaw_turn_support_hydraulic_mode", "")).strip().lower()
+    gate_value = 1.0 if is_yaw_turn_support and mode == "free" else 0.0
+    return torch.full((env.num_envs,), gate_value, device=env.device, dtype=torch.float32)
+
+
+def yaw_turn_free_mode_hydraulic_action_magnitude_l1(
+    env: ManagerBasedRLEnv,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Mode-gated hydraulic action magnitude penalty for free-hydraulic yaw-turn ablations."""
+
+    return _yaw_turn_support_free_mode_gate(env) * hydraulic_action_magnitude_l1(env, action_name=action_name)
+
+
+def yaw_turn_free_mode_hydraulic_action_rate_l1(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Mode-gated L1 hydraulic action-rate penalty using the first four action dimensions."""
+
+    delta = torch.abs(env.action_manager.action[:, :4] - env.action_manager.prev_action[:, :4])
+    return _yaw_turn_support_free_mode_gate(env) * torch.mean(delta, dim=1)
+
+
+def yaw_turn_free_mode_hydraulic_action_range_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Mode-gated per-leg hydraulic action spread penalty."""
+
+    return _yaw_turn_support_free_mode_gate(env) * hydraulic_action_range_penalty(env, action_name=action_name)
+
+
+def yaw_turn_free_mode_actual_stroke_nominal_l2(
+    env: ManagerBasedRLEnv,
+    stroke_nominal: float = 0.5,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Mode-gated nominal stroke regularizer."""
+
+    return _yaw_turn_support_free_mode_gate(env) * actual_stroke_nominal_l2(
+        env, stroke_nominal=stroke_nominal, action_name=action_name
+    )
+
+
+def yaw_turn_free_mode_actual_stroke_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    limit: float = 0.55,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Mode-gated soft-limit regularizer."""
+
+    return _yaw_turn_support_free_mode_gate(env) * actual_stroke_soft_limit_penalty(
+        env, limit=limit, action_name=action_name
+    )
+
+
+def yaw_turn_wheel_common_mode_target_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize shared left/right wheel target motion while allowing differential steering."""
+
+    return wheel_target_common_mode_penalty(env, action_name=action_name)
+
+
+def yaw_rate_command_tracking_reward(
+    env: ManagerBasedRLEnv,
+    active_threshold: float = 0.03,
+    sigma: float = 0.20,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Direction-gated yaw-rate command tracking reward."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = yaw_rate_command(env)
+    yaw = asset.data.root_ang_vel_b[:, 2]
+    active = torch.abs(cmd) > float(active_threshold)
+    desired_sign = torch.sign(cmd)
+    signed_yaw = desired_sign * yaw
+    sigma_sq = max(float(sigma) * float(sigma), 1.0e-6)
+    active_reward = torch.where(
+        signed_yaw > 0.0,
+        torch.exp(-torch.square(yaw - cmd) / sigma_sq),
+        torch.zeros_like(yaw),
+    )
+    inactive_reward = torch.exp(-torch.square(yaw) / sigma_sq)
+    return torch.where(active, active_reward, inactive_reward)
+
+
+def wrong_direction_yaw_command_penalty(
+    env: ManagerBasedRLEnv,
+    active_threshold: float = 0.03,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize yaw-rate that rotates opposite to the command sign."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = yaw_rate_command(env)
+    yaw = asset.data.root_ang_vel_b[:, 2]
+    active = torch.abs(cmd) > float(active_threshold)
+    penalty = torch.relu(-(torch.sign(cmd) * yaw))
+    return torch.where(active, penalty, torch.zeros_like(penalty))
+
+
+def too_small_yaw_rate_command_penalty(
+    env: ManagerBasedRLEnv,
+    active_threshold: float = 0.10,
+    min_yaw_rate_min: float = 0.08,
+    min_yaw_rate_max: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize too-small signed yaw when a non-trivial yaw-rate command is active."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = yaw_rate_command(env)
+    yaw = asset.data.root_ang_vel_b[:, 2]
+    active = torch.abs(cmd) > float(active_threshold)
+    desired_sign = torch.sign(cmd)
+    signed_yaw = desired_sign * yaw
+    min_yaw = torch.clamp(
+        0.5 * torch.abs(cmd),
+        min=float(min_yaw_rate_min),
+        max=float(min_yaw_rate_max),
+    )
+    penalty = torch.relu(min_yaw - signed_yaw) / torch.clamp(min_yaw, min=1.0e-6)
+    penalty = torch.clamp(penalty, min=0.0, max=2.0)
+    return torch.where(active, penalty, torch.zeros_like(penalty))
+
+
+def wheel_forward_mode_target_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize semantic wheel forward-mode target magnitude."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
+    semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
+    semantic_forward_mode = 0.5 * (semantic_left_forward_target + semantic_right_forward_target)
+    action_term = env.action_manager.get_term(action_name)
+    velocity_limit = float(getattr(action_term, "_velocity_limit", 1.0))
+    return torch.abs(semantic_forward_mode) / max(velocity_limit, 1.0)
+
+
+def wheel_turn_mode_target_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+    soft_limit: float = 8.0,
+) -> torch.Tensor:
+    """Penalize excessive semantic differential turn mode target magnitude."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
+    semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
+    semantic_turn_mode = 0.5 * (semantic_right_forward_target - semantic_left_forward_target)
+    action_term = env.action_manager.get_term(action_name)
+    velocity_limit = float(getattr(action_term, "_velocity_limit", 1.0))
+    penalty = torch.relu(torch.abs(semantic_turn_mode) - float(soft_limit))
+    return penalty / max(velocity_limit, 1.0)
+
+
+def wheel_target_abs_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+    soft_limit: float = 8.0,
+) -> torch.Tensor:
+    """Penalize excessive mean absolute wheel velocity target magnitude."""
+
+    wheel_action_term = env.action_manager.get_term(action_name)
+    target_abs = torch.mean(torch.abs(wheel_action_term.velocity_target), dim=1)
+    velocity_limit = float(getattr(wheel_action_term, "_velocity_limit", 1.0))
+    penalty = torch.relu(target_abs - float(soft_limit))
+    return penalty / max(velocity_limit, 1.0)
+
+
+def wheel_joint_vel_abs_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+    soft_limit: float = 10.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize excessive mean absolute actual wheel joint velocity magnitude."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_action_term = env.action_manager.get_term(action_name)
+    wheel_joint_vel = asset.data.joint_vel[:, wheel_action_term._joint_ids]
+    vel_abs = torch.mean(torch.abs(wheel_joint_vel), dim=1)
+    velocity_limit = float(getattr(wheel_action_term, "_velocity_limit", 1.0))
+    penalty = torch.relu(vel_abs - float(soft_limit))
+    return penalty / max(velocity_limit, 1.0)
+
+
+def wasted_turn_when_yaw_small_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+    active_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize large semantic turn usage when commanded yaw is still not produced."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = yaw_rate_command(env)
+    yaw = asset.data.root_ang_vel_b[:, 2]
+    desired_sign = torch.sign(cmd)
+    signed_yaw = desired_sign * yaw
+    required_yaw = 0.5 * torch.abs(cmd)
+    yaw_deficit = torch.relu(required_yaw - signed_yaw) / torch.clamp(required_yaw, min=1.0e-6)
+    yaw_deficit = torch.clamp(yaw_deficit, min=0.0, max=2.0)
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
+    semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
+    semantic_turn_mode = 0.5 * (semantic_right_forward_target - semantic_left_forward_target)
+    action_term = env.action_manager.get_term(action_name)
+    velocity_limit = float(getattr(action_term, "_velocity_limit", 1.0))
+    turn_usage = torch.abs(semantic_turn_mode) / max(velocity_limit, 1.0)
+    active = (torch.abs(cmd) > float(active_threshold)).to(torch.float32)
+    return turn_usage * yaw_deficit * active
+
+
+def short_goal_excessive_yaw_rate_penalty(
+    env: ManagerBasedRLEnv,
+    free_yaw_rate: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize excessive absolute yaw rate beyond a small free band."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.relu(torch.abs(asset.data.root_ang_vel_b[:, 2]) - float(free_yaw_rate))
+
+
+def short_goal_forward_velocity_during_turn_penalty(
+    env: ManagerBasedRLEnv,
+    free_speed: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize forward/backward body speed during a turn-only task."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.relu(torch.abs(asset.data.root_lin_vel_b[:, 0]) - float(free_speed))
+
+
+def short_goal_base_xy_speed_penalty(
+    env: ManagerBasedRLEnv,
+    free_speed: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize planar body speed beyond a small allowance."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_xy_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    return torch.relu(base_xy_speed - float(free_speed))
 
 
 def turn_to_target_heading_alignment_exp(

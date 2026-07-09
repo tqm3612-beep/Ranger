@@ -30,8 +30,15 @@ class WheelMotorCSVAction(ActionTerm):
     Assumption for this project version:
     the policy outputs a normalized wheel-velocity command. The action term
     filters the command with a first-order response and acceleration limit, then
-    closes a local velocity loop that converts the velocity target into joint
-    torque sent to the wheel joints.
+    sends the resulting wheel-velocity target to the articulation through
+    ``set_joint_velocity_target``.
+
+    Deprecated compatibility note:
+    older config fields such as ``control_mode``, ``velocity_kp``,
+    ``velocity_damping``, ``viscous_friction``, and ``effort_limit`` are still
+    accepted so existing task configs keep loading, but they no longer affect
+    the control calculation. The local velocity loop / effort-control path is
+    intentionally disabled.
     """
 
     cfg: "WheelMotorCSVActionCfg"
@@ -60,17 +67,17 @@ class WheelMotorCSVAction(ActionTerm):
         self._velocity_limit = float(self.cfg.velocity_limit)
         self._acceleration_limit = float(self.cfg.acceleration_limit)
         self._command_time_constant = float(self.cfg.command_time_constant)
-        self._velocity_kp = float(self.cfg.velocity_kp)
-        self._velocity_damping = float(self.cfg.velocity_damping)
-        self._viscous_friction = float(self.cfg.viscous_friction)
-        self._effort_limit = float(self.cfg.effort_limit)
+        self._velocity_kp = float(self.cfg.velocity_kp)  # deprecated / ignored
+        self._velocity_damping = float(self.cfg.velocity_damping)  # deprecated / ignored
+        self._viscous_friction = float(self.cfg.viscous_friction)  # deprecated / ignored
+        self._effort_limit = float(self.cfg.effort_limit)  # deprecated / ignored
+        requested_control_mode = str(self.cfg.control_mode).strip().lower()
+        self._control_mode = "velocity"
 
-        if self._velocity_limit <= 0.0 or self._acceleration_limit <= 0.0 or self._effort_limit <= 0.0:
+        if self._velocity_limit <= 0.0 or self._acceleration_limit <= 0.0:
             raise ValueError("Wheel motor limits must be positive.")
         if self._command_time_constant < 0.0:
             raise ValueError("Wheel motor command_time_constant must be non-negative.")
-        if self._velocity_kp <= 0.0:
-            raise ValueError("Wheel motor velocity_kp must be positive.")
 
         self._clip = _build_clip_tensor(
             clip=self.cfg.clip,
@@ -78,6 +85,20 @@ class WheelMotorCSVAction(ActionTerm):
             num_envs=self.num_envs,
             action_dim=self.action_dim,
             device=self.device,
+        )
+        if requested_control_mode != "velocity":
+            print(
+                f"[WheelMotorCSVAction] requested control_mode={requested_control_mode!r} is deprecated; "
+                "forcing velocity-target control.",
+                flush=True,
+            )
+        print(
+            f"[WheelMotorCSVAction] joints={self._joint_names} "
+            f"control_mode={self._control_mode} "
+            "target_mode=set_joint_velocity_target "
+            f"velocity_limit={self._velocity_limit} "
+            "local_velocity_loop=disabled",
+            flush=True,
         )
 
     @property
@@ -90,7 +111,7 @@ class WheelMotorCSVAction(ActionTerm):
 
     @property
     def processed_actions(self) -> torch.Tensor:
-        """Wheel joint torques sent to the simulator."""
+        """Wheel velocity target sent to the simulator."""
         return self._processed_actions
 
     @property
@@ -100,8 +121,16 @@ class WheelMotorCSVAction(ActionTerm):
 
     @property
     def torque_actual(self) -> torch.Tensor:
-        """Equivalent wheel torque command after the local velocity loop."""
+        """Deprecated debug tensor retained for compatibility; always zero."""
         return self._torque_actual
+
+    @property
+    def control_mode(self) -> str:
+        return self._control_mode
+
+    @property
+    def uses_velocity_target(self) -> bool:
+        return True
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
@@ -119,7 +148,6 @@ class WheelMotorCSVAction(ActionTerm):
         else:
             velocity_cmd = velocity_des
 
-        wheel_speed = self._asset.data.joint_vel[:, self._joint_ids]
         max_delta = self._acceleration_limit * self._env.step_dt
         velocity_delta = torch.clamp(velocity_cmd - self._velocity_target, min=-max_delta, max=max_delta)
         self._velocity_target[:] = torch.clamp(
@@ -127,15 +155,11 @@ class WheelMotorCSVAction(ActionTerm):
             min=-self._velocity_limit,
             max=self._velocity_limit,
         )
-
-        velocity_error = self._velocity_target - wheel_speed
-        torque = self._velocity_kp * velocity_error - self._velocity_damping * wheel_speed
-        torque = torque - self._viscous_friction * wheel_speed
-        self._torque_actual[:] = torch.clamp(torque, min=-self._effort_limit, max=self._effort_limit)
-        self._processed_actions[:] = self._torque_actual
+        self._torque_actual.zero_()
+        self._processed_actions[:] = self._velocity_target
 
     def apply_actions(self) -> None:
-        self._asset.set_joint_effort_target(self._processed_actions, joint_ids=self._joint_ids)
+        self._asset.set_joint_velocity_target(self._processed_actions, joint_ids=self._joint_ids)
 
     def _canonicalize_env_ids(self, env_ids: Sequence[int] | torch.Tensor | None) -> torch.Tensor:
         if env_ids is None:
@@ -400,10 +424,12 @@ class WheelMotorCSVActionCfg(ActionTermCfg):
     velocity_limit: float = 20.0
     acceleration_limit: float = 80.0
     command_time_constant: float = 0.02
+    # Deprecated / ignored: kept only so older config files still load cleanly.
     velocity_kp: float = 10.0
     velocity_damping: float = 0.2
     viscous_friction: float = 0.05
     effort_limit: float = 100.0
+    control_mode: str = "velocity"
 
 
 @configclass

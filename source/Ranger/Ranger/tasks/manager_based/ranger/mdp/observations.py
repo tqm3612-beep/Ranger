@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import torch
 import torch.nn.functional as F
@@ -24,6 +25,11 @@ SPEED_COMMAND_TIMER_ATTR = "_ranger_speed_command_timer"
 SPEED_COMMAND_DURATION_ATTR = "_ranger_speed_command_duration"
 GOAL_HEADING_TARGET_ATTR = "_ranger_goal_heading_target_pos_w"
 GOAL_HEADING_PREV_HEADING_ERROR_ATTR = "_ranger_goal_heading_prev_heading_error"
+SHORT_GOAL_TARGET_ATTR = "_ranger_short_goal_pos_w"
+SHORT_GOAL_PREV_DISTANCE_ATTR = "_ranger_short_goal_prev_distance"
+SHORT_GOAL_REACHED_ATTR = "_ranger_short_goal_reached"
+SHORT_GOAL_PREV_HEADING_ERROR_ATTR = "_ranger_short_goal_prev_heading_error"
+YAW_RATE_COMMAND_ATTR = "_ranger_yaw_rate_command"
 SUSPENSION_STROKE_PREV_ATTR = "_ranger_suspension_stroke_prev"
 SUSPENSION_STROKE_RATE_ATTR = "_ranger_suspension_stroke_rate"
 SUSPENSION_STROKE_RATE_STEP_ATTR = "_ranger_suspension_stroke_rate_step"
@@ -59,6 +65,13 @@ def _as_env_ids(env: ManagerBasedEnv, env_ids) -> torch.Tensor:
     if isinstance(env_ids, torch.Tensor):
         return env_ids.to(device=env.device, dtype=torch.long)
     return torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return float(default)
+    return float(raw)
 
 
 def _ensure_speed_command_buffers(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -287,6 +300,90 @@ def _ensure_goal_heading_target(env: ManagerBasedEnv) -> torch.Tensor:
     return target_pos_w
 
 
+def _ensure_short_goal_target(env: ManagerBasedEnv) -> torch.Tensor:
+    target_pos_w = getattr(env, SHORT_GOAL_TARGET_ATTR, None)
+    if target_pos_w is None or target_pos_w.shape != (env.num_envs, 3):
+        target_pos_w = torch.zeros((env.num_envs, 3), device=env.device, dtype=torch.float32)
+        setattr(env, SHORT_GOAL_TARGET_ATTR, target_pos_w)
+    return target_pos_w
+
+
+def _ensure_short_goal_buffers(env: ManagerBasedEnv) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    target_pos_w = _ensure_short_goal_target(env)
+    prev_goal_distance = getattr(env, SHORT_GOAL_PREV_DISTANCE_ATTR, None)
+    goal_reached = getattr(env, SHORT_GOAL_REACHED_ATTR, None)
+    needs_init = (
+        prev_goal_distance is None
+        or goal_reached is None
+        or prev_goal_distance.shape != (env.num_envs,)
+        or goal_reached.shape != (env.num_envs,)
+    )
+    if needs_init:
+        prev_goal_distance = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        goal_reached = torch.zeros((env.num_envs,), device=env.device, dtype=torch.bool)
+        setattr(env, SHORT_GOAL_PREV_DISTANCE_ATTR, prev_goal_distance)
+        setattr(env, SHORT_GOAL_REACHED_ATTR, goal_reached)
+    return target_pos_w, prev_goal_distance, goal_reached
+
+
+def _ensure_yaw_rate_command_buffer(env: ManagerBasedEnv) -> torch.Tensor:
+    command = getattr(env, YAW_RATE_COMMAND_ATTR, None)
+    if command is None or command.shape != (env.num_envs,):
+        command = torch.zeros((env.num_envs,), device=env.device, dtype=torch.float32)
+        setattr(env, YAW_RATE_COMMAND_ATTR, command)
+    return command
+
+
+def reset_yaw_rate_command(
+    env: ManagerBasedEnv,
+    env_ids,
+    min_abs: float = 0.08,
+    max_abs: float = 0.15,
+    zero_rate: float = 0.0,
+    sign_mode: str = "balanced",
+) -> None:
+    """Sample a per-episode constant yaw-rate command."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    min_abs = _env_float("RANGER_YAW_CMD_MIN_ABS", min_abs)
+    max_abs = _env_float("RANGER_YAW_CMD_MAX_ABS", max_abs)
+    zero_rate = _env_float("RANGER_YAW_CMD_ZERO_RATE", zero_rate)
+    sign_mode = os.getenv("RANGER_YAW_CMD_SIGN_MODE", sign_mode).strip().lower()
+    if sign_mode not in {"balanced", "positive", "negative"}:
+        sign_mode = "balanced"
+    if max_abs < min_abs:
+        min_abs, max_abs = max_abs, min_abs
+    zero_rate = min(max(float(zero_rate), 0.0), 1.0)
+
+    command = _ensure_yaw_rate_command_buffer(env)
+    num = env_ids.numel()
+    abs_cmd = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(float(min_abs), float(max_abs))
+    if sign_mode == "positive":
+        sign = torch.ones(num, device=env.device, dtype=torch.float32)
+    elif sign_mode == "negative":
+        sign = -torch.ones(num, device=env.device, dtype=torch.float32)
+    else:
+        sign = torch.where(
+            torch.rand(num, device=env.device) < 0.5,
+            -torch.ones(num, device=env.device, dtype=torch.float32),
+            torch.ones(num, device=env.device, dtype=torch.float32),
+        )
+    cmd = sign * abs_cmd
+    if zero_rate > 0.0:
+        zero_mask = torch.rand(num, device=env.device) < float(zero_rate)
+        cmd = torch.where(zero_mask, torch.zeros_like(cmd), cmd)
+    command[env_ids] = cmd
+
+
+def yaw_rate_command(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return per-env constant yaw-rate command."""
+
+    return _ensure_yaw_rate_command_buffer(env)
+
+
 def reset_goal_heading_target(
     env: ManagerBasedEnv,
     env_ids,
@@ -338,6 +435,103 @@ def reset_goal_heading_target(
         prev_heading_error[env_ids] = float("nan")
 
 
+def reset_short_goal_target(
+    env: ManagerBasedEnv,
+    env_ids,
+    distance_range: tuple[float, float] = (0.5, 2.0),
+    heading_range: tuple[float, float] = (-0.7853981633974483, 0.7853981633974483),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Sample a short-range flat-goal target and initialize per-env progress buffers."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    num = env_ids.numel()
+    distance_min = _env_float("RANGER_GOAL_DISTANCE_MIN", float(distance_range[0]))
+    distance_max = _env_float("RANGER_GOAL_DISTANCE_MAX", float(distance_range[1]))
+    angle_min_deg = _env_float("RANGER_GOAL_ANGLE_MIN_DEG", float(torch.rad2deg(torch.tensor(float(heading_range[0]))).item()))
+    angle_max_deg = _env_float("RANGER_GOAL_ANGLE_MAX_DEG", float(torch.rad2deg(torch.tensor(float(heading_range[1]))).item()))
+    if distance_max < distance_min:
+        distance_min, distance_max = distance_max, distance_min
+    if angle_max_deg < angle_min_deg:
+        angle_min_deg, angle_max_deg = angle_max_deg, angle_min_deg
+    heading_min = math.radians(angle_min_deg)
+    heading_max = math.radians(angle_max_deg)
+    distance = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+        float(distance_min), float(distance_max)
+    )
+    heading = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+        float(heading_min), float(heading_max)
+    )
+    target_vec_b = torch.zeros((num, 3), device=env.device, dtype=torch.float32)
+    target_vec_b[:, 0] = distance * torch.cos(heading)
+    target_vec_b[:, 1] = distance * torch.sin(heading)
+    target_vec_w = math_utils.quat_apply_yaw(asset.data.root_quat_w[env_ids], target_vec_b)
+    target_pos_w[env_ids] = asset.data.root_pos_w[env_ids] + target_vec_w
+    prev_goal_distance[env_ids] = distance
+    goal_reached[env_ids] = False
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is not None and prev_heading_error.shape == (env.num_envs,):
+        prev_heading_error[env_ids] = float("nan")
+
+
+def reset_short_goal_turn_target(
+    env: ManagerBasedEnv,
+    env_ids,
+    distance_range: tuple[float, float] = (1.0, 1.5),
+    left_heading_range_deg: tuple[float, float] = (25.0, 45.0),
+    right_heading_range_deg: tuple[float, float] = (-45.0, -25.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Sample a side-only short-goal target for differential turning practice."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    num = env_ids.numel()
+
+    distance = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
+        float(distance_range[0]), float(distance_range[1])
+    )
+    left_mask = torch.rand((num,), device=env.device) < 0.5
+    heading = torch.empty(num, device=env.device, dtype=torch.float32)
+
+    if torch.any(left_mask):
+        heading[left_mask] = torch.empty(int(left_mask.sum().item()), device=env.device, dtype=torch.float32).uniform_(
+            math.radians(float(left_heading_range_deg[0])),
+            math.radians(float(left_heading_range_deg[1])),
+        )
+    right_mask = ~left_mask
+    if torch.any(right_mask):
+        heading[right_mask] = torch.empty(
+            int(right_mask.sum().item()), device=env.device, dtype=torch.float32
+        ).uniform_(
+            math.radians(float(right_heading_range_deg[0])),
+            math.radians(float(right_heading_range_deg[1])),
+        )
+
+    target_vec_b = torch.zeros((num, 3), device=env.device, dtype=torch.float32)
+    target_vec_b[:, 0] = distance * torch.cos(heading)
+    target_vec_b[:, 1] = distance * torch.sin(heading)
+    target_vec_w = math_utils.quat_apply_yaw(asset.data.root_quat_w[env_ids], target_vec_b)
+    target_pos_w[env_ids] = asset.data.root_pos_w[env_ids] + target_vec_w
+    prev_goal_distance[env_ids] = distance
+    goal_reached[env_ids] = False
+
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
+        prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
+        setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
+    prev_heading_error[env_ids] = heading
+
+
 def goal_heading_target_pos_w(env: ManagerBasedEnv) -> torch.Tensor:
     """Return sampled goal-heading target positions in world frame."""
 
@@ -352,6 +546,28 @@ def goal_heading_target_body(
 
     asset: Articulation = env.scene[asset_cfg.name]
     target_pos_w = _ensure_goal_heading_target(env)
+    target_vec_w = target_pos_w - asset.data.root_pos_w
+    target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w, target_vec_w)
+    target_xy_b = target_vec_b[:, :2]
+    distance = torch.norm(target_xy_b, dim=1)
+    heading_error = torch.atan2(target_xy_b[:, 1], target_xy_b[:, 0])
+    return target_vec_b, distance, heading_error
+
+
+def short_goal_target_pos_w(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return sampled short-goal target positions in world frame."""
+
+    return _ensure_short_goal_target(env)
+
+
+def short_goal_target_body(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return short-goal vector, distance, and heading error in the robot body frame."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w = _ensure_short_goal_target(env)
     target_vec_w = target_pos_w - asset.data.root_pos_w
     target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w, target_vec_w)
     target_xy_b = target_vec_b[:, :2]
@@ -709,12 +925,24 @@ def command_observation(
         obs[:, 0] = command[:, 0]
         obs[:, 1] = 0.0
         obs[:, 2] = command[:, 1]
+    elif command_mode == "yaw_rate_command":
+        command = yaw_rate_command(env)
+        obs[:, 0] = 0.0
+        obs[:, 1] = 0.0
+        obs[:, 2] = command
     elif command_mode != "zero":
         raise ValueError(f"Unsupported command_mode: {command_mode}")
 
     goal_source = goal_source.lower()
     if goal_source == "dynamic":
         target_vec_b, distance, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
+        obs[:, 3] = target_vec_b[:, 0]
+        obs[:, 4] = target_vec_b[:, 1]
+        obs[:, 5] = distance
+        obs[:, 6] = torch.sin(heading_error)
+        obs[:, 7] = torch.cos(heading_error)
+    elif goal_source == "short_goal":
+        target_vec_b, distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
         obs[:, 3] = target_vec_b[:, 0]
         obs[:, 4] = target_vec_b[:, 1]
         obs[:, 5] = distance

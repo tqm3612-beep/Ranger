@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
+import os
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
@@ -214,6 +215,7 @@ class ActionsCfg:
         asset_name="robot",
         joint_names=["w_lb", "w_lf", "w_rf", "w_rb"],
         preserve_order=True,
+        control_mode="velocity",
         velocity_limit=20.0,
         acceleration_limit=80.0,
         command_time_constant=0.02,
@@ -1251,6 +1253,387 @@ class RangerTurnToTargetFlatEnvCfg(RangerStandEnvCfg):
         self.enable_reset_settle = True
         self.reset_settle_steps = 60
         self.reset_settle_leg_action = -0.34
+
+
+@configclass
+class RangerShortGoalFlatEnvCfg(RangerStandEnvCfg):
+    """Short-distance flat-goal approach task that preserves the current V1 actor/critic interfaces."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.stand_training_task = False
+        self.enable_initial_stroke_randomization = False
+        self.episode_length_s = 5.0
+        self.scene.ground.spawn.size = (300.0, 300.0, 0.02)
+
+        # Keep actor/critic observation shapes unchanged while swapping in a short-range dynamic goal.
+        self.observations.policy_state.command_state.func = mdp.command_observation
+        self.observations.policy_state.command_state.params = {
+            "command_mode": "zero",
+            "goal_source": "short_goal",
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
+
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_target,
+            mode="reset",
+            params={
+                "distance_range": (0.5, 2.0),
+                "heading_range": (-0.7853981633974483, 0.7853981633974483),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.terminations.bad_orientation.params["limit_angle"] = 1.2
+        self.terminations.root_height_low.params["minimum_height"] = 0.30
+        self.terminations.goal_reached = DoneTerm(
+            func=mdp.short_goal_reached,
+            params={"success_distance": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+
+        # Preserve only the stand safety constraints; do not leave positive stand rewards
+        # that let the policy score by standing still near the reset pose.
+        self.rewards.alive.weight = 0.0
+        self.rewards.forward_progress.weight = 0.0
+        self.rewards.lateral_velocity.weight = 0.0
+        self.rewards.wheel_joint_velocity.weight = 0.0
+        self.rewards.base_xy_velocity.weight = 0.0
+        self.rewards.base_yaw_rate.weight = 0.0
+        self.rewards.yaw_drift_from_reset.weight = 0.0
+        self.rewards.root_height_tracking.weight = 0.0
+        self.rewards.root_height_band.weight = 0.0
+        self.rewards.wheel_contact_count.weight = 0.0
+        self.rewards.wheel_contact_stability.weight = 0.0
+        self.rewards.wheel_contact_balance.weight = 0.0
+        self.rewards.action_rate.weight = -0.02
+        self.rewards.action_magnitude.weight = -0.001
+        self.rewards.termination.weight = -20.0
+
+        self.rewards.progress_to_goal = RewTerm(
+            func=mdp.short_goal_progress_reward,
+            weight=20.0,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.goal_velocity = RewTerm(
+            func=mdp.short_goal_velocity_towards_target,
+            weight=4.0,
+            params={"max_velocity": 0.8, "min_reward": -1.0, "max_reward": 1.5, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.goal_success = RewTerm(
+            func=mdp.short_goal_success_reward,
+            weight=12.0,
+            params={"success_distance": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.near_goal_stop = RewTerm(
+            func=mdp.short_goal_near_stop_penalty,
+            weight=-0.8,
+            params={"stop_distance": 0.5, "yaw_weight": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.heading_alignment = RewTerm(
+            func=mdp.short_goal_heading_alignment,
+            weight=0.0,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+
+
+@configclass
+class RangerShortGoalTurnFlatEnvCfg(RangerShortGoalFlatEnvCfg):
+    """Side-goal differential-turn task that keeps the current V1 actor/critic interfaces."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.short_goal_turn_task = True
+        self.short_goal_turn_lock_hydraulic = True
+        self.short_goal_turn_hydraulic_mode_default = "free_small"
+        self.actions.wheel_motor_csv.velocity_limit = 80.0
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_turn_target,
+            mode="reset",
+            params={
+                "distance_range": (1.0, 1.5),
+                "left_heading_range_deg": (25.0, 45.0),
+                "right_heading_range_deg": (-45.0, -25.0),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.progress_to_goal = RewTerm(
+            func=mdp.short_goal_progress_reward_heading_gated,
+            weight=20.0,
+            params={"heading_error_threshold": 0.35, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.goal_velocity = RewTerm(
+            func=mdp.short_goal_velocity_towards_target_heading_gated,
+            weight=4.0,
+            params={
+                "max_velocity": 0.8,
+                "min_reward": -1.0,
+                "max_reward": 1.5,
+                "heading_error_threshold": 0.35,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.goal_success = RewTerm(
+            func=mdp.short_goal_success_reward,
+            weight=12.0,
+            params={"success_distance": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.near_goal_stop = RewTerm(
+            func=mdp.short_goal_near_stop_penalty,
+            weight=-0.8,
+            params={"stop_distance": 0.5, "yaw_weight": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.heading_error_reduction = RewTerm(
+            func=mdp.short_goal_heading_error_reduction,
+            weight=6.0,
+            params={"min_progress": -0.5, "max_progress": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.turn_toward_goal = RewTerm(
+            func=mdp.short_goal_turn_toward_goal,
+            weight=2.0,
+            params={"min_reward": -1.0, "max_reward": 1.0, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.hydraulic_action_magnitude = RewTerm(
+            func=mdp.hydraulic_action_magnitude_l1,
+            weight=-0.20,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_range = RewTerm(
+            func=mdp.stroke_range_penalty,
+            weight=-2.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_diagonal_balance = RewTerm(
+            func=mdp.stroke_diagonal_balance_penalty,
+            weight=-1.0,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.contact_force_diag_balance = RewTerm(
+            func=mdp.contact_force_diag_balance_penalty,
+            weight=-1.0,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.contact_force_left_right_balance = RewTerm(
+            func=mdp.contact_force_left_right_balance_penalty,
+            weight=-0.4,
+            params={"sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"])},
+        )
+        self.rewards.low_contact_ratio_support = RewTerm(
+            func=mdp.contact_force_min_ratio_support_penalty,
+            weight=-0.6,
+            params={
+                "min_ratio_threshold": 0.15,
+                "sensor_cfg": SceneEntityCfg("wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+            },
+        )
+
+
+@configclass
+class RangerYawTurnSupportFlatEnvCfg(RangerShortGoalTurnFlatEnvCfg):
+    """Low-speed turn-in-place support task with goal-independent hydraulic support-hold control."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.short_goal_turn_task = False
+        self.short_goal_turn_lock_hydraulic = False
+        self.yaw_turn_support_task = True
+        self.yaw_turn_support_hydraulic_mode_default = "support_hold"
+        self.actions.wheel_motor_csv.velocity_limit = 80.0
+
+        self.rewards.progress_to_goal.weight = 0.0
+        self.rewards.goal_velocity.weight = 0.0
+        self.rewards.goal_success.weight = 0.0
+        self.rewards.near_goal_stop.weight = 0.0
+        self.rewards.heading_error_reduction.weight = 10.0
+        self.rewards.turn_toward_goal.weight = 8.0
+        self.rewards.heading_alignment = RewTerm(
+            func=mdp.short_goal_heading_alignment,
+            weight=0.0,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.signed_yaw_rate_tracking = RewTerm(
+            func=mdp.short_goal_signed_yaw_rate_tracking,
+            weight=8.0,
+            params={"target_yaw_rate": 0.30, "heading_deadband": 0.10, "sigma": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.too_small_yaw_rate_when_error_large = RewTerm(
+            func=mdp.short_goal_too_small_yaw_rate_when_error_large_penalty,
+            weight=-5.0,
+            params={"min_yaw_rate": 0.10, "heading_threshold": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wrong_direction_yaw = RewTerm(
+            func=mdp.short_goal_wrong_direction_yaw_penalty,
+            weight=-10.0,
+            params={"heading_deadband": 0.10, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.excessive_yaw_rate = RewTerm(
+            func=mdp.short_goal_excessive_yaw_rate_penalty,
+            weight=-1.0,
+            params={"free_yaw_rate": 0.9, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.forward_velocity_during_turn = RewTerm(
+            func=mdp.short_goal_forward_velocity_during_turn_penalty,
+            weight=-5.0,
+            params={"free_speed": 0.12, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.base_xy_speed_during_turn = RewTerm(
+            func=mdp.short_goal_base_xy_speed_penalty,
+            weight=-1.5,
+            params={"free_speed": 0.18, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.hydraulic_action_magnitude = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_magnitude_l1,
+            weight=-0.08,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.hydraulic_action_rate = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_rate_l1,
+            weight=-0.05,
+        )
+        self.rewards.hydraulic_action_range = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_range_penalty,
+            weight=-0.05,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_nominal = RewTerm(
+            func=mdp.yaw_turn_free_mode_actual_stroke_nominal_l2,
+            weight=-0.5,
+            params={"stroke_nominal": 0.5, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_soft_limit = RewTerm(
+            func=mdp.yaw_turn_free_mode_actual_stroke_soft_limit_penalty,
+            weight=-4.0,
+            params={"limit": 0.55, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_range.weight = -1.5
+        self.rewards.stroke_diagonal_balance.weight = -1.0
+        self.rewards.turn_wheel_target_common_mode = RewTerm(
+            func=mdp.yaw_turn_wheel_common_mode_target_penalty,
+            weight=-0.10,
+            params={"action_name": "wheel_motor_csv"},
+        )
+
+        self.terminations.goal_reached = DoneTerm(func=mdp.never_terminate)
+
+
+@configclass
+class RangerYawRateCommandFlatEnvCfg(RangerYawTurnSupportFlatEnvCfg):
+    """Stage-1 low-level yaw-rate command tracking task on flat ground."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.yaw_rate_command_task = True
+        self.yaw_turn_support_hydraulic_mode_default = "support_hold"
+        self.actions.wheel_motor_csv.velocity_limit = float(os.getenv("RANGER_YAW_WHEEL_VEL_LIMIT", "30.0"))
+        self.events.reset_short_goal_target = None
+        self.events.reset_yaw_rate_command = EventTerm(
+            func=mdp.reset_yaw_rate_command,
+            mode="reset",
+            params={"min_abs": 0.08, "max_abs": 0.15, "zero_rate": 0.0, "sign_mode": "balanced"},
+        )
+        self.observations.policy_state.command_state.func = mdp.command_observation
+        self.observations.policy_state.command_state.params = {
+            "command_mode": "yaw_rate_command",
+            "goal_source": "fixed",
+            "goal_x_body": 1.0,
+            "goal_y_body": 0.0,
+        }
+
+        self.rewards.progress_to_goal.weight = 0.0
+        self.rewards.goal_velocity.weight = 0.0
+        self.rewards.goal_success.weight = 0.0
+        self.rewards.near_goal_stop.weight = 0.0
+        self.rewards.heading_alignment.weight = 0.0
+        self.rewards.heading_error_reduction.weight = 0.0
+        self.rewards.turn_toward_goal.weight = 0.0
+        self.rewards.signed_yaw_rate_tracking = RewTerm(
+            func=mdp.yaw_rate_command_tracking_reward,
+            weight=10.0,
+            params={"active_threshold": 0.02, "sigma": 0.10, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wrong_direction_yaw = RewTerm(
+            func=mdp.wrong_direction_yaw_command_penalty,
+            weight=-8.0,
+            params={"active_threshold": 0.02, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.too_small_yaw_rate_when_error_large = RewTerm(
+            func=mdp.too_small_yaw_rate_command_penalty,
+            weight=-4.0,
+            params={
+                "active_threshold": 0.05,
+                "min_yaw_rate_min": 0.04,
+                "min_yaw_rate_max": 0.08,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.excessive_yaw_rate = RewTerm(
+            func=mdp.short_goal_excessive_yaw_rate_penalty,
+            weight=-1.0,
+            params={"free_yaw_rate": 0.5, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.forward_velocity_during_turn = RewTerm(
+            func=mdp.short_goal_forward_velocity_during_turn_penalty,
+            weight=-8.0,
+            params={"free_speed": 0.05, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.base_xy_speed_during_turn = RewTerm(
+            func=mdp.short_goal_base_xy_speed_penalty,
+            weight=-4.0,
+            params={"free_speed": 0.08, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.hydraulic_action_magnitude = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_magnitude_l1,
+            weight=-0.25,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.hydraulic_action_rate = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_rate_l1,
+            weight=-0.10,
+        )
+        self.rewards.hydraulic_action_range = RewTerm(
+            func=mdp.yaw_turn_free_mode_hydraulic_action_range_penalty,
+            weight=-0.10,
+            params={"action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_nominal = RewTerm(
+            func=mdp.yaw_turn_free_mode_actual_stroke_nominal_l2,
+            weight=-1.0,
+            params={"stroke_nominal": 0.5, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.actual_stroke_soft_limit = RewTerm(
+            func=mdp.yaw_turn_free_mode_actual_stroke_soft_limit_penalty,
+            weight=-6.0,
+            params={"limit": 0.55, "action_name": "leg_hydraulic"},
+        )
+        self.rewards.stroke_range.weight = -3.0
+        self.rewards.stroke_diagonal_balance.weight = -2.0
+        self.rewards.turn_wheel_target_common_mode = RewTerm(
+            func=mdp.wheel_forward_mode_target_penalty,
+            weight=-0.25,
+            params={"action_name": "wheel_motor_csv"},
+        )
+        self.rewards.wheel_turn_mode_soft_limit = RewTerm(
+            func=mdp.wheel_turn_mode_target_soft_limit_penalty,
+            weight=-0.5,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 8.0},
+        )
+        self.rewards.wheel_target_abs_soft_limit = RewTerm(
+            func=mdp.wheel_target_abs_soft_limit_penalty,
+            weight=-0.5,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 8.0},
+        )
+        self.rewards.wheel_joint_vel_abs_soft_limit = RewTerm(
+            func=mdp.wheel_joint_vel_abs_soft_limit_penalty,
+            weight=-0.3,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 10.0, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wasted_turn_when_yaw_small = RewTerm(
+            func=mdp.wasted_turn_when_yaw_small_penalty,
+            weight=-0.5,
+            params={"action_name": "wheel_motor_csv", "active_threshold": 0.05, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.terminations.goal_reached = DoneTerm(func=mdp.never_terminate)
 
 
 @configclass

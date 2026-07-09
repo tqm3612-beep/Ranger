@@ -14,6 +14,7 @@ import torch
 
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
+from .observations import short_goal_target_body
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -38,3 +39,22 @@ def root_height_below_minimum_with_grace(
 
     grace_active = env.episode_length_buf < grace_steps
     return torch.logical_and(low_height, ~grace_active)
+
+
+def short_goal_reached(
+    env: ManagerBasedRLEnv,
+    success_distance: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the short flat goal is reached."""
+
+    _, distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    return distance < float(success_distance)
+
+
+def never_terminate(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """Termination helper that never fires."""
+
+    return torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)

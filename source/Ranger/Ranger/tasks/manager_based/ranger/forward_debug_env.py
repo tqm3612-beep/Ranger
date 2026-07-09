@@ -11,6 +11,8 @@ import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import POSITION_GOAL_MARKER_CFG
 from isaaclab.utils.math import euler_xyz_from_quat, quat_from_euler_xyz
 
 from . import mdp
@@ -105,14 +107,38 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             ground_size_z = float(getattr(getattr(ground_cfg, "spawn", None), "size", (0.0, 0.0, 0.0))[2])
         self._stand_trace_ground_height = ground_pos_z + 0.5 * ground_size_z
 
-        # Raw wheel order is [w_lb, w_lf, w_rf, w_rb] == [lr, lf, rf, rr].
+        # Raw wheel order is [w_lb, w_lf, w_rf, w_rb].
         # Semantic wheel sign unifies left/right mirrored joint axes.
         self._wheel_forward_sign = mdp.wheel_semantic_sign_lr_lf_rf_rr(device=self.device)
 
-        self._is_speed_command_task = hasattr(self.cfg.events, "reset_speed_command")
-        self._is_goal_heading_task = hasattr(self.cfg.events, "reset_goal_heading_target")
+        self._is_speed_command_task = getattr(self.cfg.events, "reset_speed_command", None) is not None
+        self._is_goal_heading_task = getattr(self.cfg.events, "reset_goal_heading_target", None) is not None
+        self._is_short_goal_task = getattr(self.cfg.events, "reset_short_goal_target", None) is not None
+        self._is_yaw_rate_command_task = bool(getattr(self.cfg, "yaw_rate_command_task", False))
+        self._is_short_goal_turn_task = bool(getattr(self.cfg, "short_goal_turn_task", False))
+        self._is_yaw_turn_support_task = bool(getattr(self.cfg, "yaw_turn_support_task", False))
         self._is_turn_to_target_task = bool(getattr(self.cfg, "turn_to_target_task", False))
         self._is_stand_training_task = bool(getattr(self.cfg, "stand_training_task", False))
+        self._short_goal_turn_lock_hydraulic = bool(getattr(self.cfg, "short_goal_turn_lock_hydraulic", False))
+        self._short_goal_turn_hydraulic_mode = os.getenv(
+            "RANGER_TURN_HYDRAULIC_MODE",
+            str(getattr(self.cfg, "short_goal_turn_hydraulic_mode_default", "free_small")),
+        ).strip().lower()
+        if self._short_goal_turn_hydraulic_mode not in {"locked", "free_small", "free"}:
+            self._short_goal_turn_hydraulic_mode = "free_small"
+        self._yaw_turn_support_hydraulic_mode = os.getenv(
+            "RANGER_YAW_HYDRAULIC_MODE",
+            str(getattr(self.cfg, "yaw_turn_support_hydraulic_mode_default", "support_hold")),
+        ).strip().lower()
+        if self._yaw_turn_support_hydraulic_mode not in {"support_hold", "locked", "free"}:
+            self._yaw_turn_support_hydraulic_mode = "support_hold"
+        self._support_contact_sign_mode = os.getenv("RANGER_SUPPORT_CONTACT_SIGN", "auto").strip().lower()
+        if self._support_contact_sign_mode not in {"auto", "normal", "inverted"}:
+            self._support_contact_sign_mode = "auto"
+        self._short_goal_visualization_enabled = (
+            self._is_short_goal_task and os.getenv("RANGER_VISUALIZE_GOAL", "0") == "1"
+        )
+        self._short_goal_goal_marker: VisualizationMarkers | None = None
         self._stand_debug_metrics_enabled = os.getenv("RANGER_DEBUG_METRICS", "0") == "1"
         self._command_obs_start = 26
         self._command_obs_end = 34
@@ -129,6 +155,73 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._reset_settle_step_active = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._turn_sanity_semantic_cmd = torch.zeros((self.num_envs, 2), dtype=torch.float32, device=self.device)
         self._turn_sanity_prev_yaw = torch.full((self.num_envs,), float("nan"), dtype=torch.float32, device=self.device)
+        # support_hold leg order is always [lb, lf, rf, rb].
+        self._support_hold_leg_order = ("lb", "lf", "rf", "rb")
+        self._support_hold_action_raw_to_lb_lf_rf_rb = torch.tensor([0, 1, 2, 3], device=self.device, dtype=torch.long)
+        self._support_hold_stroke_to_lb_lf_rf_rb = torch.tensor([0, 1, 2, 3], device=self.device, dtype=torch.long)
+        self._support_hold_contact_to_lb_lf_rf_rb = torch.tensor([0, 1, 2, 3], device=self.device, dtype=torch.long)
+        self._yaw_turn_support_hold_semantic_action = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_hold_raw_action = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_executed_raw_action = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_contact_correction_semantic = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_stroke_nominal_correction_semantic = torch.zeros(
+            (self.num_envs, 4), dtype=torch.float32, device=self.device
+        )
+        self._yaw_turn_support_stroke_range_correction_semantic = torch.zeros(
+            (self.num_envs, 4), dtype=torch.float32, device=self.device
+        )
+        self._yaw_turn_support_diag_correction_semantic = torch.zeros(
+            (self.num_envs, 4), dtype=torch.float32, device=self.device
+        )
+        self._yaw_turn_support_stroke_correction_semantic = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_roll_pitch_correction_semantic = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._yaw_turn_support_non_contact_correction_semantic = torch.zeros(
+            (self.num_envs, 4), dtype=torch.float32, device=self.device
+        )
+        self._yaw_turn_support_contact_cancellation_semantic = torch.zeros(
+            (self.num_envs, 4), dtype=torch.float32, device=self.device
+        )
+        self._yaw_turn_support_total_pre_filter_semantic = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._policy_hydraulic_action_raw = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        self._executed_hydraulic_action_prev = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
+        nominal_stroke_cfg = getattr(getattr(getattr(self.cfg, "rewards", None), "actual_stroke_nominal", None), "params", None)
+        nominal_stroke_value = None
+        if isinstance(nominal_stroke_cfg, dict):
+            nominal_stroke_value = nominal_stroke_cfg.get("stroke_nominal", None)
+        if nominal_stroke_value is None:
+            nominal_stroke_value = 0.5
+            print(
+                "[RangerForwardDebugEnv] Warning: could not read actual_stroke_nominal.stroke_nominal; "
+                "using 0.5 for yaw support-hold nominal stroke.",
+                flush=True,
+            )
+        self._yaw_turn_support_nominal_stroke = float(nominal_stroke_value)
+        if self._support_contact_sign_mode == "inverted":
+            self._support_contact_correction_sign = -1.0
+        else:
+            self._support_contact_correction_sign = 1.0
+        if self._is_yaw_turn_support_task:
+            print(
+                f"[RangerForwardDebugEnv] task={self.cfg.__class__.__name__} "
+                f"final_hydraulic_mode={self._yaw_turn_support_hydraulic_mode} "
+                f"support_hold_override={'enabled' if self._yaw_turn_support_hydraulic_mode == 'support_hold' else 'disabled'} "
+                f"policy_hydraulic_action={'ignored' if self._yaw_turn_support_hydraulic_mode == 'support_hold' else 'executed'} "
+                f"RANGER_SUPPORT_CONTACT_SIGN={self._support_contact_sign_mode} "
+                f"contact_correction_sign={self._support_contact_correction_sign:+.1f} "
+                f"support_hold_leg_order={list(self._support_hold_leg_order)} "
+                f'contact_rule="low_force -> reduce_stroke"',
+                flush=True,
+            )
+        if self._is_yaw_rate_command_task:
+            yaw_cmd_cfg = getattr(getattr(self.cfg.events, "reset_yaw_rate_command", None), "params", {})
+            print(
+                f"[RangerForwardDebugEnv] task={self.cfg.__class__.__name__} "
+                f"final_hydraulic_mode={self._yaw_turn_support_hydraulic_mode} "
+                f"wheel_velocity_limit={float(getattr(self.cfg.actions.wheel_motor_csv, 'velocity_limit', 0.0)):.3f} "
+                f"yaw_command_range=[{float(yaw_cmd_cfg.get('min_abs', 0.08)):.3f}, {float(yaw_cmd_cfg.get('max_abs', 0.15)):.3f}] "
+                f"yaw_command_sign_mode={os.getenv('RANGER_YAW_CMD_SIGN_MODE', str(yaw_cmd_cfg.get('sign_mode', 'balanced'))).strip().lower()}",
+                flush=True,
+            )
         self._stand_reset_yaw = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
         self._stand_recent_reset_happened = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._stand_reset_pattern_code = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
@@ -247,6 +340,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             )
             self._stand_trace_csv_writer.writeheader()
             self._stand_trace_csv_file.flush()
+        if self._short_goal_visualization_enabled:
+            self._initialize_short_goal_visualizer()
         self._turn_sanity_term_names = tuple(getattr(self.termination_manager, "active_terms", ()))
         self._turn_sanity_root_height_initial = torch.full(
             (self.num_envs,), float("nan"), dtype=torch.float32, device=self.device
@@ -852,6 +947,182 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "raw_action_w_rf",
             "raw_action_w_rb",
         )
+        short_goal_metric_names = (
+            "goal_distance_mean",
+            "progress_mean",
+            "success_rate",
+            "base_xy_vel_mean",
+            "base_lin_vel_x",
+            "base_lin_vel_y",
+            "base_yaw_rate",
+            "wheel_target_abs_mean",
+            "wheel_joint_vel_abs_mean",
+            "raw_wheel_action_abs_mean",
+            "policy_hydraulic_action_abs_mean",
+            "hydraulic_action_abs_mean",
+            "hydraulic_action_rate_abs_mean",
+            "support_hold_action_abs_mean",
+            "support_hold_action_range",
+            "support_hold_mode_debug",
+            "executed_hydraulic_action_abs_mean",
+            "support_hold_contact_correction_abs_mean",
+            "support_hold_contact_correction_max_abs",
+            "support_hold_stroke_correction_abs_mean",
+            "support_hold_roll_pitch_correction_abs_mean",
+            "support_hold_total_pre_filter_abs_mean",
+            "support_hold_total_post_filter_abs_mean",
+            "support_hold_stroke_lb_mean",
+            "support_hold_stroke_lf_mean",
+            "support_hold_stroke_rf_mean",
+            "support_hold_stroke_rb_mean",
+            "support_hold_stroke_nominal_correction_lb_mean",
+            "support_hold_stroke_nominal_correction_lf_mean",
+            "support_hold_stroke_nominal_correction_rf_mean",
+            "support_hold_stroke_nominal_correction_rb_mean",
+            "support_hold_stroke_range_correction_lb_mean",
+            "support_hold_stroke_range_correction_lf_mean",
+            "support_hold_stroke_range_correction_rf_mean",
+            "support_hold_stroke_range_correction_rb_mean",
+            "support_hold_diag_correction_lb_mean",
+            "support_hold_diag_correction_lf_mean",
+            "support_hold_diag_correction_rf_mean",
+            "support_hold_diag_correction_rb_mean",
+            "support_hold_contact_correction_lb_mean",
+            "support_hold_contact_correction_lf_mean",
+            "support_hold_contact_correction_rf_mean",
+            "support_hold_contact_correction_rb_mean",
+            "support_hold_roll_pitch_correction_lb_mean",
+            "support_hold_roll_pitch_correction_lf_mean",
+            "support_hold_roll_pitch_correction_rf_mean",
+            "support_hold_roll_pitch_correction_rb_mean",
+            "support_hold_non_contact_correction_lb_mean",
+            "support_hold_non_contact_correction_lf_mean",
+            "support_hold_non_contact_correction_rf_mean",
+            "support_hold_non_contact_correction_rb_mean",
+            "support_hold_contact_cancelled_lf_mean",
+            "support_hold_contact_cancelled_rb_mean",
+            "support_hold_contact_cancelled_abs_mean",
+            "executed_hydraulic_action_lb_mean",
+            "executed_hydraulic_action_lf_mean",
+            "executed_hydraulic_action_rf_mean",
+            "executed_hydraulic_action_rb_mean",
+            "support_hold_total_pre_filter_lb_mean",
+            "support_hold_total_pre_filter_lf_mean",
+            "support_hold_total_pre_filter_rf_mean",
+            "support_hold_total_pre_filter_rb_mean",
+            "wrong_direction_yaw_mean",
+            "forward_velocity_during_turn",
+            "stroke_range_mean",
+            "stroke_diagonal_balance",
+            "contact_force_imbalance",
+            "min_wheel_contact_force_mean",
+            "zero_contact_ratio",
+            "wheel_contact_force_lb_mean",
+            "wheel_contact_force_lf_mean",
+            "wheel_contact_force_rf_mean",
+            "wheel_contact_force_rb_mean",
+            "wheel_common_mode_target_abs_mean",
+            "wheel_differential_target_mean",
+            "wheel_differential_target_abs_mean",
+            "hydraulic_mode_debug",
+            "goal_x_body_mean",
+            "goal_y_body_mean",
+            "goal_angle_body_mean",
+            "goal_angle_body_abs_mean",
+            "goal_left_rate",
+            "goal_right_rate",
+            "goal_front_rate",
+            "heading_error_abs_mean",
+            "heading_error_reduction_mean",
+            "turn_toward_goal_mean",
+            "signed_yaw_rate_tracking_mean",
+            "too_small_yaw_rate_when_error_large_mean",
+            "desired_yaw_rate_mean",
+            "desired_yaw_rate_abs_mean",
+            "desired_yaw_sign_mean",
+            "yaw_rate_error_mean",
+            "yaw_rate_error_abs_mean",
+            "yaw_active_rate",
+            "yaw_correct_direction_rate",
+            "yaw_too_small_rate",
+            "left_yaw_correct_direction_rate",
+            "right_yaw_correct_direction_rate",
+            "left_yaw_too_small_rate",
+            "right_yaw_too_small_rate",
+            "left_signed_yaw_rate_mean",
+            "right_signed_yaw_rate_mean",
+            "wheel_velocity_target_mean",
+            "semantic_wheel_velocity_target_mean",
+            "wheel_joint_vel_mean",
+            "semantic_wheel_joint_vel_mean",
+            "wheel_left_target_mean",
+            "wheel_right_target_mean",
+            "left_turn_yaw_rate_mean",
+            "right_turn_yaw_rate_mean",
+            "left_goal_success_rate",
+            "right_goal_success_rate",
+            "bad_orientation_rate",
+        )
+        yaw_rate_command_metric_names = (
+            "yaw_cmd_mean",
+            "yaw_cmd_abs_mean",
+            "yaw_cmd_positive_rate",
+            "yaw_cmd_negative_rate",
+            "yaw_cmd_sign_mode_debug",
+            "yaw_rate_command_tracking_mean",
+            "yaw_cmd_error_abs_mean",
+            "yaw_cmd_correct_direction_rate",
+            "yaw_cmd_too_small_rate",
+            "positive_cmd_yaw_rate_mean",
+            "negative_cmd_yaw_rate_mean",
+            "positive_cmd_correct_direction_rate",
+            "negative_cmd_correct_direction_rate",
+            "base_yaw_rate",
+            "base_lin_vel_x",
+            "base_lin_vel_y",
+            "base_xy_vel_mean",
+            "wheel_target_abs_mean",
+            "wheel_joint_vel_abs_mean",
+            "raw_wheel_action_abs_mean",
+            "semantic_forward_mode_target_abs_mean",
+            "semantic_turn_mode_target_abs_mean",
+            "wheel_forward_mode_penalty_mean",
+            "wheel_turn_mode_soft_limit_mean",
+            "wheel_target_abs_soft_limit_mean",
+            "wheel_joint_vel_abs_soft_limit_mean",
+            "wasted_turn_when_yaw_small_mean",
+            "wheel_velocity_limit_debug",
+            "wheel_left_target_mean",
+            "wheel_right_target_mean",
+            "raw_wheel_target_lb_mean",
+            "raw_wheel_target_lf_mean",
+            "raw_wheel_target_rf_mean",
+            "raw_wheel_target_rb_mean",
+            "raw_wheel_joint_vel_lb_mean",
+            "raw_wheel_joint_vel_lf_mean",
+            "raw_wheel_joint_vel_rf_mean",
+            "raw_wheel_joint_vel_rb_mean",
+            "semantic_wheel_target_lb_mean",
+            "semantic_wheel_target_lf_mean",
+            "semantic_wheel_target_rf_mean",
+            "semantic_wheel_target_rb_mean",
+            "semantic_wheel_joint_vel_lb_mean",
+            "semantic_wheel_joint_vel_lf_mean",
+            "semantic_wheel_joint_vel_rf_mean",
+            "semantic_wheel_joint_vel_rb_mean",
+            "hydraulic_mode_debug",
+            "support_hold_mode_debug",
+            "hydraulic_free_mode_gate_mean",
+            "policy_hydraulic_action_abs_mean",
+            "hydraulic_action_abs_mean",
+            "hydraulic_action_rate_abs_mean",
+            "stroke_range_mean",
+            "stroke_diagonal_balance",
+            "zero_contact_ratio",
+            "contact_force_imbalance",
+            "min_wheel_contact_force_mean",
+            "bad_orientation_rate",
+        )
         if self._is_speed_command_task:
             self._forward_debug_metric_names = speed_command_metric_names
             self._debug_log_prefix = "forward_debug"
@@ -861,6 +1132,12 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         elif self._is_stand_training_task:
             self._forward_debug_metric_names = stand_metric_names
             self._debug_log_prefix = "stand_debug"
+        elif self._is_yaw_rate_command_task:
+            self._forward_debug_metric_names = yaw_rate_command_metric_names
+            self._debug_log_prefix = "yaw_rate_command"
+        elif self._is_short_goal_task:
+            self._forward_debug_metric_names = short_goal_metric_names
+            self._debug_log_prefix = "short_goal"
         elif self._is_goal_heading_task:
             self._forward_debug_metric_names = goal_heading_metric_names
             self._debug_log_prefix = "goal_heading_debug"
@@ -2081,6 +2358,494 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
                 values[f"turn_sanity/termination_term/{term_name}"] = term_value
             return values
 
+        if self._is_yaw_rate_command_task:
+            cmd_yaw_rate = mdp.yaw_rate_command(self)
+            cmd_yaw_abs = torch.abs(cmd_yaw_rate)
+            cmd_sign = torch.sign(cmd_yaw_rate)
+            active_mask = cmd_yaw_abs > 0.02
+            too_small_active_mask = cmd_yaw_abs > 0.05
+            signed_yaw = cmd_sign * root_ang_vel_b_z
+            yaw_cmd_error_abs = torch.abs(root_ang_vel_b_z - cmd_yaw_rate)
+            yaw_cmd_correct_direction = ((signed_yaw > 0.0) & active_mask).to(torch.float32)
+            min_yaw = torch.clamp(0.5 * cmd_yaw_abs, min=0.04, max=0.08)
+            yaw_cmd_too_small = (
+                torch.clamp(torch.relu(min_yaw - signed_yaw) / torch.clamp(min_yaw, min=1.0e-6), min=0.0, max=2.0)
+                * too_small_active_mask.to(torch.float32)
+            )
+            base_lin_vel_y = robot.data.root_lin_vel_b[:, 1]
+            base_xy_vel_mean = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+            wheel_target_abs_mean = torch.mean(torch.abs(wheel_velocity_target), dim=1)
+            wheel_joint_vel_abs_mean = torch.mean(torch.abs(wheel_joint_vel), dim=1)
+            raw_wheel_action_abs_mean = torch.mean(torch.abs(wheel_action_term.raw_actions), dim=1)
+            semantic_left_target = semantic_wheel_velocity_target[:, :2].mean(dim=1)
+            semantic_right_target = semantic_wheel_velocity_target[:, 2:].mean(dim=1)
+            semantic_forward_mode_target = 0.5 * (semantic_left_target + semantic_right_target)
+            semantic_turn_mode_target = 0.5 * (semantic_right_target - semantic_left_target)
+            wheel_velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0)
+            wheel_forward_mode_penalty_mean = torch.abs(semantic_forward_mode_target) / wheel_velocity_limit
+            wheel_turn_mode_soft_limit_mean = torch.relu(torch.abs(semantic_turn_mode_target) - 8.0) / wheel_velocity_limit
+            wheel_target_abs_soft_limit_mean = torch.relu(wheel_target_abs_mean - 8.0) / wheel_velocity_limit
+            wheel_joint_vel_abs_soft_limit_mean = torch.relu(wheel_joint_vel_abs_mean - 10.0) / wheel_velocity_limit
+            yaw_deficit = torch.clamp(
+                torch.relu(min_yaw - signed_yaw) / torch.clamp(min_yaw, min=1.0e-6),
+                min=0.0,
+                max=2.0,
+            )
+            wasted_turn_when_yaw_small_mean = (
+                torch.abs(semantic_turn_mode_target) / wheel_velocity_limit
+            ) * yaw_deficit * too_small_active_mask.to(torch.float32)
+            wheel_left_target_mean = wheel_velocity_target[:, :2].mean(dim=1)
+            wheel_right_target_mean = wheel_velocity_target[:, 2:].mean(dim=1)
+            policy_hydraulic_action_abs_mean = torch.mean(torch.abs(self._policy_hydraulic_action_raw), dim=1)
+            hydraulic_action_abs_mean = torch.mean(torch.abs(self._yaw_turn_support_executed_raw_action), dim=1)
+            hydraulic_action_rate_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_executed_raw_action - self._executed_hydraulic_action_prev), dim=1
+            )
+            stroke_actual_lb_lf_rf_rb = leg_action_term.stroke_actual[:, self._support_hold_stroke_to_lb_lf_rf_rb]
+            stroke_range_mean = stroke_actual_lb_lf_rf_rb.max(dim=1).values - stroke_actual_lb_lf_rf_rb.min(dim=1).values
+            stroke_diagonal_balance = torch.abs(
+                (stroke_actual_lb_lf_rf_rb[:, 0] + stroke_actual_lb_lf_rf_rb[:, 2])
+                - (stroke_actual_lb_lf_rf_rb[:, 1] + stroke_actual_lb_lf_rf_rb[:, 3])
+            )
+            contact_force_lb_lf_rf_rb, contact_force_total_raw, _, _ = _wheel_contact_force_ratio_lf_lr_rf_rr(
+                self,
+                SceneEntityCfg("wheel_contact_forces", body_names=["w_lb", "w_lf", "w_rf", "w_rb"]),
+            )
+            contact_force_imbalance = (
+                contact_force_lb_lf_rf_rb.max(dim=1).values - contact_force_lb_lf_rf_rb.min(dim=1).values
+            ) / torch.clamp(contact_force_total_raw, min=1.0e-6)
+            min_wheel_contact_force_mean = contact_force_lb_lf_rf_rb.min(dim=1).values
+            zero_contact_ratio = (contact_force_lb_lf_rf_rb < 1.0).to(torch.float32).mean(dim=1)
+            bad_orientation_rate = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            for term_idx, term_name in enumerate(getattr(self.termination_manager, "active_terms", ())):
+                if term_name == "bad_orientation":
+                    bad_orientation_rate = self.termination_manager._term_dones[:, term_idx].to(torch.float32)
+                    break
+
+            def masked_mean_or_zero(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                mask_f = mask.to(value.dtype)
+                denom = torch.clamp(mask_f.sum(), min=1.0)
+                scalar = torch.sum(value * mask_f) / denom
+                return torch.full_like(value, scalar)
+
+            tracking_term_idx = None
+            wrong_direction_term_idx = None
+            too_small_term_idx = None
+            for term_idx, term_name in enumerate(self.reward_manager.active_terms):
+                if term_name == "signed_yaw_rate_tracking":
+                    tracking_term_idx = term_idx
+                elif term_name == "wrong_direction_yaw":
+                    wrong_direction_term_idx = term_idx
+                elif term_name == "too_small_yaw_rate_when_error_large":
+                    too_small_term_idx = term_idx
+            if tracking_term_idx is not None:
+                tracking_weight = float(self.cfg.rewards.signed_yaw_rate_tracking.weight)
+                yaw_rate_command_tracking_mean = self.reward_manager._step_reward[:, tracking_term_idx] / max(
+                    abs(tracking_weight), 1.0e-6
+                )
+            else:
+                yaw_rate_command_tracking_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            hydraulic_free_mode_gate_mean = torch.full(
+                (self.num_envs,),
+                1.0 if self._yaw_turn_support_hydraulic_mode == "free" else 0.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            hydraulic_mode_debug = torch.full(
+                (self.num_envs,),
+                0.0 if self._yaw_turn_support_hydraulic_mode == "locked" else 1.0 if self._yaw_turn_support_hydraulic_mode == "support_hold" else 2.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            support_hold_mode_debug = hydraulic_mode_debug
+            yaw_cmd_sign_mode = os.getenv("RANGER_YAW_CMD_SIGN_MODE", "balanced").strip().lower()
+            yaw_cmd_sign_mode_debug = torch.full(
+                (self.num_envs,),
+                0.0 if yaw_cmd_sign_mode == "balanced" else 1.0 if yaw_cmd_sign_mode == "positive" else 2.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            positive_mask = cmd_yaw_rate > 0.0
+            negative_mask = cmd_yaw_rate < 0.0
+            positive_cmd_yaw_rate_mean = masked_mean_or_zero(root_ang_vel_b_z, positive_mask)
+            negative_cmd_yaw_rate_mean = masked_mean_or_zero(root_ang_vel_b_z, negative_mask)
+            positive_cmd_correct_direction_rate = masked_mean_or_zero(yaw_cmd_correct_direction, positive_mask)
+            negative_cmd_correct_direction_rate = masked_mean_or_zero(yaw_cmd_correct_direction, negative_mask)
+            return {
+                "yaw_cmd_mean": cmd_yaw_rate,
+                "yaw_cmd_abs_mean": cmd_yaw_abs,
+                "yaw_cmd_positive_rate": positive_mask.to(torch.float32),
+                "yaw_cmd_negative_rate": negative_mask.to(torch.float32),
+                "yaw_cmd_sign_mode_debug": yaw_cmd_sign_mode_debug,
+                "yaw_rate_command_tracking_mean": yaw_rate_command_tracking_mean,
+                "yaw_cmd_error_abs_mean": yaw_cmd_error_abs,
+                "yaw_cmd_correct_direction_rate": yaw_cmd_correct_direction,
+                "yaw_cmd_too_small_rate": yaw_cmd_too_small,
+                "positive_cmd_yaw_rate_mean": positive_cmd_yaw_rate_mean,
+                "negative_cmd_yaw_rate_mean": negative_cmd_yaw_rate_mean,
+                "positive_cmd_correct_direction_rate": positive_cmd_correct_direction_rate,
+                "negative_cmd_correct_direction_rate": negative_cmd_correct_direction_rate,
+                "base_yaw_rate": root_ang_vel_b_z,
+                "base_lin_vel_x": base_lin_vel_x,
+                "base_lin_vel_y": base_lin_vel_y,
+                "base_xy_vel_mean": base_xy_vel_mean,
+                "wheel_target_abs_mean": wheel_target_abs_mean,
+                "wheel_joint_vel_abs_mean": wheel_joint_vel_abs_mean,
+                "raw_wheel_action_abs_mean": raw_wheel_action_abs_mean,
+                "semantic_forward_mode_target_abs_mean": torch.abs(semantic_forward_mode_target),
+                "semantic_turn_mode_target_abs_mean": torch.abs(semantic_turn_mode_target),
+                "wheel_forward_mode_penalty_mean": wheel_forward_mode_penalty_mean,
+                "wheel_turn_mode_soft_limit_mean": wheel_turn_mode_soft_limit_mean,
+                "wheel_target_abs_soft_limit_mean": wheel_target_abs_soft_limit_mean,
+                "wheel_joint_vel_abs_soft_limit_mean": wheel_joint_vel_abs_soft_limit_mean,
+                "wasted_turn_when_yaw_small_mean": wasted_turn_when_yaw_small_mean,
+                "wheel_velocity_limit_debug": torch.full(
+                    (self.num_envs,), wheel_velocity_limit, dtype=torch.float32, device=self.device
+                ),
+                "wheel_left_target_mean": wheel_left_target_mean,
+                "wheel_right_target_mean": wheel_right_target_mean,
+                "raw_wheel_target_lb_mean": wheel_velocity_target[:, 0],
+                "raw_wheel_target_lf_mean": wheel_velocity_target[:, 1],
+                "raw_wheel_target_rf_mean": wheel_velocity_target[:, 2],
+                "raw_wheel_target_rb_mean": wheel_velocity_target[:, 3],
+                "raw_wheel_joint_vel_lb_mean": wheel_joint_vel[:, 0],
+                "raw_wheel_joint_vel_lf_mean": wheel_joint_vel[:, 1],
+                "raw_wheel_joint_vel_rf_mean": wheel_joint_vel[:, 2],
+                "raw_wheel_joint_vel_rb_mean": wheel_joint_vel[:, 3],
+                "semantic_wheel_target_lb_mean": semantic_wheel_velocity_target[:, 0],
+                "semantic_wheel_target_lf_mean": semantic_wheel_velocity_target[:, 1],
+                "semantic_wheel_target_rf_mean": semantic_wheel_velocity_target[:, 2],
+                "semantic_wheel_target_rb_mean": semantic_wheel_velocity_target[:, 3],
+                "semantic_wheel_joint_vel_lb_mean": semantic_wheel_joint_vel[:, 0],
+                "semantic_wheel_joint_vel_lf_mean": semantic_wheel_joint_vel[:, 1],
+                "semantic_wheel_joint_vel_rf_mean": semantic_wheel_joint_vel[:, 2],
+                "semantic_wheel_joint_vel_rb_mean": semantic_wheel_joint_vel[:, 3],
+                "hydraulic_mode_debug": hydraulic_mode_debug,
+                "support_hold_mode_debug": support_hold_mode_debug,
+                "hydraulic_free_mode_gate_mean": hydraulic_free_mode_gate_mean,
+                "policy_hydraulic_action_abs_mean": policy_hydraulic_action_abs_mean,
+                "hydraulic_action_abs_mean": hydraulic_action_abs_mean,
+                "hydraulic_action_rate_abs_mean": hydraulic_action_rate_abs_mean,
+                "stroke_range_mean": stroke_range_mean,
+                "stroke_diagonal_balance": stroke_diagonal_balance,
+                "zero_contact_ratio": zero_contact_ratio,
+                "contact_force_imbalance": contact_force_imbalance,
+                "min_wheel_contact_force_mean": min_wheel_contact_force_mean,
+                "bad_orientation_rate": bad_orientation_rate,
+            }
+
+        if self._is_short_goal_task:
+            target_vec_b, goal_distance, heading_error = mdp.short_goal_target_body(self)
+            goal_angle_body = torch.atan2(target_vec_b[:, 1], target_vec_b[:, 0])
+            base_lin_vel_y = robot.data.root_lin_vel_b[:, 1]
+            base_xy_vel_mean = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+            wheel_target_abs_mean = torch.mean(torch.abs(wheel_velocity_target), dim=1)
+            wheel_joint_vel_abs_mean = torch.mean(torch.abs(wheel_joint_vel), dim=1)
+            raw_wheel_action_abs_mean = torch.mean(torch.abs(wheel_action_term.raw_actions), dim=1)
+            policy_hydraulic_action_abs_mean = torch.mean(torch.abs(self._policy_hydraulic_action_raw), dim=1)
+            hydraulic_action_abs_mean = torch.mean(torch.abs(self._yaw_turn_support_executed_raw_action), dim=1)
+            hydraulic_action_rate_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_executed_raw_action - self._executed_hydraulic_action_prev), dim=1
+            )
+            stroke_actual_lb_lf_rf_rb = leg_action_term.stroke_actual[:, self._support_hold_stroke_to_lb_lf_rf_rb]
+            stroke_range_mean = stroke_actual_lb_lf_rf_rb.max(dim=1).values - stroke_actual_lb_lf_rf_rb.min(dim=1).values
+            stroke_diagonal_balance = torch.abs(
+                (stroke_actual_lb_lf_rf_rb[:, 0] + stroke_actual_lb_lf_rf_rb[:, 2])
+                - (stroke_actual_lb_lf_rf_rb[:, 1] + stroke_actual_lb_lf_rf_rb[:, 3])
+            )
+            contact_force_lb_lf_rf_rb, contact_force_total_raw, _, _ = _wheel_contact_force_ratio_lf_lr_rf_rr(
+                self,
+                SceneEntityCfg("wheel_contact_forces", body_names=["w_lb", "w_lf", "w_rf", "w_rb"]),
+            )
+            raw_contact_sensor = self.scene.sensors["wheel_contact_forces"]
+            raw_contact_body_ids, _ = raw_contact_sensor.find_bodies(["w_lb", "w_lf", "w_rf", "w_rb"], preserve_order=True)
+            raw_contact_body_ids = torch.as_tensor(raw_contact_body_ids, device=self.device, dtype=torch.long)
+            raw_contact_force = torch.max(
+                torch.norm(raw_contact_sensor.data.net_forces_w_history[:, :, raw_contact_body_ids, :], dim=-1),
+                dim=1,
+            )[0]
+            contact_force_imbalance = (
+                contact_force_lb_lf_rf_rb.max(dim=1).values - contact_force_lb_lf_rf_rb.min(dim=1).values
+            ) / torch.clamp(contact_force_total_raw, min=1.0e-6)
+            min_wheel_contact_force_mean = contact_force_lb_lf_rf_rb.min(dim=1).values
+            zero_contact_ratio = (contact_force_lb_lf_rf_rb < 1.0).to(torch.float32).mean(dim=1)
+            if self._is_yaw_turn_support_task:
+                hydraulic_mode_debug = torch.full(
+                    (self.num_envs,),
+                    0.0 if self._yaw_turn_support_hydraulic_mode == "locked" else 1.0 if self._yaw_turn_support_hydraulic_mode == "support_hold" else 2.0,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            else:
+                hydraulic_mode_debug = torch.full(
+                    (self.num_envs,),
+                    0.0 if self._short_goal_turn_hydraulic_mode == "locked" else 1.0 if self._short_goal_turn_hydraulic_mode == "free_small" else 2.0,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+            support_hold_mode_debug = torch.full(
+                (self.num_envs,),
+                0.0 if self._yaw_turn_support_hydraulic_mode == "locked" else 1.0 if self._yaw_turn_support_hydraulic_mode == "support_hold" else 2.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            support_hold_action_abs_mean = torch.mean(torch.abs(self._yaw_turn_support_hold_raw_action), dim=1)
+            support_hold_action_range = (
+                self._yaw_turn_support_hold_raw_action.max(dim=1).values - self._yaw_turn_support_hold_raw_action.min(dim=1).values
+            )
+            executed_hydraulic_action_abs_mean = torch.mean(torch.abs(self._yaw_turn_support_executed_raw_action), dim=1)
+            support_hold_contact_correction_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_contact_correction_semantic), dim=1
+            )
+            support_hold_contact_correction_max_abs = torch.max(
+                torch.abs(self._yaw_turn_support_contact_correction_semantic), dim=1
+            ).values
+            support_hold_stroke_correction_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_stroke_correction_semantic), dim=1
+            )
+            support_hold_roll_pitch_correction_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_roll_pitch_correction_semantic), dim=1
+            )
+            support_hold_total_pre_filter_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_total_pre_filter_semantic), dim=1
+            )
+            support_hold_total_post_filter_abs_mean = torch.mean(
+                torch.abs(self._yaw_turn_support_hold_semantic_action), dim=1
+            )
+            executed_hydraulic_action_lb_lf_rf_rb = self._yaw_turn_support_executed_raw_action[
+                :, self._support_hold_action_raw_to_lb_lf_rf_rb
+            ]
+            goal_reached_term_idx = None
+            progress_term_idx = None
+            heading_error_reduction_term_idx = None
+            turn_toward_goal_term_idx = None
+            wrong_direction_yaw_term_idx = None
+            signed_yaw_rate_tracking_term_idx = None
+            too_small_yaw_rate_when_error_large_term_idx = None
+            for term_idx, term_name in enumerate(self.reward_manager.active_terms):
+                if term_name == "progress_to_goal":
+                    progress_term_idx = term_idx
+                elif term_name == "goal_success":
+                    goal_reached_term_idx = term_idx
+                elif term_name == "heading_error_reduction":
+                    heading_error_reduction_term_idx = term_idx
+                elif term_name == "turn_toward_goal":
+                    turn_toward_goal_term_idx = term_idx
+                elif term_name == "wrong_direction_yaw":
+                    wrong_direction_yaw_term_idx = term_idx
+                elif term_name == "signed_yaw_rate_tracking":
+                    signed_yaw_rate_tracking_term_idx = term_idx
+                elif term_name == "too_small_yaw_rate_when_error_large":
+                    too_small_yaw_rate_when_error_large_term_idx = term_idx
+            if progress_term_idx is not None:
+                progress_weight = float(self.cfg.rewards.progress_to_goal.weight)
+                progress_mean = self.reward_manager._step_reward[:, progress_term_idx] / max(abs(progress_weight), 1.0e-6)
+            else:
+                progress_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if goal_reached_term_idx is not None:
+                success_weight = float(self.cfg.rewards.goal_success.weight)
+                success_rate = self.reward_manager._step_reward[:, goal_reached_term_idx] / max(abs(success_weight), 1.0e-6)
+            else:
+                success_rate = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if heading_error_reduction_term_idx is not None:
+                heading_error_reduction_weight = float(self.cfg.rewards.heading_error_reduction.weight)
+                heading_error_reduction_mean = self.reward_manager._step_reward[:, heading_error_reduction_term_idx] / max(
+                    abs(heading_error_reduction_weight), 1.0e-6
+                )
+            else:
+                heading_error_reduction_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if turn_toward_goal_term_idx is not None:
+                turn_toward_goal_weight = float(self.cfg.rewards.turn_toward_goal.weight)
+                turn_toward_goal_mean = self.reward_manager._step_reward[:, turn_toward_goal_term_idx] / max(
+                    abs(turn_toward_goal_weight), 1.0e-6
+                )
+            else:
+                turn_toward_goal_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if wrong_direction_yaw_term_idx is not None:
+                wrong_direction_yaw_weight = float(self.cfg.rewards.wrong_direction_yaw.weight)
+                wrong_direction_yaw_mean = self.reward_manager._step_reward[:, wrong_direction_yaw_term_idx] / max(
+                    abs(wrong_direction_yaw_weight), 1.0e-6
+                )
+            else:
+                wrong_direction_yaw_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if signed_yaw_rate_tracking_term_idx is not None:
+                signed_yaw_rate_tracking_weight = float(self.cfg.rewards.signed_yaw_rate_tracking.weight)
+                signed_yaw_rate_tracking_mean = self.reward_manager._step_reward[
+                    :, signed_yaw_rate_tracking_term_idx
+                ] / max(abs(signed_yaw_rate_tracking_weight), 1.0e-6)
+            else:
+                signed_yaw_rate_tracking_mean = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            if too_small_yaw_rate_when_error_large_term_idx is not None:
+                too_small_yaw_rate_when_error_large_weight = float(
+                    self.cfg.rewards.too_small_yaw_rate_when_error_large.weight
+                )
+                too_small_yaw_rate_when_error_large_mean = self.reward_manager._step_reward[
+                    :, too_small_yaw_rate_when_error_large_term_idx
+                ] / max(abs(too_small_yaw_rate_when_error_large_weight), 1.0e-6)
+            else:
+                too_small_yaw_rate_when_error_large_mean = torch.zeros(
+                    (self.num_envs,), dtype=torch.float32, device=self.device
+                )
+            desired_yaw_rate = torch.where(
+                torch.abs(heading_error) > 0.10,
+                torch.sign(target_vec_b[:, 1]) * 0.35,
+                torch.zeros_like(root_ang_vel_b_z),
+            )
+            desired_yaw_sign = torch.sign(target_vec_b[:, 1])
+            yaw_rate_error = root_ang_vel_b_z - desired_yaw_rate
+            yaw_active_mask = (torch.abs(heading_error) > 0.10).to(torch.float32)
+            yaw_correct_direction_rate = (
+                ((desired_yaw_sign * root_ang_vel_b_z) > 0.0).to(torch.float32) * yaw_active_mask
+            )
+            yaw_too_small_rate = (
+                (torch.abs(root_ang_vel_b_z) < 0.12).to(torch.float32) * (torch.abs(heading_error) > 0.25).to(torch.float32)
+            )
+            wheel_velocity_target_mean = wheel_velocity_target.mean(dim=1)
+            wheel_joint_vel_mean = wheel_joint_vel.mean(dim=1)
+            semantic_wheel_velocity_target_mean = semantic_wheel_velocity_target.mean(dim=1)
+            semantic_wheel_joint_vel_mean = semantic_wheel_joint_vel.mean(dim=1)
+            wheel_left_target_mean = wheel_velocity_target[:, 0:2].mean(dim=1)
+            wheel_right_target_mean = wheel_velocity_target[:, 2:4].mean(dim=1)
+            wheel_common_mode_target = 0.5 * (wheel_left_target_mean + wheel_right_target_mean)
+            wheel_differential_target = wheel_right_target_mean - wheel_left_target_mean
+            goal_left_mask = goal_angle_body > 0.0
+            goal_right_mask = goal_angle_body < 0.0
+            signed_yaw = desired_yaw_sign * root_ang_vel_b_z
+            left_yaw_correct_direction_rate = yaw_correct_direction_rate * goal_left_mask.to(torch.float32)
+            right_yaw_correct_direction_rate = yaw_correct_direction_rate * goal_right_mask.to(torch.float32)
+            left_yaw_too_small_rate = yaw_too_small_rate * goal_left_mask.to(torch.float32)
+            right_yaw_too_small_rate = yaw_too_small_rate * goal_right_mask.to(torch.float32)
+            bad_orientation_rate = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+            for term_idx, term_name in enumerate(getattr(self.termination_manager, "active_terms", ())):
+                if term_name == "bad_orientation":
+                    bad_orientation_rate = self.termination_manager._term_dones[:, term_idx].to(torch.float32)
+                    break
+
+            def masked_mean_or_zero(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+                mask_f = mask.to(value.dtype)
+                denom = torch.clamp(mask_f.sum(), min=1.0)
+                scalar = torch.sum(value * mask_f) / denom
+                return torch.full_like(value, scalar)
+
+            return {
+                "goal_distance_mean": goal_distance,
+                "progress_mean": progress_mean,
+                "success_rate": success_rate,
+                "base_xy_vel_mean": base_xy_vel_mean,
+                "base_lin_vel_x": base_lin_vel_x,
+                "base_lin_vel_y": base_lin_vel_y,
+                "base_yaw_rate": root_ang_vel_b_z,
+                "wheel_target_abs_mean": wheel_target_abs_mean,
+                "wheel_joint_vel_abs_mean": wheel_joint_vel_abs_mean,
+                "raw_wheel_action_abs_mean": raw_wheel_action_abs_mean,
+                "policy_hydraulic_action_abs_mean": policy_hydraulic_action_abs_mean,
+                "hydraulic_action_abs_mean": hydraulic_action_abs_mean,
+                "hydraulic_action_rate_abs_mean": hydraulic_action_rate_abs_mean,
+                "support_hold_action_abs_mean": support_hold_action_abs_mean,
+                "support_hold_action_range": support_hold_action_range,
+                "support_hold_mode_debug": support_hold_mode_debug,
+                "executed_hydraulic_action_abs_mean": executed_hydraulic_action_abs_mean,
+                "support_hold_contact_correction_abs_mean": support_hold_contact_correction_abs_mean,
+                "support_hold_contact_correction_max_abs": support_hold_contact_correction_max_abs,
+                "support_hold_stroke_correction_abs_mean": support_hold_stroke_correction_abs_mean,
+                "support_hold_roll_pitch_correction_abs_mean": support_hold_roll_pitch_correction_abs_mean,
+                "support_hold_total_pre_filter_abs_mean": support_hold_total_pre_filter_abs_mean,
+                "support_hold_total_post_filter_abs_mean": support_hold_total_post_filter_abs_mean,
+                "support_hold_stroke_lb_mean": stroke_actual_lb_lf_rf_rb[:, 0],
+                "support_hold_stroke_lf_mean": stroke_actual_lb_lf_rf_rb[:, 1],
+                "support_hold_stroke_rf_mean": stroke_actual_lb_lf_rf_rb[:, 2],
+                "support_hold_stroke_rb_mean": stroke_actual_lb_lf_rf_rb[:, 3],
+                "support_hold_stroke_nominal_correction_lb_mean": self._yaw_turn_support_stroke_nominal_correction_semantic[:, 0],
+                "support_hold_stroke_nominal_correction_lf_mean": self._yaw_turn_support_stroke_nominal_correction_semantic[:, 1],
+                "support_hold_stroke_nominal_correction_rf_mean": self._yaw_turn_support_stroke_nominal_correction_semantic[:, 2],
+                "support_hold_stroke_nominal_correction_rb_mean": self._yaw_turn_support_stroke_nominal_correction_semantic[:, 3],
+                "support_hold_stroke_range_correction_lb_mean": self._yaw_turn_support_stroke_range_correction_semantic[:, 0],
+                "support_hold_stroke_range_correction_lf_mean": self._yaw_turn_support_stroke_range_correction_semantic[:, 1],
+                "support_hold_stroke_range_correction_rf_mean": self._yaw_turn_support_stroke_range_correction_semantic[:, 2],
+                "support_hold_stroke_range_correction_rb_mean": self._yaw_turn_support_stroke_range_correction_semantic[:, 3],
+                "support_hold_diag_correction_lb_mean": self._yaw_turn_support_diag_correction_semantic[:, 0],
+                "support_hold_diag_correction_lf_mean": self._yaw_turn_support_diag_correction_semantic[:, 1],
+                "support_hold_diag_correction_rf_mean": self._yaw_turn_support_diag_correction_semantic[:, 2],
+                "support_hold_diag_correction_rb_mean": self._yaw_turn_support_diag_correction_semantic[:, 3],
+                "support_hold_contact_correction_lb_mean": self._yaw_turn_support_contact_correction_semantic[:, 0],
+                "support_hold_contact_correction_lf_mean": self._yaw_turn_support_contact_correction_semantic[:, 1],
+                "support_hold_contact_correction_rf_mean": self._yaw_turn_support_contact_correction_semantic[:, 2],
+                "support_hold_contact_correction_rb_mean": self._yaw_turn_support_contact_correction_semantic[:, 3],
+                "support_hold_roll_pitch_correction_lb_mean": self._yaw_turn_support_roll_pitch_correction_semantic[:, 0],
+                "support_hold_roll_pitch_correction_lf_mean": self._yaw_turn_support_roll_pitch_correction_semantic[:, 1],
+                "support_hold_roll_pitch_correction_rf_mean": self._yaw_turn_support_roll_pitch_correction_semantic[:, 2],
+                "support_hold_roll_pitch_correction_rb_mean": self._yaw_turn_support_roll_pitch_correction_semantic[:, 3],
+                "support_hold_non_contact_correction_lb_mean": self._yaw_turn_support_non_contact_correction_semantic[:, 0],
+                "support_hold_non_contact_correction_lf_mean": self._yaw_turn_support_non_contact_correction_semantic[:, 1],
+                "support_hold_non_contact_correction_rf_mean": self._yaw_turn_support_non_contact_correction_semantic[:, 2],
+                "support_hold_non_contact_correction_rb_mean": self._yaw_turn_support_non_contact_correction_semantic[:, 3],
+                "support_hold_contact_cancelled_lf_mean": self._yaw_turn_support_contact_cancellation_semantic[:, 1],
+                "support_hold_contact_cancelled_rb_mean": self._yaw_turn_support_contact_cancellation_semantic[:, 3],
+                "support_hold_contact_cancelled_abs_mean": torch.mean(
+                    torch.abs(self._yaw_turn_support_contact_cancellation_semantic), dim=1
+                ),
+                "executed_hydraulic_action_lb_mean": executed_hydraulic_action_lb_lf_rf_rb[:, 0],
+                "executed_hydraulic_action_lf_mean": executed_hydraulic_action_lb_lf_rf_rb[:, 1],
+                "executed_hydraulic_action_rf_mean": executed_hydraulic_action_lb_lf_rf_rb[:, 2],
+                "executed_hydraulic_action_rb_mean": executed_hydraulic_action_lb_lf_rf_rb[:, 3],
+                "support_hold_total_pre_filter_lb_mean": self._yaw_turn_support_total_pre_filter_semantic[:, 0],
+                "support_hold_total_pre_filter_lf_mean": self._yaw_turn_support_total_pre_filter_semantic[:, 1],
+                "support_hold_total_pre_filter_rf_mean": self._yaw_turn_support_total_pre_filter_semantic[:, 2],
+                "support_hold_total_pre_filter_rb_mean": self._yaw_turn_support_total_pre_filter_semantic[:, 3],
+                "wrong_direction_yaw_mean": wrong_direction_yaw_mean,
+                "forward_velocity_during_turn": torch.abs(base_lin_vel_x),
+                "hydraulic_mode_debug": hydraulic_mode_debug,
+                "stroke_range_mean": stroke_range_mean,
+                "stroke_diagonal_balance": stroke_diagonal_balance,
+                "contact_force_imbalance": contact_force_imbalance,
+                "min_wheel_contact_force_mean": min_wheel_contact_force_mean,
+                "zero_contact_ratio": zero_contact_ratio,
+                "wheel_contact_force_lb_mean": raw_contact_force[:, 0],
+                "wheel_contact_force_lf_mean": raw_contact_force[:, 1],
+                "wheel_contact_force_rf_mean": raw_contact_force[:, 2],
+                "wheel_contact_force_rb_mean": raw_contact_force[:, 3],
+                "wheel_common_mode_target_abs_mean": torch.abs(wheel_common_mode_target),
+                "wheel_differential_target_mean": wheel_differential_target,
+                "wheel_differential_target_abs_mean": torch.abs(wheel_differential_target),
+                "goal_x_body_mean": target_vec_b[:, 0],
+                "goal_y_body_mean": target_vec_b[:, 1],
+                "goal_angle_body_mean": goal_angle_body,
+                "goal_angle_body_abs_mean": torch.abs(goal_angle_body),
+                "goal_left_rate": (goal_angle_body > 0.0).to(torch.float32),
+                "goal_right_rate": (goal_angle_body < 0.0).to(torch.float32),
+                "goal_front_rate": (target_vec_b[:, 0] > 0.0).to(torch.float32),
+                "heading_error_abs_mean": torch.abs(heading_error),
+                "heading_error_reduction_mean": heading_error_reduction_mean,
+                "turn_toward_goal_mean": turn_toward_goal_mean,
+                "signed_yaw_rate_tracking_mean": signed_yaw_rate_tracking_mean,
+                "too_small_yaw_rate_when_error_large_mean": too_small_yaw_rate_when_error_large_mean,
+                "desired_yaw_rate_mean": desired_yaw_rate,
+                "desired_yaw_rate_abs_mean": torch.abs(desired_yaw_rate),
+                "desired_yaw_sign_mean": desired_yaw_sign,
+                "yaw_rate_error_mean": yaw_rate_error,
+                "yaw_rate_error_abs_mean": torch.abs(yaw_rate_error),
+                "yaw_active_rate": yaw_active_mask,
+                "yaw_correct_direction_rate": yaw_correct_direction_rate,
+                "yaw_too_small_rate": yaw_too_small_rate,
+                "left_yaw_correct_direction_rate": left_yaw_correct_direction_rate,
+                "right_yaw_correct_direction_rate": right_yaw_correct_direction_rate,
+                "left_yaw_too_small_rate": left_yaw_too_small_rate,
+                "right_yaw_too_small_rate": right_yaw_too_small_rate,
+                "left_signed_yaw_rate_mean": masked_mean_or_zero(signed_yaw, goal_left_mask),
+                "right_signed_yaw_rate_mean": masked_mean_or_zero(signed_yaw, goal_right_mask),
+                "wheel_velocity_target_mean": wheel_velocity_target_mean,
+                "semantic_wheel_velocity_target_mean": semantic_wheel_velocity_target_mean,
+                "wheel_joint_vel_mean": wheel_joint_vel_mean,
+                "semantic_wheel_joint_vel_mean": semantic_wheel_joint_vel_mean,
+                "wheel_left_target_mean": wheel_left_target_mean,
+                "wheel_right_target_mean": wheel_right_target_mean,
+                "left_turn_yaw_rate_mean": masked_mean_or_zero(root_ang_vel_b_z, goal_left_mask),
+                "right_turn_yaw_rate_mean": masked_mean_or_zero(root_ang_vel_b_z, goal_right_mask),
+                "left_goal_success_rate": masked_mean_or_zero(success_rate, goal_left_mask),
+                "right_goal_success_rate": masked_mean_or_zero(success_rate, goal_right_mask),
+                "bad_orientation_rate": bad_orientation_rate,
+            }
+
         # Raw physical joint-space mean. This is kept for debugging, but after adding
         # wheel_forward_sign it is no longer a good "forward motion" indicator.
         wheel_velocity_target_mean = wheel_velocity_target.mean(dim=1)
@@ -2493,6 +3258,167 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         action[:, 4:8] = 0.0
         return action
 
+    def _apply_short_goal_turn_action_constraints(self, action: torch.Tensor) -> torch.Tensor:
+        if not self._is_short_goal_turn_task:
+            return action
+        mode = self._short_goal_turn_hydraulic_mode
+        if mode == "free":
+            return action
+        if mode == "locked" and not self._short_goal_turn_lock_hydraulic:
+            return action
+        action = action.clone()
+        if mode == "locked":
+            action[:, 0:4] = 0.0
+        elif mode == "free_small":
+            action[:, 0:4] = torch.clamp(action[:, 0:4], min=-0.15, max=0.15)
+        return action
+
+    def _compute_yaw_turn_support_hold_raw_action(self) -> torch.Tensor:
+        """Goal-independent hydraulic support controller for four-wheel support health.
+
+        This controller intentionally avoids goal angle, heading error, yaw-rate target,
+        or reward information. It only uses local support state: stroke, roll/pitch,
+        body angular rates, and wheel contact force.
+
+        support_hold_leg_order = [lb, lf, rf, rb]
+        """
+
+        robot = self.scene["robot"]
+        leg_action_term = self.action_manager.get_term("leg_hydraulic")
+        stroke_lb_lf_rf_rb = leg_action_term.stroke_actual[:, self._support_hold_stroke_to_lb_lf_rf_rb]
+        root_ang_vel_b = robot.data.root_ang_vel_b
+        roll, pitch, _ = euler_xyz_from_quat(robot.data.root_quat_w)
+        wheel_contact_sensor = self.scene.sensors["wheel_contact_forces"]
+        raw_body_ids, _ = wheel_contact_sensor.find_bodies(["w_lb", "w_lf", "w_rf", "w_rb"], preserve_order=True)
+        raw_body_ids = torch.as_tensor(raw_body_ids, device=self.device, dtype=torch.long)
+        raw_net_contact_forces = wheel_contact_sensor.data.net_forces_w_history[:, :, raw_body_ids, :]
+        raw_contact_force = torch.max(torch.norm(raw_net_contact_forces, dim=-1), dim=1)[0]
+        contact_force_lb_lf_rf_rb = raw_contact_force[:, self._support_hold_contact_to_lb_lf_rf_rb]
+
+        stroke_mean = stroke_lb_lf_rf_rb.mean(dim=1, keepdim=True)
+        stroke_nominal_correction = 0.9 * (self._yaw_turn_support_nominal_stroke - stroke_lb_lf_rf_rb)
+        stroke_range_correction = 0.35 * (stroke_mean - stroke_lb_lf_rf_rb)
+
+        diag_error = (stroke_lb_lf_rf_rb[:, 0] + stroke_lb_lf_rf_rb[:, 2]) - (
+            stroke_lb_lf_rf_rb[:, 1] + stroke_lb_lf_rf_rb[:, 3]
+        )
+        diag_correction = 0.20 * diag_error.unsqueeze(1) * torch.tensor(
+            [-1.0, 1.0, -1.0, 1.0], device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+
+        # Standard XYZ body-angle compensation:
+        # positive pitch => lower the front / raise the rear;
+        # positive roll => lower the left / raise the right.
+        pitch_correction = 0.08 * pitch.unsqueeze(1) * torch.tensor(
+            [-1.0, -1.0, 1.0, 1.0], device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+        roll_correction = 0.08 * roll.unsqueeze(1) * torch.tensor(
+            [-1.0, 1.0, 1.0, -1.0], device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+        pitch_rate_damping = 0.04 * root_ang_vel_b[:, 1].unsqueeze(1) * torch.tensor(
+            [-1.0, -1.0, 1.0, 1.0], device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+        roll_rate_damping = 0.04 * root_ang_vel_b[:, 0].unsqueeze(1) * torch.tensor(
+            [-1.0, 1.0, 1.0, -1.0], device=self.device, dtype=torch.float32
+        ).unsqueeze(0)
+
+        contact_force_clamped = torch.clamp(contact_force_lb_lf_rf_rb, min=0.0, max=500.0)
+        mean_contact_force = contact_force_clamped.mean(dim=1, keepdim=True)
+        low_contact_threshold = torch.maximum(
+            0.5 * mean_contact_force,
+            torch.full_like(mean_contact_force, 50.0),
+        )
+        low_contact_mask = contact_force_clamped < low_contact_threshold
+        low_contact_mask_f = low_contact_mask.to(torch.float32)
+        stroke_nominal_correction = torch.where(
+            low_contact_mask & (stroke_nominal_correction > 0.0),
+            stroke_nominal_correction * 0.2,
+            stroke_nominal_correction,
+        )
+        stroke_range_correction = torch.where(
+            low_contact_mask & (stroke_range_correction > 0.0),
+            stroke_range_correction * 0.3,
+            stroke_range_correction,
+        )
+        diag_correction = torch.where(
+            low_contact_mask & (diag_correction > 0.0),
+            diag_correction * 0.3,
+            diag_correction,
+        )
+        # force_error > 0 means this wheel is under-loaded.
+        # With the current stroke definition, low contact force should reduce stroke
+        # (extend the leg / press the wheel down), so the correction is negative.
+        force_error = mean_contact_force - contact_force_clamped
+        normalized_force_error = force_error / torch.clamp(mean_contact_force, min=20.0)
+        normalized_force_error = normalized_force_error - normalized_force_error.mean(dim=1, keepdim=True)
+        contact_correction = self._support_contact_correction_sign * (-0.05) * normalized_force_error
+        contact_correction = torch.where(
+            low_contact_mask_f > 0.0,
+            contact_correction,
+            contact_correction * 1.1,
+        )
+        contact_correction = torch.clamp(contact_correction, min=-0.06, max=0.06)
+
+        stroke_correction = stroke_nominal_correction + stroke_range_correction + diag_correction
+        roll_pitch_correction = pitch_correction + roll_correction + pitch_rate_damping + roll_rate_damping
+        non_contact_correction = stroke_correction + roll_pitch_correction
+        total_pre_filter_semantic = non_contact_correction + contact_correction
+        cancellation_per_leg = torch.relu(-(non_contact_correction * torch.sign(contact_correction)))
+
+        desired_semantic = total_pre_filter_semantic
+        desired_semantic = torch.clamp(desired_semantic, min=-0.12, max=0.12)
+
+        self._yaw_turn_support_contact_correction_semantic[:] = contact_correction
+        self._yaw_turn_support_stroke_nominal_correction_semantic[:] = stroke_nominal_correction
+        self._yaw_turn_support_stroke_range_correction_semantic[:] = stroke_range_correction
+        self._yaw_turn_support_diag_correction_semantic[:] = diag_correction
+        self._yaw_turn_support_stroke_correction_semantic[:] = stroke_correction
+        self._yaw_turn_support_roll_pitch_correction_semantic[:] = roll_pitch_correction
+        self._yaw_turn_support_non_contact_correction_semantic[:] = non_contact_correction
+        self._yaw_turn_support_contact_cancellation_semantic[:] = cancellation_per_leg
+        self._yaw_turn_support_total_pre_filter_semantic[:] = total_pre_filter_semantic
+
+        alpha = self.step_dt / (0.08 + self.step_dt)
+        filtered_semantic = self._yaw_turn_support_hold_semantic_action + alpha * (
+            desired_semantic - self._yaw_turn_support_hold_semantic_action
+        )
+        max_delta = 0.03
+        delta = torch.clamp(
+            filtered_semantic - self._yaw_turn_support_hold_semantic_action,
+            min=-max_delta,
+            max=max_delta,
+        )
+        filtered_semantic = torch.clamp(
+            self._yaw_turn_support_hold_semantic_action + delta,
+            min=-0.12,
+            max=0.12,
+        )
+        self._yaw_turn_support_hold_semantic_action[:] = filtered_semantic
+
+        raw_order = filtered_semantic[:, self._support_hold_action_raw_to_lb_lf_rf_rb]
+        self._yaw_turn_support_hold_raw_action[:] = raw_order
+        return raw_order
+
+    def _apply_yaw_turn_support_action_constraints(self, action: torch.Tensor) -> torch.Tensor:
+        if not self._is_yaw_turn_support_task:
+            return action
+
+        mode = self._yaw_turn_support_hydraulic_mode
+        action = action.clone()
+        self._executed_hydraulic_action_prev[:] = self._yaw_turn_support_executed_raw_action
+        if mode == "locked":
+            action[:, 0:4] = 0.0
+            self._yaw_turn_support_hold_semantic_action.zero_()
+            self._yaw_turn_support_hold_raw_action.zero_()
+        elif mode == "support_hold":
+            action[:, 0:4] = self._compute_yaw_turn_support_hold_raw_action()
+        else:
+            self._yaw_turn_support_hold_semantic_action.zero_()
+            self._yaw_turn_support_hold_raw_action.zero_()
+
+        self._yaw_turn_support_executed_raw_action[:] = action[:, 0:4]
+        return action
+
     def _apply_stand_trace_action_override(self, action: torch.Tensor) -> torch.Tensor:
         if not self._stand_trace_enabled or self._stand_trace_mode != "zero_action":
             return action
@@ -2686,11 +3612,39 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._stand_trace_csv_writer.writerow(row)
         self._stand_trace_csv_file.flush()
 
+    def _initialize_short_goal_visualizer(self) -> None:
+        marker_cfg = POSITION_GOAL_MARKER_CFG.copy()
+        marker_cfg.prim_path = "/World/Visuals/RangerShortGoalTargets"
+        self._short_goal_goal_marker = VisualizationMarkers(marker_cfg)
+
+    def _update_short_goal_visualizer(self) -> None:
+        if not self._short_goal_visualization_enabled or self._short_goal_goal_marker is None:
+            return
+        goal_pos_w = mdp.short_goal_target_pos_w(self).clone()
+        goal_pos_w[:, 2] = self._stand_trace_ground_height + 0.10
+        _, goal_distance, _ = mdp.short_goal_target_body(self)
+        marker_indices = torch.where(
+            goal_distance < 0.5,
+            torch.ones((self.num_envs,), dtype=torch.int32, device=self.device),
+            torch.zeros((self.num_envs,), dtype=torch.int32, device=self.device),
+        )
+        scales = torch.full((self.num_envs, 3), 6.0, dtype=torch.float32, device=self.device)
+        self._short_goal_goal_marker.visualize(
+            translations=goal_pos_w,
+            marker_indices=marker_indices,
+            scales=scales,
+        )
+
     def step(self, action: torch.Tensor):
         # process actions
-        action = self._apply_reset_settle_action(action.to(self.device))
+        action = action.to(self.device)
+        if action.shape[1] >= 4:
+            self._policy_hydraulic_action_raw[:] = action[:, 0:4]
+        action = self._apply_reset_settle_action(action)
         action = self._apply_goal_heading_turn_sanity_action(action)
         action = self._apply_stand_action_constraints(action)
+        action = self._apply_short_goal_turn_action_constraints(action)
+        action = self._apply_yaw_turn_support_action_constraints(action)
         action = self._apply_stand_trace_action_override(action)
         self.action_manager.process_action(action)
 
@@ -2744,6 +3698,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
         self.obs_buf = self.observation_manager.compute(update_history=True)
+        self._update_short_goal_visualizer()
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
@@ -2912,6 +3867,9 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         if self._enable_reset_settle and self._reset_settle_steps > 0:
             self._reset_settle_remaining_steps[env_ids] = self._reset_settle_steps
             self._reset_settle_step_active[env_ids] = False
+        self._policy_hydraulic_action_raw[env_ids] = 0.0
+        self._yaw_turn_support_executed_raw_action[env_ids] = 0.0
+        self._executed_hydraulic_action_prev[env_ids] = 0.0
         if self._is_goal_heading_task:
             self._goal_heading_prev_distance[env_ids] = float("nan")
             self._goal_heading_debug_prev_abs_error[env_ids] = float("nan")
@@ -3008,10 +3966,12 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             self._stand_last50_wheel_contact_over_weight[env_ids] = 0.0
             self._stand_last50_non_wheel_contact_over_weight[env_ids] = 0.0
         if self._is_stand_training_task and not self._stand_debug_metrics_enabled:
+            self._update_short_goal_visualizer()
             return
         self.extras.setdefault("full_log", {})
         self.extras["full_log"].update(debug_logs)
         self.extras["log"].update(self._filter_forward_debug_logs_for_stdout(debug_logs))
+        self._update_short_goal_visualizer()
 
     def render(self, recompute: bool = False) -> np.ndarray | None:
         return super().render(recompute=recompute)

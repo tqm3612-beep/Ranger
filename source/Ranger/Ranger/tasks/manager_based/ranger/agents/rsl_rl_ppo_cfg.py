@@ -66,3 +66,10 @@ class StandPPORunnerCfg(PPORunnerCfg):
     policy = RangerTerrainActorCriticCfg(
         init_noise_std=0.5,
     )
+
+
+@configclass
+class ShortGoalFlatPPORunnerCfg(PPORunnerCfg):
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.5,
+    )

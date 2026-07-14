@@ -123,6 +123,26 @@ gym.register(
 )
 
 gym.register(
+    id="Template-Ranger-ShortGoalTurnFreeHydraulicFlat-v0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalTurnFreeHydraulicFlatEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Template-Ranger-ShortGoalTurnFreeHydraulicFlat-v1",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalTurnFreeHydraulicFlatV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Template-Ranger-YawTurnSupportFlat-v0",
     entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,

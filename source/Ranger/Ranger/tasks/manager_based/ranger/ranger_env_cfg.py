@@ -1430,6 +1430,282 @@ class RangerShortGoalTurnFlatEnvCfg(RangerShortGoalFlatEnvCfg):
 
 
 @configclass
+class RangerShortGoalTurnFreeHydraulicFlatEnvCfg(RangerShortGoalTurnFlatEnvCfg):
+    """Side-goal turn task with policy-controlled free hydraulics and short-goal wheel priors."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.short_goal_turn_task = True
+        self.short_goal_turn_lock_hydraulic = False
+        self.short_goal_turn_hydraulic_mode_default = "free"
+        self.actions.wheel_motor_csv.velocity_limit = 80.0
+        self.observations.policy_state.wheel_joint_vel_rel.params["scale"] = 80.0
+
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_turn_target,
+            mode="reset",
+            params={
+                "distance_range": (1.0, 1.5),
+                "left_heading_range_deg": (25.0, 45.0),
+                "right_heading_range_deg": (-45.0, -25.0),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.progress_to_goal.weight = 0.0
+        self.rewards.goal_velocity.weight = 0.0
+        self.rewards.goal_success.weight = 0.0
+        self.rewards.near_goal_stop.weight = 0.0
+        self.rewards.heading_error_reduction.weight = 9.0
+        self.rewards.turn_toward_goal.weight = 4.0
+
+        self.rewards.short_goal_wheel_diff_prior = RewTerm(
+            func=mdp.short_goal_wheel_diff_prior_l1,
+            weight=-1.0,
+            params={"turn_gain": 40.0, "action_name": "wheel_motor_csv", "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.short_goal_forward_common_mode = RewTerm(
+            func=mdp.short_goal_forward_common_mode_penalty,
+            weight=-0.20,
+            params={
+                "heading_error_threshold": 0.35,
+                "action_name": "wheel_motor_csv",
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.hydraulic_action_magnitude.weight = -0.05
+        self.rewards.hydraulic_action_rate = RewTerm(
+            func=mdp.hydraulic_action_rate_l1,
+            weight=-0.03,
+        )
+        self.rewards.stroke_range.weight = -0.5
+        self.rewards.stroke_diagonal_balance.weight = -0.25
+        self.rewards.actual_stroke_nominal.weight = 0.0
+        self.rewards.actual_stroke_soft_limit.weight = -1.0
+        self.rewards.low_stroke_negative_hydraulic_action.weight = 0.0
+        self.rewards.height_gated_low_stroke_negative_hydraulic_action.weight = 0.0
+        self.rewards.high_height_low_stroke_negative_hydraulic_action.weight = 0.0
+        self.rewards.stroke_away_from_nominal_hydraulic_action.weight = 0.0
+        self.rewards.front_rear_stroke_balance.weight = 0.0
+
+        self.rewards.wheel_contact_count.weight = 0.0
+        self.rewards.wheel_contact_stability.weight = 0.0
+        self.rewards.wheel_contact_balance.weight = 0.0
+        if hasattr(self.rewards, "wheel_all_contact"):
+            self.rewards.wheel_all_contact.weight = 0.0
+        self.rewards.contact_force_diag_balance.weight = -0.15
+        self.rewards.contact_force_left_right_balance.weight = 0.0
+        self.rewards.contact_force_range_balance.weight = 0.0
+        self.rewards.contact_force_min_support.weight = 0.0
+        self.rewards.contact_force_min_ratio_support.weight = 0.0
+        self.rewards.low_contact_support.weight = 0.0
+        self.rewards.low_contact_ratio_support.weight = -0.15
+        self.rewards.unloaded_wheel_spin = RewTerm(
+            func=mdp.unloaded_wheel_spin_penalty,
+            weight=-0.003,
+            params={
+                "force_threshold": 20.0,
+                "sensor_cfg": SceneEntityCfg(
+                    "wheel_contact_forces",
+                    body_names=["w_lf", "w_lb", "w_rf", "w_rb"],
+                ),
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=["w_lf", "w_lb", "w_rf", "w_rb"],
+                ),
+            },
+        )
+
+        for reward_name in (
+            "yaw_rate_tracking",
+            "yaw_rate_command_tracking",
+            "yaw_rate_error_penalty",
+            "turn_direction",
+            "wheel_turn_difference_error",
+            "wheel_command_tracking",
+            "wheel_command_error",
+        ):
+            if hasattr(self.rewards, reward_name):
+                getattr(self.rewards, reward_name).weight = 0.0
+        self.rewards.forward_velocity_during_turn = RewTerm(
+            func=mdp.short_goal_forward_velocity_during_turn_penalty,
+            weight=0.0,
+            params={"free_speed": 0.12, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.signed_yaw_rate_tracking = RewTerm(
+            func=mdp.short_goal_signed_yaw_rate_tracking,
+            weight=0.0,
+            params={"target_yaw_rate": 0.30, "heading_deadband": 0.10, "sigma": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.too_small_yaw_rate_when_error_large = RewTerm(
+            func=mdp.short_goal_too_small_yaw_rate_when_error_large_penalty,
+            weight=0.0,
+            params={"min_yaw_rate": 0.10, "heading_threshold": 0.25, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wrong_direction_yaw = RewTerm(
+            func=mdp.short_goal_wrong_direction_yaw_penalty,
+            weight=0.0,
+            params={"heading_deadband": 0.10, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wrong_direction_yaw_command = RewTerm(
+            func=mdp.wrong_direction_yaw_command_penalty,
+            weight=0.0,
+            params={"active_threshold": 0.02, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.too_small_yaw_rate_when_error_large_command = RewTerm(
+            func=mdp.too_small_yaw_rate_command_penalty,
+            weight=0.0,
+            params={"active_threshold": 0.05, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wheel_turn_mode_soft_limit = RewTerm(
+            func=mdp.wheel_turn_mode_target_soft_limit_penalty,
+            weight=0.0,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 8.0},
+        )
+        self.rewards.wheel_target_abs_soft_limit = RewTerm(
+            func=mdp.wheel_target_abs_soft_limit_penalty,
+            weight=0.0,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 8.0},
+        )
+        self.rewards.wheel_joint_vel_abs_soft_limit = RewTerm(
+            func=mdp.wheel_joint_vel_abs_soft_limit_penalty,
+            weight=0.0,
+            params={"action_name": "wheel_motor_csv", "soft_limit": 10.0, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.wasted_turn_when_yaw_small = RewTerm(
+            func=mdp.wasted_turn_when_yaw_small_penalty,
+            weight=0.0,
+            params={"action_name": "wheel_motor_csv", "active_threshold": 0.05, "asset_cfg": SceneEntityCfg("robot")},
+        )
+
+
+@configclass
+class RangerShortGoalTurnFreeHydraulicFlatV1EnvCfg(RangerShortGoalTurnFreeHydraulicFlatEnvCfg):
+    """Full short-goal turn, approach, decelerate, and settle task with free hydraulics."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.episode_length_s = 8.0
+        self.short_goal_turn_task = True
+        self.short_goal_turn_lock_hydraulic = False
+        self.short_goal_turn_hydraulic_mode_default = "free"
+        self.actions.wheel_motor_csv.velocity_limit = 80.0
+        self.observations.policy_state.wheel_joint_vel_rel.params["scale"] = 80.0
+
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_turn_target,
+            mode="reset",
+            params={
+                "distance_range": (2.0, 3.0),
+                "left_heading_range_deg": (25.0, 45.0),
+                "right_heading_range_deg": (-45.0, -25.0),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.progress_to_goal = RewTerm(
+            func=mdp.short_goal_progress_reward_heading_gated,
+            weight=2.0,
+            params={"heading_error_threshold": 0.35, "asset_cfg": SceneEntityCfg("robot")},
+        )
+        self.rewards.goal_velocity.weight = 0.0
+        self.rewards.goal_success.weight = 0.0
+        self.rewards.near_goal_stop.weight = 0.0
+        self.rewards.short_goal_speed_profile = RewTerm(
+            func=mdp.short_goal_speed_profile_penalty,
+            weight=-1.0,
+            params={
+                "stop_distance": 0.25,
+                "speed_gain": 0.6,
+                "max_speed": 0.8,
+                "heading_deadband": 0.20,
+                "heading_full": 0.60,
+                "near_distance": 0.60,
+                "yaw_rate_ref": 0.80,
+                "yaw_component_weight": 0.5,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.heading_error_reduction = RewTerm(
+            func=mdp.short_goal_heading_error_reduction,
+            weight=9.0,
+            params={
+                "min_progress": -0.5,
+                "max_progress": 0.5,
+                "use_turn_distance_gate": True,
+                "turn_gate_start_distance": 0.35,
+                "turn_gate_full_distance": 0.60,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.turn_toward_goal = RewTerm(
+            func=mdp.short_goal_turn_toward_goal,
+            weight=4.0,
+            params={
+                "min_reward": -1.0,
+                "max_reward": 1.0,
+                "use_turn_distance_gate": True,
+                "turn_gate_start_distance": 0.35,
+                "turn_gate_full_distance": 0.60,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.short_goal_wheel_diff_prior = RewTerm(
+            func=mdp.short_goal_wheel_diff_prior_l1,
+            weight=-1.0,
+            params={
+                "turn_gain": 40.0,
+                "action_name": "wheel_motor_csv",
+                "use_turn_distance_gate": True,
+                "turn_gate_start_distance": 0.35,
+                "turn_gate_full_distance": 0.60,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.short_goal_forward_common_mode = RewTerm(
+            func=mdp.short_goal_forward_common_mode_penalty,
+            weight=-0.15,
+            params={
+                "heading_error_threshold": 0.35,
+                "action_name": "wheel_motor_csv",
+                "use_turn_distance_gate": True,
+                "turn_gate_start_distance": 0.35,
+                "turn_gate_full_distance": 0.60,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        self.rewards.base_roll_pitch_rate.weight = -0.8
+        self.rewards.roll_angle.weight = -1.3
+        self.rewards.pitch_angle.weight = -1.5
+        self.rewards.stroke_range.weight = -0.8
+        self.rewards.stroke_diagonal_balance.weight = -0.5
+        self.rewards.hydraulic_action_magnitude.weight = -0.05
+        self.rewards.hydraulic_action_rate.weight = -0.06
+        self.rewards.actual_stroke_soft_limit.weight = -1.0
+        self.rewards.base_height_low.weight = -8.0
+        self.rewards.base_height_high.weight = -10.0
+        self.rewards.contact_force_diag_balance.weight = -0.22
+        self.rewards.contact_force_left_right_balance.weight = 0.0
+        self.rewards.contact_force_min_support.weight = 0.0
+        self.rewards.contact_force_min_ratio_support.weight = 0.0
+        self.rewards.low_contact_support.weight = 0.0
+        self.rewards.low_contact_ratio_support.weight = -0.25
+        self.rewards.unloaded_wheel_spin.weight = -0.006
+
+        self.rewards.signed_yaw_rate_tracking.weight = 0.0
+        self.rewards.too_small_yaw_rate_when_error_large.weight = 0.0
+        self.rewards.wrong_direction_yaw.weight = 0.0
+        self.rewards.wheel_turn_mode_soft_limit.weight = 0.0
+        self.rewards.wheel_target_abs_soft_limit.weight = 0.0
+        self.rewards.wheel_joint_vel_abs_soft_limit.weight = 0.0
+        self.rewards.wasted_turn_when_yaw_small.weight = 0.0
+
+        self.terminations.goal_reached = None
+
+
+@configclass
 class RangerYawTurnSupportFlatEnvCfg(RangerShortGoalTurnFlatEnvCfg):
     """Low-speed turn-in-place support task with goal-independent hydraulic support-hold control."""
 

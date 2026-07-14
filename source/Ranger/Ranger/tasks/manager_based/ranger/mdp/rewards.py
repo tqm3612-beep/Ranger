@@ -560,15 +560,61 @@ def short_goal_velocity_towards_target_heading_gated(
     return active_mask * velocity_reward
 
 
+def short_goal_speed_profile_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.25,
+    speed_gain: float = 0.6,
+    max_speed: float = 0.8,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.60,
+    near_distance: float = 0.60,
+    yaw_rate_ref: float = 0.80,
+    yaw_component_weight: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize speed above a distance/heading-gated profile and yaw near the short goal."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+
+    desired_speed = torch.clamp(
+        float(speed_gain) * (goal_distance - float(stop_distance)),
+        min=0.0,
+        max=float(max_speed),
+    )
+    heading_abs = torch.abs(heading_error)
+    alignment_gate = torch.clamp(
+        (float(heading_full) - heading_abs) / max(float(heading_full) - float(heading_deadband), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    desired_speed = desired_speed * alignment_gate
+
+    speed_excess = torch.relu(base_xy_speed - desired_speed)
+    linear_penalty = torch.square(speed_excess / max(float(max_speed), 1.0e-6))
+    near_gate = torch.clamp(
+        (float(near_distance) - goal_distance) / max(float(near_distance) - float(stop_distance), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    yaw_penalty = near_gate * torch.square(yaw_rate / max(float(yaw_rate_ref), 1.0e-6))
+    return linear_penalty + float(yaw_component_weight) * yaw_penalty
+
+
 def short_goal_heading_error_reduction(
     env: ManagerBasedRLEnv,
     min_progress: float = -0.5,
     max_progress: float = 0.5,
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Reward step-wise reduction in absolute heading error for short-goal turning."""
 
-    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
     prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
     if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
         prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
@@ -582,21 +628,113 @@ def short_goal_heading_error_reduction(
         torch.zeros_like(current_abs_error),
     )
     prev_heading_error[:] = heading_error
-    return torch.clamp(progress, min=float(min_progress), max=float(max_progress))
+    progress = torch.clamp(progress, min=float(min_progress), max=float(max_progress))
+    if use_turn_distance_gate:
+        progress = progress * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return progress
 
 
 def short_goal_turn_toward_goal(
     env: ManagerBasedRLEnv,
     min_reward: float = -1.0,
     max_reward: float = 1.0,
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Reward yaw-rate direction that turns toward the side goal."""
 
     asset: Articulation = env.scene[asset_cfg.name]
-    target_vec_b, _, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    target_vec_b, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
     turn_direction = torch.sign(target_vec_b[:, 1]) * asset.data.root_ang_vel_b[:, 2]
-    return torch.clamp(turn_direction, min=float(min_reward), max=float(max_reward))
+    reward = torch.clamp(turn_direction, min=float(min_reward), max=float(max_reward))
+    if use_turn_distance_gate:
+        reward = reward * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return reward
+
+
+def _short_goal_turn_distance_gate(
+    goal_distance: torch.Tensor,
+    start_distance: float = 0.35,
+    full_distance: float = 0.60,
+) -> torch.Tensor:
+    """Return a near-goal gate that fades turn-only shaping out near the target."""
+
+    return torch.clamp(
+        (goal_distance - float(start_distance)) / max(float(full_distance) - float(start_distance), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+
+
+def short_goal_wheel_diff_prior_l1(
+    env: ManagerBasedRLEnv,
+    turn_gain: float = 20.0,
+    action_name: str = "wheel_motor_csv",
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize semantic left-right wheel target mismatch for the short-goal heading error."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    left_mean = semantic_target[:, :2].mean(dim=1)
+    right_mean = semantic_target[:, 2:].mean(dim=1)
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    expected_diff = -2.0 * float(turn_gain) * torch.sin(heading_error)
+    actual_diff = left_mean - right_mean
+    error = torch.abs(actual_diff - expected_diff)
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = float(getattr(wheel_action_term, "_velocity_limit", 1.0))
+    penalty = error / max(2.0 * velocity_limit, 1.0)
+    if use_turn_distance_gate:
+        penalty = penalty * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return penalty
+
+
+def short_goal_forward_common_mode_penalty(
+    env: ManagerBasedRLEnv,
+    heading_error_threshold: float = 0.35,
+    action_name: str = "wheel_motor_csv",
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize shared forward wheel target motion while the short-goal heading error is large."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    left_mean = semantic_target[:, :2].mean(dim=1)
+    right_mean = semantic_target[:, 2:].mean(dim=1)
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    active = (torch.abs(heading_error) > float(heading_error_threshold)).to(semantic_target.dtype)
+    common_mode = torch.abs(0.5 * (left_mean + right_mean))
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = float(getattr(wheel_action_term, "_velocity_limit", 1.0))
+    penalty = active * common_mode / max(velocity_limit, 1.0)
+    if use_turn_distance_gate:
+        penalty = penalty * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return penalty
 
 
 def _short_goal_signed_yaw_targets(
@@ -1291,6 +1429,13 @@ def hydraulic_action_magnitude_l1(
 
     action_term = env.action_manager.get_term(action_name)
     return torch.mean(torch.abs(action_term.raw_actions), dim=1)
+
+
+def hydraulic_action_rate_l1(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Penalize L1 hydraulic action-rate using the first four action dimensions."""
+
+    delta = torch.abs(env.action_manager.action[:, :4] - env.action_manager.prev_action[:, :4])
+    return torch.mean(delta, dim=1)
 
 
 def hydraulic_action_range_penalty(

@@ -11,9 +11,13 @@ import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets import ArticulationCfg
 
-RANGER_ASSET_DIR = Path(__file__).resolve().parent
-RANGER_URDF_PATH = RANGER_ASSET_DIR / "urdf" / "ranger.urdf"
-RANGER_USD_PATH = RANGER_ASSET_DIR / "usd" / "ranger.usd"
+RANGER_PROJECT_ROOT = Path(__file__).resolve().parents[5]
+RANGER_MODEL_DIR = RANGER_PROJECT_ROOT / "RANGER"
+RANGER_URDF_PATH = RANGER_MODEL_DIR / "urdf" / "RANGER.urdf"
+RANGER_USD_PATH = RANGER_MODEL_DIR / "usd" / "RANGER.usd"
+
+if not RANGER_USD_PATH.is_file():
+    raise FileNotFoundError(f"Ranger USD asset not found: {RANGER_USD_PATH}")
 
 RANGER_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -37,10 +41,10 @@ RANGER_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.7,
     init_state=ArticulationCfg.InitialStateCfg(
-        pos=(0.0, 0.0, 0.75),
+        pos=(0.0, 0.0, 0.7),
         joint_pos={
             # Recomputed from the current URDF and wheel meshes so that, with
-            # base_link spawned at z=0.75, the four wheel lowest points are
+            # base_link spawned at z=0.7, the four wheel lowest points are
             # nearly coplanar at ground height.
             "g_lb": 0,
             "g_lf": 0,
@@ -75,6 +79,7 @@ RANGER_CFG = ArticulationCfg(
 )
 """Configuration for the Ranger robot.
 
-The USD is expected at ``assets/ranger/usd/ranger.usd``. Generate it from
-``assets/ranger/urdf/ranger.urdf`` before creating the environment.
+The robot model assets are stored under the repository-level ``RANGER``
+directory. The runtime asset is ``RANGER/usd/RANGER.usd`` and is generated
+from ``RANGER/urdf/RANGER.urdf``.
 """

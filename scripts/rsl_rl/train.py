@@ -28,11 +28,34 @@ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy 
 parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
+parser.add_argument(
+    "--warm_start_checkpoint",
+    type=str,
+    default=None,
+    help="Checkpoint used only to initialize actor parameters.",
+)
+parser.add_argument(
+    "--warm_start_mode",
+    type=str,
+    choices=("actor_suspension", "actor_full"),
+    default=None,
+    help=(
+        "Actor warm-start mode. "
+        "'actor_suspension' loads the shared encoders, actor trunk, "
+        "and suspension head while keeping the wheel head random. "
+        "'actor_full' loads the complete actor."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+
+if args_cli.resume and args_cli.warm_start_checkpoint is not None:
+    raise ValueError("--resume and --warm_start_checkpoint cannot be used together.")
+if args_cli.warm_start_checkpoint is not None and args_cli.warm_start_mode is None:
+    raise ValueError("--warm_start_mode is required when --warm_start_checkpoint is provided.")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -108,6 +131,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
 from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic
+from warm_start import warm_start_ranger_actor
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -268,6 +292,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # load previously trained model
             runner.load(resume_path)
         _reset_action_std_from_env(runner)
+    elif args_cli.warm_start_checkpoint is not None:
+        warm_start_ranger_actor(
+            runner=runner,
+            checkpoint_path=args_cli.warm_start_checkpoint,
+            mode=args_cli.warm_start_mode,
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -16,7 +16,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description="Audit Ranger asset geometry, collision, inertia, and mapping symmetry.")
-parser.add_argument("--task", type=str, default="Template-Ranger-ShortGoalTurnFreeHydraulicFlat-v1", help="Gym task id.")
+parser.add_argument("--task", type=str, default="Template-Ranger-ShortGoalFlat-v1", help="Gym task id.")
 parser.add_argument(
     "--mode",
     type=str,

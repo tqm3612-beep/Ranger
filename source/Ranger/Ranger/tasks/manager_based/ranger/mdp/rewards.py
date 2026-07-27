@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
+from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, wrap_to_pi
 
 from .observations import (
     GOAL_HEADING_PREV_HEADING_ERROR_ATTR,
@@ -465,6 +465,24 @@ def short_goal_progress_reward(
     return progress
 
 
+def _short_goal_navigation_gate(env: ManagerBasedRLEnv, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Return one before the latched stop phase and zero after entering it."""
+
+    stop_phase_active = getattr(env, "_short_goal_stop_phase_active", None)
+    if stop_phase_active is None or stop_phase_active.shape != (env.num_envs,):
+        return torch.ones((env.num_envs,), dtype=dtype, device=env.device)
+    return (~stop_phase_active).to(dtype)
+
+
+def _short_goal_stop_phase_gate(env: ManagerBasedRLEnv, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Return one only after the short-goal stop phase has been latched."""
+
+    stop_phase_active = getattr(env, "_short_goal_stop_phase_active", None)
+    if stop_phase_active is None or stop_phase_active.shape != (env.num_envs,):
+        return torch.zeros((env.num_envs,), dtype=dtype, device=env.device)
+    return stop_phase_active.to(dtype)
+
+
 def short_goal_progress_reward_heading_gated(
     env: ManagerBasedRLEnv,
     heading_error_threshold: float = 0.35,
@@ -476,6 +494,28 @@ def short_goal_progress_reward_heading_gated(
     _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
     active_mask = (torch.abs(heading_error) <= float(heading_error_threshold)).to(progress.dtype)
     return active_mask * progress
+
+
+def short_goal_progress_reward_alignment_gated(
+    env: ManagerBasedRLEnv,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.80,
+    alignment_floor: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward distance reduction with a non-zero heading-alignment floor."""
+
+    progress = short_goal_progress_reward(env, asset_cfg=asset_cfg)
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    alignment_gate = torch.clamp(
+        (float(heading_full) - torch.abs(heading_error))
+        / max(float(heading_full) - float(heading_deadband), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    floor = min(max(float(alignment_floor), 0.0), 1.0)
+    alignment_scale = floor + (1.0 - floor) * alignment_gate
+    return _short_goal_navigation_gate(env, dtype=progress.dtype) * alignment_scale * progress
 
 
 def short_goal_success_reward(
@@ -493,6 +533,294 @@ def short_goal_success_reward(
     newly_reached = (current_distance < float(success_distance)) & (~goal_reached)
     goal_reached |= newly_reached
     return newly_reached.to(torch.float32)
+
+
+def short_goal_precision_reach_reward(
+    env: ManagerBasedRLEnv,
+    precision_distance: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Give a one-time episode-level bonus for reaching the precision radius."""
+
+    newly_reached = short_goal_success_reward(
+        env,
+        success_distance=precision_distance,
+        asset_cfg=asset_cfg,
+    )
+    # RewardManager multiplies terms by step_dt. Divide here so the configured
+    # weight is the actual one-time episode bonus rather than a time-scaled value.
+    return newly_reached / max(float(env.step_dt), 1.0e-6)
+
+
+def short_goal_stopped_success_reward(
+    env: ManagerBasedRLEnv,
+    success_distance: float = 0.25,
+    max_xy_speed: float = 0.15,
+    max_yaw_rate: float = 0.20,
+    required_hold_steps: int = 24,
+    max_roll: float | None = None,
+    max_pitch: float | None = None,
+    max_stroke_range: float | None = None,
+    max_stroke_tracking_error: float | None = None,
+    action_name: str = "leg_hydraulic",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward settling inside the success radius, with or without capture override."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    yaw_rate_abs = torch.abs(asset.data.root_ang_vel_b[:, 2])
+    posture_ok = torch.ones((env.num_envs,), dtype=torch.bool, device=env.device)
+    if max_roll is not None or max_pitch is not None:
+        roll, pitch, _ = euler_xyz_from_quat(asset.data.root_quat_w)
+        if max_roll is not None:
+            posture_ok &= torch.abs(roll) <= float(max_roll)
+        if max_pitch is not None:
+            posture_ok &= torch.abs(pitch) <= float(max_pitch)
+    action_term = None
+    if max_stroke_range is not None or max_stroke_tracking_error is not None:
+        action_term = env.action_manager.get_term(action_name)
+    if max_stroke_range is not None:
+        stroke_actual = action_term.stroke_actual
+        stroke_range = stroke_actual.max(dim=1).values - stroke_actual.min(dim=1).values
+        posture_ok &= stroke_range <= float(max_stroke_range)
+    if max_stroke_tracking_error is not None:
+        tracking_error = torch.max(torch.abs(action_term.stroke_desired - action_term.stroke_actual), dim=1).values
+        posture_ok &= tracking_error <= float(max_stroke_tracking_error)
+    stopped_now = (
+        (current_distance < float(success_distance))
+        & (base_xy_speed < float(max_xy_speed))
+        & (yaw_rate_abs < float(max_yaw_rate))
+        & posture_ok
+    )
+    stable_steps = getattr(env, "_short_goal_stop_phase_stable_steps", None)
+    if stable_steps is None or stable_steps.shape != (env.num_envs,):
+        stopped_success = stopped_now
+    else:
+        stopped_success = stopped_now & (stable_steps >= int(required_hold_steps))
+    # RewardManager integrates every term with step_dt. This event occurs for one
+    # step only, so divide by step_dt to make the configured weight a true
+    # episode-level success bonus rather than a time-scaled continuous reward.
+    return stopped_success.to(torch.float32) / max(float(env.step_dt), 1.0e-6)
+
+
+def short_goal_stop_phase_xy_speed_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize planar base motion after the goal region has been entered."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    return _short_goal_stop_phase_gate(env, dtype=base_xy_speed.dtype) * base_xy_speed
+
+
+def _short_goal_stop_phase_linear_allowance(
+    goal_distance: torch.Tensor,
+    enter_distance: float,
+    zero_distance: float,
+    value_at_enter: float,
+) -> torch.Tensor:
+    """Return a linear allowance that reaches zero at the precision radius."""
+
+    if float(enter_distance) <= float(zero_distance):
+        raise ValueError("enter_distance must be greater than zero_distance.")
+    distance_fraction = torch.clamp(
+        (goal_distance - float(zero_distance)) / (float(enter_distance) - float(zero_distance)),
+        min=0.0,
+        max=1.0,
+    )
+    return max(float(value_at_enter), 0.0) * distance_fraction
+
+
+def short_goal_stop_phase_xy_speed_envelope_penalty(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    zero_distance: float = 0.30,
+    allowed_speed_at_enter: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize planar speed above a distance-dependent stop-phase envelope."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    allowance = _short_goal_stop_phase_linear_allowance(
+        goal_distance,
+        enter_distance=enter_distance,
+        zero_distance=zero_distance,
+        value_at_enter=allowed_speed_at_enter,
+    )
+    excess = torch.relu(base_xy_speed - allowance)
+    scale = max(float(allowed_speed_at_enter), 1.0e-6)
+    penalty = torch.square(excess / scale)
+    return _short_goal_stop_phase_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_stop_phase_yaw_rate_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize yaw motion after the goal region has been entered."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    yaw_rate_abs = torch.abs(asset.data.root_ang_vel_b[:, 2])
+    return _short_goal_stop_phase_gate(env, dtype=yaw_rate_abs.dtype) * yaw_rate_abs
+
+
+def short_goal_stop_phase_yaw_rate_envelope_penalty(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    zero_distance: float = 0.30,
+    allowed_yaw_rate_at_enter: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize yaw rate above a distance-dependent stop-phase envelope."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    yaw_rate_abs = torch.abs(asset.data.root_ang_vel_b[:, 2])
+    allowance = _short_goal_stop_phase_linear_allowance(
+        goal_distance,
+        enter_distance=enter_distance,
+        zero_distance=zero_distance,
+        value_at_enter=allowed_yaw_rate_at_enter,
+    )
+    excess = torch.relu(yaw_rate_abs - allowance)
+    scale = max(float(allowed_yaw_rate_at_enter), 1.0e-6)
+    penalty = torch.square(excess / scale)
+    return _short_goal_stop_phase_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_stop_phase_roll_error_penalty(
+    env: ManagerBasedRLEnv,
+    reference_angle: float = 0.035,
+    max_normalized_error: float = 4.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize normalized squared roll error only during the latched stop phase."""
+
+    if float(reference_angle) <= 0.0:
+        raise ValueError("reference_angle must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll, _, _ = euler_xyz_from_quat(asset.data.root_quat_w)
+    normalized_error = torch.square(roll / float(reference_angle))
+    normalized_error = torch.clamp(normalized_error, max=float(max_normalized_error))
+    return _short_goal_stop_phase_gate(env, dtype=normalized_error.dtype) * normalized_error
+
+
+def short_goal_stop_phase_pitch_error_penalty(
+    env: ManagerBasedRLEnv,
+    reference_angle: float = 0.035,
+    max_normalized_error: float = 4.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize normalized squared pitch error only during the latched stop phase."""
+
+    if float(reference_angle) <= 0.0:
+        raise ValueError("reference_angle must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, pitch, _ = euler_xyz_from_quat(asset.data.root_quat_w)
+    normalized_error = torch.square(pitch / float(reference_angle))
+    normalized_error = torch.clamp(normalized_error, max=float(max_normalized_error))
+    return _short_goal_stop_phase_gate(env, dtype=normalized_error.dtype) * normalized_error
+
+
+def short_goal_stop_phase_wheel_target_penalty(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize the policy's raw wheel request during the latched stop phase."""
+
+    raw_policy_wheel_action = getattr(env, "_short_goal_policy_wheel_action_raw", None)
+    if raw_policy_wheel_action is not None and raw_policy_wheel_action.shape == (env.num_envs, 4):
+        target_abs_mean = torch.mean(torch.abs(raw_policy_wheel_action), dim=1)
+    else:
+        action_term = env.action_manager.get_term(action_name)
+        velocity_limit = max(float(getattr(action_term, "_velocity_limit", 1.0)), 1.0e-6)
+        target_abs_mean = torch.mean(torch.abs(action_term.velocity_target), dim=1) / velocity_limit
+    return _short_goal_stop_phase_gate(env, dtype=target_abs_mean.dtype) * target_abs_mean
+
+
+def short_goal_stop_phase_wheel_target_envelope_penalty(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    zero_distance: float = 0.30,
+    allowed_action_at_enter: float = 0.20,
+    action_name: str = "wheel_motor_csv",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize wheel requests above an allowance that shrinks to zero near the target."""
+
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    raw_policy_wheel_action = getattr(env, "_short_goal_policy_wheel_action_raw", None)
+    if raw_policy_wheel_action is not None and raw_policy_wheel_action.shape == (env.num_envs, 4):
+        target_abs_mean = torch.mean(torch.abs(raw_policy_wheel_action), dim=1)
+    else:
+        action_term = env.action_manager.get_term(action_name)
+        velocity_limit = max(float(getattr(action_term, "_velocity_limit", 1.0)), 1.0e-6)
+        target_abs_mean = torch.mean(torch.abs(action_term.velocity_target), dim=1) / velocity_limit
+    allowance = _short_goal_stop_phase_linear_allowance(
+        goal_distance,
+        enter_distance=enter_distance,
+        zero_distance=zero_distance,
+        value_at_enter=allowed_action_at_enter,
+    )
+    excess = torch.relu(target_abs_mean - allowance)
+    scale = max(float(allowed_action_at_enter), 1.0e-6)
+    penalty = torch.square(excess / scale)
+    return _short_goal_stop_phase_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_stop_phase_precision_closeness_reward(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    precision_distance: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward continuous closeness from the stop boundary to the precision radius."""
+
+    if float(enter_distance) <= float(precision_distance):
+        raise ValueError("enter_distance must be greater than precision_distance.")
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    closeness = torch.clamp(
+        (float(enter_distance) - goal_distance) / (float(enter_distance) - float(precision_distance)),
+        min=0.0,
+        max=1.0,
+    )
+    return _short_goal_stop_phase_gate(env, dtype=closeness.dtype) * closeness
+
+
+def short_goal_stop_phase_distance_drift_penalty(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize moving away from the target after entering the stop phase."""
+
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    drift = torch.relu(current_distance - float(enter_distance)) / max(float(enter_distance), 1.0e-6)
+    return _short_goal_stop_phase_gate(env, dtype=drift.dtype) * drift
+
+
+def failure_termination_penalty(
+    env: ManagerBasedRLEnv,
+    excluded_terms: tuple[str, ...] = ("time_out", "stopped_goal_reached"),
+) -> torch.Tensor:
+    """Return one only for undesired termination terms, excluding timeout and success."""
+
+    failed = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    active_terms = tuple(getattr(env.termination_manager, "active_terms", ()))
+    term_dones = getattr(env.termination_manager, "_term_dones", None)
+    if term_dones is None:
+        return failed.to(torch.float32)
+    excluded = set(excluded_terms)
+    for term_idx, term_name in enumerate(active_terms):
+        if term_name in excluded:
+            continue
+        failed |= term_dones[:, term_idx]
+    return failed.to(torch.float32)
 
 
 def short_goal_near_stop_penalty(
@@ -560,47 +888,169 @@ def short_goal_velocity_towards_target_heading_gated(
     return active_mask * velocity_reward
 
 
-def short_goal_speed_profile_penalty(
-    env: ManagerBasedRLEnv,
-    stop_distance: float = 0.25,
-    speed_gain: float = 0.6,
-    max_speed: float = 0.8,
-    heading_deadband: float = 0.20,
-    heading_full: float = 0.60,
-    near_distance: float = 0.60,
-    yaw_rate_ref: float = 0.80,
-    yaw_component_weight: float = 0.5,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+def _short_goal_braking_desired_speed(
+    goal_distance: torch.Tensor,
+    heading_error: torch.Tensor,
+    stop_distance: float,
+    braking_acceleration: float,
+    max_speed: float,
+    heading_deadband: float,
+    heading_full: float,
+    alignment_floor: float = 0.30,
 ) -> torch.Tensor:
-    """Penalize speed above a distance/heading-gated profile and yaw near the short goal."""
+    """Return a distance-based speed envelope without allowing heading error to force zero speed."""
 
-    asset: Articulation = env.scene[asset_cfg.name]
-    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
-    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
-    yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
-
-    desired_speed = torch.clamp(
-        float(speed_gain) * (goal_distance - float(stop_distance)),
-        min=0.0,
-        max=float(max_speed),
-    )
+    remaining_distance = torch.relu(goal_distance - float(stop_distance))
+    desired_speed = torch.sqrt(2.0 * max(float(braking_acceleration), 1.0e-6) * remaining_distance)
+    desired_speed = torch.clamp(desired_speed, max=float(max_speed))
     heading_abs = torch.abs(heading_error)
     alignment_gate = torch.clamp(
         (float(heading_full) - heading_abs) / max(float(heading_full) - float(heading_deadband), 1.0e-6),
         min=0.0,
         max=1.0,
     )
-    desired_speed = desired_speed * alignment_gate
+    floor = min(max(float(alignment_floor), 0.0), 1.0)
+    return desired_speed * (floor + (1.0 - floor) * alignment_gate)
 
-    speed_excess = torch.relu(base_xy_speed - desired_speed)
-    linear_penalty = torch.square(speed_excess / max(float(max_speed), 1.0e-6))
+
+def short_goal_speed_profile_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.30,
+    braking_acceleration: float = 0.60,
+    reaction_time: float = 0.20,
+    braking_margin: float = 0.08,
+    near_distance: float = 1.0,
+    yaw_rate_ref: float = 0.80,
+    yaw_component_weight: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize only when the robot cannot stop inside the captured goal region."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    target_dir_b = target_vec_b[:, :2] / torch.clamp(goal_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_goal = torch.sum(asset.data.root_lin_vel_b[:, :2] * target_dir_b, dim=1)
+    positive_velocity = torch.relu(velocity_toward_goal)
+    yaw_rate = torch.abs(asset.data.root_ang_vel_b[:, 2])
+
+    braking_accel = max(float(braking_acceleration), 1.0e-6)
+    # The vehicle may cross the capture boundary with finite speed and brake
+    # inside the goal region. Requiring zero speed exactly at stop_distance
+    # creates the 0.30-0.60 m low-speed dead zone seen in the previous run.
+    available_braking_distance = torch.relu(goal_distance)
+    required_braking_distance = (
+        torch.square(positive_velocity) / (2.0 * braking_accel)
+        + max(float(reaction_time), 0.0) * positive_velocity
+        + max(float(braking_margin), 0.0)
+    )
+    braking_excess = torch.relu(required_braking_distance - available_braking_distance)
+    linear_penalty = torch.square(braking_excess / max(float(near_distance), 1.0e-6))
     near_gate = torch.clamp(
         (float(near_distance) - goal_distance) / max(float(near_distance) - float(stop_distance), 1.0e-6),
         min=0.0,
         max=1.0,
     )
     yaw_penalty = near_gate * torch.square(yaw_rate / max(float(yaw_rate_ref), 1.0e-6))
-    return linear_penalty + float(yaw_component_weight) * yaw_penalty
+    penalty = linear_penalty + float(yaw_component_weight) * yaw_penalty
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_cruise_underspeed_penalty(
+    env: ManagerBasedRLEnv,
+    capture_distance: float = 0.30,
+    approach_full_distance: float = 0.60,
+    cruise_full_distance: float = 1.20,
+    approach_speed: float = 0.35,
+    cruise_speed: float = 0.80,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.80,
+    alignment_floor: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize stopping outside the capture radius with a piecewise speed floor."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    target_dir_b = target_vec_b[:, :2] / torch.clamp(goal_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_goal = torch.sum(asset.data.root_lin_vel_b[:, :2] * target_dir_b, dim=1)
+
+    heading_abs = torch.abs(heading_error)
+    alignment_gate = torch.clamp(
+        (float(heading_full) - heading_abs) / max(float(heading_full) - float(heading_deadband), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    floor = min(max(float(alignment_floor), 0.0), 1.0)
+    blend = torch.clamp(
+        (goal_distance - float(approach_full_distance))
+        / max(float(cruise_full_distance) - float(approach_full_distance), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    base_reference_speed = float(approach_speed) + blend * (float(cruise_speed) - float(approach_speed))
+    reference_speed = base_reference_speed * (floor + (1.0 - floor) * alignment_gate)
+    underspeed = torch.relu(reference_speed - velocity_toward_goal)
+    outside_capture = (goal_distance > float(capture_distance)).to(underspeed.dtype)
+    penalty = outside_capture * torch.square(underspeed / max(float(cruise_speed), 1.0e-6))
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_near_goal_away_speed_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.30,
+    active_distance: float = 1.0,
+    speed_reference: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize moving away from the target near the goal, independent of drive direction."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_vec_b, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    target_dir_b = target_vec_b[:, :2] / torch.clamp(goal_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_goal = torch.sum(asset.data.root_lin_vel_b[:, :2] * target_dir_b, dim=1)
+    near_gate = torch.clamp(
+        (float(active_distance) - goal_distance)
+        / max(float(active_distance) - float(stop_distance), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    away_speed = torch.relu(-velocity_toward_goal)
+    penalty = near_gate * torch.square(away_speed / max(float(speed_reference), 1.0e-6))
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_approach_wheel_target_excess_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.25,
+    braking_acceleration: float = 0.6,
+    max_speed: float = 1.0,
+    approach_distance: float = 1.0,
+    wheel_radius: float = 0.2024,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.60,
+    action_name: str = "wheel_motor_csv",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize wheel targets that exceed the braking-profile speed in the approach region."""
+
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    desired_speed = _short_goal_braking_desired_speed(
+        goal_distance,
+        heading_error,
+        stop_distance=stop_distance,
+        braking_acceleration=braking_acceleration,
+        max_speed=max_speed,
+        heading_deadband=heading_deadband,
+        heading_full=heading_full,
+    )
+    action_term = env.action_manager.get_term(action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(action_term.velocity_target)
+    velocity_limit = max(float(getattr(action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    allowed_wheel_speed = desired_speed / max(float(wheel_radius), 1.0e-6)
+    target_excess = torch.relu(torch.abs(semantic_target) - allowed_wheel_speed.unsqueeze(1))
+    approach_gate = (goal_distance < float(approach_distance)).to(target_excess.dtype)
+    penalty = approach_gate * torch.mean(target_excess, dim=1) / velocity_limit
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
 
 
 def short_goal_heading_error_reduction(
@@ -635,7 +1085,25 @@ def short_goal_heading_error_reduction(
             start_distance=turn_gate_start_distance,
             full_distance=turn_gate_full_distance,
         )
-    return progress
+    return _short_goal_navigation_gate(env, dtype=progress.dtype) * progress
+
+
+def short_goal_heading_error_cost(
+    env: ManagerBasedRLEnv,
+    fade_start_distance: float = 0.50,
+    full_distance: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return a smooth heading cost that fades out near the position target."""
+
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    distance_gate = _short_goal_turn_distance_gate(
+        goal_distance,
+        start_distance=fade_start_distance,
+        full_distance=full_distance,
+    )
+    cost = distance_gate * (1.0 - torch.cos(heading_error))
+    return _short_goal_navigation_gate(env, dtype=cost.dtype) * cost
 
 
 def short_goal_turn_toward_goal(
@@ -660,6 +1128,52 @@ def short_goal_turn_toward_goal(
             full_distance=turn_gate_full_distance,
         )
     return reward
+
+
+def short_goal_continuous_yaw_rate_tracking_penalty(
+    env: ManagerBasedRLEnv,
+    yaw_rate_max: float = 0.45,
+    heading_deadband: float = 0.04,
+    heading_scale: float = 0.30,
+    yaw_rate_reference: float = 0.35,
+    max_normalized_error: float = 2.0,
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.50,
+    turn_gate_full_distance: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track a smooth signed yaw-rate reference that vanishes as heading error closes.
+
+    Large heading errors request a near-saturated yaw rate, intermediate errors
+    request a proportionally smaller rate, and errors inside the deadband request
+    zero yaw rate. The returned value is a non-negative penalty.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    heading_abs = torch.abs(heading_error)
+    effective_error = torch.sign(heading_error) * torch.relu(
+        heading_abs - max(float(heading_deadband), 0.0)
+    )
+    desired_yaw_rate = float(yaw_rate_max) * torch.tanh(
+        effective_error / max(float(heading_scale), 1.0e-6)
+    )
+    actual_yaw_rate = asset.data.root_ang_vel_b[:, 2]
+    normalized_error = torch.abs(actual_yaw_rate - desired_yaw_rate) / max(
+        float(yaw_rate_reference), 1.0e-6
+    )
+    normalized_error = torch.clamp(
+        normalized_error,
+        max=max(float(max_normalized_error), 0.0),
+    )
+    penalty = torch.square(normalized_error)
+    if use_turn_distance_gate:
+        penalty = penalty * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
 
 
 def _short_goal_turn_distance_gate(
@@ -707,6 +1221,151 @@ def short_goal_wheel_diff_prior_l1(
     return penalty
 
 
+def short_goal_wheel_turn_mode_prior_l1(
+    env: ManagerBasedRLEnv,
+    turn_gain: float = 0.5,
+    action_name: str = "wheel_motor_csv",
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize normalized wheel turn-mode error implied by the target heading."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    left_mean = semantic_target[:, :2].mean(dim=1) / velocity_limit
+    right_mean = semantic_target[:, 2:].mean(dim=1) / velocity_limit
+    actual_turn_mode = 0.5 * (right_mean - left_mean)
+    _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    desired_turn_mode = float(turn_gain) * torch.sin(heading_error)
+    penalty = torch.abs(actual_turn_mode - desired_turn_mode)
+    if use_turn_distance_gate:
+        penalty = penalty * _short_goal_turn_distance_gate(
+            goal_distance,
+            start_distance=turn_gate_start_distance,
+            full_distance=turn_gate_full_distance,
+        )
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def wheel_same_side_target_consistency_l1(
+    env: ManagerBasedRLEnv,
+    deadband: float = 0.0,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize excessive front/rear target disagreement while allowing a normalized deadband."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    left_diff_norm = torch.abs(semantic_target[:, 0] - semantic_target[:, 1]) / velocity_limit
+    right_diff_norm = torch.abs(semantic_target[:, 2] - semantic_target[:, 3]) / velocity_limit
+    left_excess = torch.relu(left_diff_norm - float(deadband))
+    right_excess = torch.relu(right_diff_norm - float(deadband))
+    return 0.5 * (left_excess + right_excess)
+
+
+def wheel_same_side_opposite_sign_penalty(
+    env: ManagerBasedRLEnv,
+    margin: float = 0.03,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize the normalized same-side component that can only exist under sign opposition."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    target_norm = semantic_target / velocity_limit
+
+    left_front, left_rear = target_norm[:, 0], target_norm[:, 1]
+    right_front, right_rear = target_norm[:, 2], target_norm[:, 3]
+    left_mean = 0.5 * (left_front + left_rear)
+    right_mean = 0.5 * (right_front + right_rear)
+    left_antisymmetric = 0.5 * (left_front - left_rear)
+    right_antisymmetric = 0.5 * (right_front - right_rear)
+    margin_value = max(float(margin), 0.0)
+    left_opposition = torch.relu(torch.abs(left_antisymmetric) - torch.abs(left_mean) - margin_value)
+    right_opposition = torch.relu(torch.abs(right_antisymmetric) - torch.abs(right_mean) - margin_value)
+    return 0.5 * (left_opposition + right_opposition)
+
+
+def loaded_wheel_longitudinal_slip_penalty(
+    env: ManagerBasedRLEnv,
+    wheel_radius: float = 0.2024,
+    min_contact_force: float = 20.0,
+    min_motion_speed: float = 0.20,
+    absolute_margin: float = 0.10,
+    relative_margin: float = 0.15,
+    excess_speed_reference: float = 0.50,
+    max_normalized_excess: float = 2.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "wheel_contact_forces", body_names=["w_lf", "w_lb", "w_rf", "w_rb"]
+    ),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize loaded-wheel overspeed without penalizing normal rolling or braking mismatch.
+
+    The term is zero while the wheel-surface speed stays within an absolute plus
+    speed-proportional margin above the corresponding wheel-hub forward speed.
+    Only positive wheel overspeed is penalized, so a stationary policy must still
+    be rejected by the separate progress and cruise-underspeed objectives.
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_joint_vel = _wheel_joint_vel_lf_lr_rf_rr(
+        env,
+        SceneEntityCfg("robot", joint_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
+    )
+    semantic_wheel_joint_vel = wheel_raw_to_semantic_lf_lr_rf_rr(wheel_joint_vel)
+
+    wheel_body_ids, _ = asset.find_bodies(["w_lf", "w_lb", "w_rf", "w_rb"], preserve_order=True)
+    wheel_hub_lin_vel_w = asset.data.body_lin_vel_w[:, wheel_body_ids, :]
+    root_forward_axis_b = torch.zeros((env.num_envs, 3), dtype=wheel_joint_vel.dtype, device=env.device)
+    root_forward_axis_b[:, 0] = 1.0
+    root_forward_axis_w = quat_apply(asset.data.root_quat_w, root_forward_axis_b)
+    wheel_hub_forward_speed = torch.sum(wheel_hub_lin_vel_w * root_forward_axis_w.unsqueeze(1), dim=-1)
+
+    wheel_surface_speed_abs = torch.abs(semantic_wheel_joint_vel * float(wheel_radius))
+    wheel_hub_forward_speed_abs = torch.abs(wheel_hub_forward_speed)
+    motion_scale = torch.maximum(wheel_surface_speed_abs, wheel_hub_forward_speed_abs)
+    contact_force = _wheel_contact_force_lf_lr_rf_rr(env, sensor_cfg)
+    active = (contact_force > float(min_contact_force)) & (motion_scale > float(min_motion_speed))
+
+    allowed_overspeed = max(float(absolute_margin), 0.0) + max(float(relative_margin), 0.0) * wheel_hub_forward_speed_abs
+    overspeed_excess = torch.relu(wheel_surface_speed_abs - wheel_hub_forward_speed_abs - allowed_overspeed)
+    normalized_excess = overspeed_excess / max(float(excess_speed_reference), 1.0e-6)
+    normalized_excess = torch.clamp(
+        normalized_excess,
+        max=max(float(max_normalized_excess), 0.0),
+    )
+    active_f = active.to(normalized_excess.dtype)
+    penalty = torch.sum(torch.square(normalized_excess) * active_f, dim=1) / torch.clamp(
+        active_f.sum(dim=1), min=1.0
+    )
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def wheel_target_rate_l1(
+    env: ManagerBasedRLEnv,
+    action_name: str = "wheel_motor_csv",
+) -> torch.Tensor:
+    """Penalize per-step wheel target changes in normalized target units."""
+
+    action_term = env.action_manager.get_term(action_name)
+    velocity_limit = max(float(getattr(action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    previous_target = getattr(action_term, "previous_velocity_target", None)
+    if previous_target is None:
+        return torch.zeros((env.num_envs,), dtype=action_term.velocity_target.dtype, device=env.device)
+    rate = torch.mean(torch.abs(action_term.velocity_target - previous_target), dim=1) / velocity_limit
+    # Do not penalize the abrupt target reduction needed when entering the stop phase.
+    return _short_goal_navigation_gate(env, dtype=rate.dtype) * rate
+
+
 def short_goal_forward_common_mode_penalty(
     env: ManagerBasedRLEnv,
     heading_error_threshold: float = 0.35,
@@ -734,7 +1393,7 @@ def short_goal_forward_common_mode_penalty(
             start_distance=turn_gate_start_distance,
             full_distance=turn_gate_full_distance,
         )
-    return penalty
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
 
 
 def _short_goal_signed_yaw_targets(
@@ -1396,6 +2055,23 @@ def actual_stroke_soft_limit_penalty(
     action_term = env.action_manager.get_term(action_name)
     over = torch.clamp(action_term.stroke_actual - float(limit), min=0.0)
     return torch.mean(over + 4.0 * torch.square(over), dim=1)
+
+
+def stroke_high_soft_limit_penalty(
+    env: ManagerBasedRLEnv,
+    soft_start: float = 0.55,
+    hard_reference: float = 0.60,
+    action_name: str = "leg_hydraulic",
+) -> torch.Tensor:
+    """Penalize high stroke; larger Ranger stroke lowers the body and sensor clearance."""
+
+    if float(hard_reference) <= float(soft_start):
+        raise ValueError("hard_reference must be greater than soft_start.")
+    action_term = env.action_manager.get_term(action_name)
+    scaled_excess = torch.relu(action_term.stroke_actual - float(soft_start)) / float(
+        hard_reference - soft_start
+    )
+    return torch.mean(torch.square(scaled_excess), dim=1)
 
 
 def stroke_range_penalty(

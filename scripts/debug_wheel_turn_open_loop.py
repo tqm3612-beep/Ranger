@@ -11,7 +11,7 @@ import traceback
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Open-loop Ranger wheel turn debug with velocity-limit sweep.")
-parser.add_argument("--task", type=str, default="Template-Ranger-ShortGoalTurnFlat-v0")
+parser.add_argument("--task", type=str, default="Template-Ranger-ShortGoalFlat-v0")
 parser.add_argument("--num_envs", type=int, default=1)
 parser.add_argument("--env_id", type=int, default=0)
 parser.add_argument("--duration", "--duration_s", dest="duration_s", type=float, default=5.0)

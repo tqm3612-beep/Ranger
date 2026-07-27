@@ -14,6 +14,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+from export_iteration_metrics import export_tensorboard_scalars  # isort: skip
 
 
 # add argparse arguments
@@ -26,6 +27,12 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--disable_iteration_metrics_csv",
+    action="store_true",
+    default=False,
+    help="Disable automatic TensorBoard scalar export to per-iteration CSV files.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument(
@@ -37,12 +44,30 @@ parser.add_argument(
 parser.add_argument(
     "--warm_start_mode",
     type=str,
-    choices=("actor_suspension", "actor_full"),
+    choices=(
+        "actor_suspension",
+        "actor_wheel",
+        "actor_suspension_only",
+        "actor_wheel_reset_suspension",
+        "actor_wheel_reset_final",
+        "actor_reset_heads",
+        "actor_heads",
+        "actor_full",
+    ),
     default=None,
     help=(
         "Actor warm-start mode. "
         "'actor_suspension' loads the shared encoders, actor trunk, "
         "and suspension head while keeping the wheel head random. "
+        "'actor_wheel' loads the complete actor and trains only the wheel head. "
+        "'actor_suspension_only' loads the complete actor and trains only the suspension head. "
+        "'actor_wheel_reset_suspension' loads the shared actor and wheel head, resets the suspension head, "
+        "and trains only the suspension head. "
+        "'actor_wheel_reset_final' loads the complete actor, resets only the wheel head's final Linear, "
+        "and trains only that final Linear. "
+        "'actor_reset_heads' loads only the shared encoders/trunk, resets both action heads, "
+        "and trains both action heads. "
+        "'actor_heads' loads the complete actor and trains both action heads while freezing encoders/trunk. "
         "'actor_full' loads the complete actor."
     ),
 )
@@ -150,41 +175,6 @@ def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str
     return get_checkpoint_path(log_root_path, load_run, load_checkpoint)
 
 
-def _is_forward_finetune_task(task_name: str) -> bool:
-    return task_name.split(":")[-1] in {"Template-Ranger-Forward-v0", "Template-Ranger-Forward-Visual-v0"}
-
-
-def _load_forward_finetune_weights(runner: OnPolicyRunner, checkpoint_path: str) -> None:
-    """Load only actor/critic weights for forward-stage fine-tuning and reset policy std."""
-
-    loaded_dict = torch.load(checkpoint_path, map_location=runner.device, weights_only=False)
-    model_state_dict = loaded_dict["model_state_dict"]
-    actor_critic = runner.alg.policy
-    actor_critic_state = actor_critic.state_dict()
-
-    actor_critic_keys = {
-        key: value for key, value in model_state_dict.items() if key.startswith("actor.") or key.startswith("critic.")
-    }
-    missing_actor_critic_keys = {
-        key for key in actor_critic_state.keys() if (key.startswith("actor.") or key.startswith("critic.")) and key not in actor_critic_keys
-    }
-    if missing_actor_critic_keys:
-        missing_preview = sorted(missing_actor_critic_keys)
-        raise KeyError(f"Checkpoint is missing actor/critic weights required for forward fine-tuning: {missing_preview}")
-
-    actor_critic.load_state_dict(actor_critic_keys, strict=False)
-
-    if hasattr(actor_critic, "std"):
-        actor_critic.std.data.fill_(0.5)
-    elif hasattr(actor_critic, "log_std"):
-        actor_critic.log_std.data.fill_(torch.log(torch.tensor(0.5, device=actor_critic.log_std.device)))
-    else:
-        raise AttributeError("Actor-critic policy does not expose 'std' or 'log_std' for action noise reset.")
-
-    runner.current_learning_iteration = 0
-    print("Loaded stand policy weights for forward fine-tuning; reset action std to 0.5.")
-
-
 def _reset_action_std_from_env(runner: OnPolicyRunner) -> None:
     """Optionally reset policy exploration std after checkpoint loading."""
 
@@ -286,11 +276,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        if _is_forward_finetune_task(args_cli.task):
-            _load_forward_finetune_weights(runner, resume_path)
-        else:
-            # load previously trained model
-            runner.load(resume_path)
+        runner.load(resume_path)
         _reset_action_std_from_env(runner)
     elif args_cli.warm_start_checkpoint is not None:
         warm_start_ranger_actor(
@@ -305,11 +291,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_pickle(os.path.join(log_dir, "params", "env.pkl"), env_cfg)
     dump_pickle(os.path.join(log_dir, "params", "agent.pkl"), agent_cfg)
 
-    # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-
-    # close the simulator
-    env.close()
+    # run training. Always flush and export scalar history, including on KeyboardInterrupt.
+    try:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
+    finally:
+        writer = getattr(runner, "writer", None)
+        if writer is not None and hasattr(writer, "flush"):
+            writer.flush()
+        if not args_cli.disable_iteration_metrics_csv:
+            try:
+                export_tensorboard_scalars(log_dir)
+            except Exception as error:
+                print(f"[WARN] Failed to export per-iteration CSV metrics: {error}")
+        env.close()
 
 
 if __name__ == "__main__":

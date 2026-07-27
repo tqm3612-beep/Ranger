@@ -14,7 +14,7 @@ from isaaclab.app import AppLauncher
 
 
 parser = argparse.ArgumentParser(description="Validate the rebuilt Ranger USD with a deterministic zero-action rollout.")
-parser.add_argument("--task", type=str, default="Template-Ranger-v0", help="Base task used to instantiate the scene.")
+parser.add_argument("--task", type=str, default="Template-Ranger-Debug-v0", help="Base task used to instantiate the scene.")
 parser.add_argument("--steps", type=int, default=1000, help="Number of zero-action environment steps.")
 parser.add_argument("--spawn_height", type=float, default=0.700, help="Initial base_link/root height in metres.")
 parser.add_argument("--contact_threshold", type=float, default=1.0, help="Wheel contact threshold in newtons.")

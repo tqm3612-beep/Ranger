@@ -261,6 +261,11 @@ class RangerTerrainActorCritic(ActorCritic):
         privileged_hidden_dims: list[int] = [64],
         wheel_head_hidden_dims: list[int] = [128],
         suspension_head_hidden_dims: list[int] = [128],
+        action_training_mask: list[float] | None = None,
+        action_output_mask: list[float] | None = None,
+        action_exploration_mask: list[float] | None = None,
+        initial_action_std: list[float] | None = None,
+        inactive_action_std: float = 1.0e-6,
         **kwargs: dict[str, Any],
     ) -> None:
         if kwargs:
@@ -277,6 +282,53 @@ class RangerTerrainActorCritic(ActorCritic):
         self.state_obs_group = state_obs_group
         self.privileged_obs_group = privileged_obs_group
         self.state_dependent_std = state_dependent_std
+        if inactive_action_std <= 0.0:
+            raise ValueError(f"inactive_action_std must be positive, got {inactive_action_std}.")
+
+        def _binary_mask(name: str, values: list[float] | None, default: list[float]) -> torch.Tensor:
+            mask_values = default if values is None else values
+            if len(mask_values) != num_actions:
+                raise ValueError(f"{name} must have {num_actions} entries, got {len(mask_values)}.")
+            mask = torch.tensor(mask_values, dtype=torch.float32)
+            if not torch.all((mask == 0.0) | (mask == 1.0)):
+                raise ValueError(f"{name} entries must be exactly 0.0 or 1.0.")
+            return mask
+
+        action_training_mask_tensor = _binary_mask(
+            "action_training_mask", action_training_mask, [1.0] * num_actions
+        )
+        if not torch.any(action_training_mask_tensor > 0.0):
+            raise ValueError("action_training_mask must keep at least one trainable action dimension.")
+        action_output_mask_tensor = _binary_mask(
+            "action_output_mask", action_output_mask, [1.0] * num_actions
+        )
+        action_exploration_mask_tensor = _binary_mask(
+            "action_exploration_mask", action_exploration_mask, action_training_mask_tensor.tolist()
+        )
+        if initial_action_std is None:
+            initial_action_std_tensor = init_noise_std * torch.ones(num_actions, dtype=torch.float32)
+        else:
+            if len(initial_action_std) != num_actions:
+                raise ValueError(
+                    f"initial_action_std must have {num_actions} entries, got {len(initial_action_std)}."
+                )
+            initial_action_std_tensor = torch.tensor(initial_action_std, dtype=torch.float32)
+            if torch.any(initial_action_std_tensor <= 0.0):
+                raise ValueError("initial_action_std entries must all be positive.")
+
+        self.register_buffer("_action_training_mask", action_training_mask_tensor, persistent=False)
+        self.register_buffer("_action_output_mask", action_output_mask_tensor, persistent=False)
+        self.register_buffer("_action_exploration_mask", action_exploration_mask_tensor, persistent=False)
+        self.register_buffer("_configured_initial_action_std", initial_action_std_tensor, persistent=False)
+        self._inactive_action_std = float(inactive_action_std)
+        if not torch.all(action_training_mask_tensor == 1.0) or not torch.all(action_output_mask_tensor == 1.0):
+            print(
+                "[RangerPolicy] action masks enabled: "
+                f"training={action_training_mask_tensor.tolist()} "
+                f"output={action_output_mask_tensor.tolist()} "
+                f"exploration={action_exploration_mask_tensor.tolist()} "
+                f"inactive_std={self._inactive_action_std:.1e}"
+            )
 
         self.num_actor_obs = sum(obs[group].shape[-1] for group in obs_groups["policy"])
         self.num_critic_obs = sum(obs[group].shape[-1] for group in obs_groups["critic"])
@@ -330,9 +382,9 @@ class RangerTerrainActorCritic(ActorCritic):
 
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+            self.std = nn.Parameter(self._configured_initial_action_std.clone())
         elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            self.log_std = nn.Parameter(torch.log(self._configured_initial_action_std.clone()))
         else:
             raise ValueError(
                 f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'."
@@ -357,16 +409,24 @@ class RangerTerrainActorCritic(ActorCritic):
 
     @property
     def entropy(self) -> torch.Tensor:
-        return self.distribution.entropy().sum(dim=-1)
+        entropy = self.distribution.entropy()
+        mask = self._action_training_mask.to(device=entropy.device, dtype=entropy.dtype)
+        return (entropy * mask).sum(dim=-1)
+
+    def _apply_action_output_mask(self, mean: torch.Tensor) -> torch.Tensor:
+        mask = self._action_output_mask.to(device=mean.device, dtype=mean.dtype)
+        return mean * mask
 
     def _update_distribution(self, obs: TensorDict) -> None:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        mean = self.actor(actor_obs)
+        mean = self._apply_action_output_mask(self.actor(actor_obs))
+        exploration_mask = self._action_exploration_mask.to(device=mean.device, dtype=mean.dtype)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         else:
             std = torch.exp(self.log_std).expand_as(mean)
+        std = std * exploration_mask + self._inactive_action_std * (1.0 - exploration_mask)
         self.distribution = Normal(mean, std)
 
     def act(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
@@ -379,7 +439,7 @@ class RangerTerrainActorCritic(ActorCritic):
         else:
             actor_obs = obs
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        return self.actor(actor_obs)
+        return self._apply_action_output_mask(self.actor(actor_obs))
 
     def evaluate(self, obs: TensorDict, **kwargs: dict[str, Any]) -> torch.Tensor:
         critic_obs = self.get_critic_obs(obs)
@@ -393,7 +453,9 @@ class RangerTerrainActorCritic(ActorCritic):
         return torch.cat([obs[group] for group in self.obs_groups["critic"]], dim=-1)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        return self.distribution.log_prob(actions).sum(dim=-1)
+        log_prob = self.distribution.log_prob(actions)
+        mask = self._action_training_mask.to(device=log_prob.device, dtype=log_prob.dtype)
+        return (log_prob * mask).sum(dim=-1)
 
     def update_normalization(self, obs: TensorDict) -> None:
         if self.actor_obs_normalization:

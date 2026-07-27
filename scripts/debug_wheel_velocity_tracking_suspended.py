@@ -11,7 +11,7 @@ import argparse
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Debug suspended Ranger wheel velocity tracking without policy involvement.")
-parser.add_argument("--task", type=str, default="Template-Ranger-Forward-v0", help="Name of the task.")
+parser.add_argument("--task", type=str, default="Template-Ranger-Debug-v0", help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to create.")
 parser.add_argument("--env_id", type=int, default=0, help="Environment index to print.")
 parser.add_argument("--init_height", type=float, default=1.5, help="Initial base height for the suspended test.")

@@ -485,6 +485,7 @@ def reset_short_goal_turn_target(
     distance_range: tuple[float, float] = (1.0, 1.5),
     left_heading_range_deg: tuple[float, float] = (25.0, 45.0),
     right_heading_range_deg: tuple[float, float] = (-45.0, -25.0),
+    paired_sides: bool = False,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
     """Sample a side-only short-goal target for differential turning practice."""
@@ -500,7 +501,10 @@ def reset_short_goal_turn_target(
     distance = torch.empty(num, device=env.device, dtype=torch.float32).uniform_(
         float(distance_range[0]), float(distance_range[1])
     )
-    left_mask = torch.rand((num,), device=env.device) < 0.5
+    if paired_sides:
+        left_mask = torch.remainder(env_ids, 2) == 0
+    else:
+        left_mask = torch.rand((num,), device=env.device) < 0.5
     heading = torch.empty(num, device=env.device, dtype=torch.float32)
 
     if torch.any(left_mask):
@@ -516,6 +520,67 @@ def reset_short_goal_turn_target(
             math.radians(float(right_heading_range_deg[0])),
             math.radians(float(right_heading_range_deg[1])),
         )
+
+    target_vec_b = torch.zeros((num, 3), device=env.device, dtype=torch.float32)
+    target_vec_b[:, 0] = distance * torch.cos(heading)
+    target_vec_b[:, 1] = distance * torch.sin(heading)
+    target_vec_w = math_utils.quat_apply_yaw(asset.data.root_quat_w[env_ids], target_vec_b)
+    target_pos_w[env_ids] = asset.data.root_pos_w[env_ids] + target_vec_w
+    prev_goal_distance[env_ids] = distance
+    goal_reached[env_ids] = False
+
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
+        prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
+        setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
+    prev_heading_error[env_ids] = heading
+
+
+def _sample_weighted_uniform_bands(
+    num: int,
+    bands: tuple[tuple[float, float], ...],
+    weights: tuple[float, ...],
+    device: str,
+) -> torch.Tensor:
+    """Sample uniformly inside one of several weighted scalar bands."""
+
+    if not bands:
+        raise ValueError("At least one sampling band is required.")
+    if len(weights) != len(bands):
+        raise ValueError(f"Expected {len(bands)} band weights, got {len(weights)}.")
+    bounds = torch.tensor(bands, device=device, dtype=torch.float32)
+    if torch.any(bounds[:, 1] <= bounds[:, 0]):
+        raise ValueError(f"Each sampling band must satisfy high > low, got {bands}.")
+    probabilities = torch.tensor(weights, device=device, dtype=torch.float32)
+    if torch.any(probabilities < 0.0) or float(probabilities.sum().item()) <= 0.0:
+        raise ValueError(f"Band weights must be non-negative with positive sum, got {weights}.")
+    probabilities = probabilities / probabilities.sum()
+    band_ids = torch.multinomial(probabilities, num_samples=num, replacement=True)
+    selected = bounds[band_ids]
+    return selected[:, 0] + torch.rand((num,), device=device) * (selected[:, 1] - selected[:, 0])
+
+
+def reset_short_goal_stratified_target(
+    env: ManagerBasedEnv,
+    env_ids,
+    distance_bands: tuple[tuple[float, float], ...] = ((5.0, 8.0),),
+    distance_weights: tuple[float, ...] = (1.0,),
+    heading_bands_deg: tuple[tuple[float, float], ...] = ((-45.0, -25.0), (25.0, 45.0)),
+    heading_weights: tuple[float, ...] = (0.5, 0.5),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Sample short-goal distance and heading from weighted curriculum bands."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    num = env_ids.numel()
+    distance = _sample_weighted_uniform_bands(num, distance_bands, distance_weights, env.device)
+    heading_deg = _sample_weighted_uniform_bands(num, heading_bands_deg, heading_weights, env.device)
+    heading = torch.deg2rad(heading_deg)
 
     target_vec_b = torch.zeros((num, 3), device=env.device, dtype=torch.float32)
     target_vec_b[:, 0] = distance * torch.cos(heading)
@@ -883,6 +948,11 @@ def command_observation(
     v_x_bins: tuple[tuple[float, float], ...] | None = None,
     goal_x_body: float = 0.0,
     goal_y_body: float = 0.0,
+    short_goal_encoding_mode: str = "legacy",
+    short_goal_observation_max_distance: float | None = None,
+    short_goal_near_distance_range: float = 3.0,
+    short_goal_global_distance_unit: float = 1.0,
+    short_goal_velocity_reference: float = 1.5,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Return the fixed eight-dimensional command/goal observation for actor state."""
@@ -943,11 +1013,53 @@ def command_observation(
         obs[:, 7] = torch.cos(heading_error)
     elif goal_source == "short_goal":
         target_vec_b, distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
-        obs[:, 3] = target_vec_b[:, 0]
-        obs[:, 4] = target_vec_b[:, 1]
-        obs[:, 5] = distance
-        obs[:, 6] = torch.sin(heading_error)
-        obs[:, 7] = torch.cos(heading_error)
+        stop_phase_active = getattr(env, "_short_goal_stop_phase_active", None)
+        if stop_phase_active is not None and stop_phase_active.shape == (env.num_envs,):
+            # ShortGoal does not use the three command slots; reuse slot 2 for the
+            # latched stop-phase flag without changing the observation dimension.
+            obs[:, 2] = stop_phase_active.to(obs.dtype)
+
+        encoding_mode = short_goal_encoding_mode.lower()
+        if encoding_mode == "long_term":
+            distance_safe = torch.clamp(distance, min=1.0e-6)
+            goal_direction = target_vec_b[:, :2] / distance_safe.unsqueeze(1)
+            near_range = max(float(short_goal_near_distance_range), 1.0e-6)
+            global_distance_unit = max(float(short_goal_global_distance_unit), 1.0e-6)
+            velocity_reference = max(float(short_goal_velocity_reference), 1.0e-6)
+            near_distance = torch.clamp(distance / near_range, min=0.0, max=1.0)
+            global_log_distance = torch.log2(1.0 + distance / global_distance_unit)
+
+            asset: Articulation = env.scene[asset_cfg.name]
+            velocity_toward_goal = torch.sum(asset.data.root_lin_vel_b[:, :2] * goal_direction, dim=1)
+            velocity_toward_goal = torch.clamp(
+                velocity_toward_goal / velocity_reference,
+                min=-1.0,
+                max=1.0,
+            )
+
+            # Fixed long-term encoding:
+            # [goal_dir_x, goal_dir_y, near_distance, log2(1 + distance / unit), velocity_toward_goal].
+            obs[:, 3] = goal_direction[:, 0]
+            obs[:, 4] = goal_direction[:, 1]
+            obs[:, 5] = near_distance
+            obs[:, 6] = global_log_distance
+            obs[:, 7] = velocity_toward_goal
+        elif encoding_mode == "legacy":
+            target_vec_obs = target_vec_b[:, :2]
+            distance_obs = distance
+            if short_goal_observation_max_distance is not None:
+                max_distance = max(float(short_goal_observation_max_distance), 1.0e-6)
+                radial_scale = torch.clamp(max_distance / torch.clamp(distance, min=1.0e-6), max=1.0)
+                target_vec_obs = target_vec_obs * radial_scale.unsqueeze(1)
+                distance_obs = torch.clamp(distance, max=max_distance)
+
+            obs[:, 3] = target_vec_obs[:, 0]
+            obs[:, 4] = target_vec_obs[:, 1]
+            obs[:, 5] = distance_obs
+            obs[:, 6] = torch.sin(heading_error)
+            obs[:, 7] = torch.cos(heading_error)
+        else:
+            raise ValueError(f"Unsupported short_goal_encoding_mode: {short_goal_encoding_mode}")
     elif goal_source == "fixed":
         goal_x_body_tensor = torch.full((env.num_envs,), float(goal_x_body), device=env.device)
         goal_y_body_tensor = torch.full((env.num_envs,), float(goal_y_body), device=env.device)

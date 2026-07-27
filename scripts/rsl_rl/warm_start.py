@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Iterable
 
@@ -8,8 +7,10 @@ import torch
 import torch.nn as nn
 
 
-ACTOR_SUSPENSION_MODULES = ("map_encoder", "state_encoder", "actor_trunk", "suspension_head")
-ACTOR_FULL_MODULES = ACTOR_SUSPENSION_MODULES + ("wheel_head",)
+ACTOR_SHARED_MODULES = ("map_encoder", "state_encoder", "actor_trunk")
+ACTOR_SUSPENSION_MODULES = ACTOR_SHARED_MODULES + ("suspension_head",)
+ACTOR_WHEEL_MODULES = ACTOR_SHARED_MODULES + ("wheel_head",)
+ACTOR_FULL_MODULES = ACTOR_SHARED_MODULES + ("suspension_head", "wheel_head")
 
 
 def _describe_public_attrs(obj: object) -> str:
@@ -119,42 +120,216 @@ def _load_actor_module(actor: nn.Module, model_state: dict[str, torch.Tensor], m
     return len(load_state)
 
 
-def _reset_actor_suspension_action_std(policy: nn.Module) -> str:
+def _reset_suspension_head(actor: nn.Module) -> str:
+    """Reinitialize the suspension branch with an exactly neutral initial output."""
+
+    suspension_head = getattr(actor, "suspension_head", None)
+    if suspension_head is None:
+        raise AttributeError(f"Target actor has no suspension_head. Actor type={type(actor).__name__}")
+    if not isinstance(suspension_head, nn.Module):
+        raise TypeError(f"actor.suspension_head is not an nn.Module: {type(suspension_head).__name__}")
+
+    for module in suspension_head.modules():
+        reset_parameters = getattr(module, "reset_parameters", None)
+        if callable(reset_parameters):
+            reset_parameters()
+
+    linear_layers = [module for module in suspension_head.modules() if isinstance(module, nn.Linear)]
+    if not linear_layers:
+        raise TypeError("actor.suspension_head must contain at least one nn.Linear layer.")
+    output_layer = linear_layers[-1]
+    with torch.no_grad():
+        output_layer.weight.zero_()
+        if output_layer.bias is not None:
+            output_layer.bias.zero_()
+
+    return (
+        f"reset {len(linear_layers)} linear layers; final weight/bias exactly zero "
+        f"(output_dim={output_layer.out_features})"
+    )
+
+
+def _reset_wheel_head(actor: nn.Module) -> str:
+    """Reinitialize the wheel branch with an exactly neutral initial output."""
+
+    wheel_head = getattr(actor, "wheel_head", None)
+    if wheel_head is None:
+        raise AttributeError(f"Target actor has no wheel_head. Actor type={type(actor).__name__}")
+    if not isinstance(wheel_head, nn.Module):
+        raise TypeError(f"actor.wheel_head is not an nn.Module: {type(wheel_head).__name__}")
+
+    for module in wheel_head.modules():
+        reset_parameters = getattr(module, "reset_parameters", None)
+        if callable(reset_parameters):
+            reset_parameters()
+
+    linear_layers = [module for module in wheel_head.modules() if isinstance(module, nn.Linear)]
+    if not linear_layers:
+        raise TypeError("actor.wheel_head must contain at least one nn.Linear layer.")
+    output_layer = linear_layers[-1]
+    with torch.no_grad():
+        output_layer.weight.zero_()
+        if output_layer.bias is not None:
+            output_layer.bias.zero_()
+
+    return (
+        f"reset {len(linear_layers)} linear layers; final weight/bias exactly zero "
+        f"(output_dim={output_layer.out_features})"
+    )
+
+
+def _reset_wheel_output_layer(actor: nn.Module) -> tuple[nn.Linear, str]:
+    """Reset only the final wheel-action mapping while preserving wheel hidden features."""
+
+    wheel_head = getattr(actor, "wheel_head", None)
+    if wheel_head is None:
+        raise AttributeError(f"Target actor has no wheel_head. Actor type={type(actor).__name__}")
+    if not isinstance(wheel_head, nn.Module):
+        raise TypeError(f"actor.wheel_head is not an nn.Module: {type(wheel_head).__name__}")
+
+    linear_layers = [module for module in wheel_head.modules() if isinstance(module, nn.Linear)]
+    if not linear_layers:
+        raise TypeError("actor.wheel_head must contain at least one nn.Linear layer.")
+    output_layer = linear_layers[-1]
+    with torch.no_grad():
+        output_layer.weight.zero_()
+        if output_layer.bias is not None:
+            output_layer.bias.zero_()
+
+    return (
+        output_layer,
+        f"final weight/bias exactly zero (input_dim={output_layer.in_features}, output_dim={output_layer.out_features})",
+    )
+
+
+def _reset_warm_start_action_std(policy: nn.Module) -> str:
+    """Restore the action-noise profile declared by the current runner configuration."""
+
+    configured = getattr(policy, "_configured_initial_action_std", None)
+    if configured is None:
+        configured = torch.tensor([0.15] * 4 + [0.25] * 4, dtype=torch.float32)
+    configured = configured.detach()
+    if tuple(configured.shape) != (8,):
+        raise ValueError(f"Expected 8-dim configured action std, got shape {tuple(configured.shape)}")
     if hasattr(policy, "std"):
         std = getattr(policy, "std")
         if tuple(std.shape) != (8,):
             raise ValueError(f"Expected 8-dim std for Ranger action space, got shape {tuple(std.shape)}")
         with torch.no_grad():
-            std[:4].fill_(0.30)
-            std[4:8].fill_(0.55)
-        return "std[:4]=0.30 std[4:8]=0.55"
+            std.copy_(configured.to(device=std.device, dtype=std.dtype))
+        std.requires_grad_(False)
+        return f"fixed std={configured.tolist()}"
     if hasattr(policy, "log_std"):
         log_std = getattr(policy, "log_std")
         if tuple(log_std.shape) != (8,):
             raise ValueError(f"Expected 8-dim log_std for Ranger action space, got shape {tuple(log_std.shape)}")
         with torch.no_grad():
-            log_std[:4].fill_(math.log(0.30))
-            log_std[4:8].fill_(math.log(0.55))
-        return "log_std[:4]=log(0.30) log_std[4:8]=log(0.55)"
+            log_std.copy_(torch.log(configured).to(device=log_std.device, dtype=log_std.dtype))
+        log_std.requires_grad_(False)
+        return f"fixed log_std=log({configured.tolist()})"
+    return "policy has no std/log_std; unchanged"
+
+
+def _reset_suspension_action_std(policy: nn.Module) -> str:
+    """Reset only suspension exploration dimensions from the current runner configuration."""
+
+    configured = getattr(policy, "_configured_initial_action_std", None)
+    if configured is None:
+        configured = torch.tensor([0.003] * 4 + [0.01] * 4, dtype=torch.float32)
+    configured = configured.detach()
+    if tuple(configured.shape) != (8,):
+        raise ValueError(f"Expected 8-dim configured action std, got shape {tuple(configured.shape)}")
+
+    if hasattr(policy, "std"):
+        std = getattr(policy, "std")
+        if tuple(std.shape) != (8,):
+            raise ValueError(f"Expected 8-dim std for Ranger action space, got shape {tuple(std.shape)}")
+        with torch.no_grad():
+            std[:4].copy_(configured[:4].to(device=std.device, dtype=std.dtype))
+        std.requires_grad_(False)
+        return f"fixed suspension std={std[:4].detach().cpu().tolist()}; wheel std preserved"
+    if hasattr(policy, "log_std"):
+        log_std = getattr(policy, "log_std")
+        if tuple(log_std.shape) != (8,):
+            raise ValueError(f"Expected 8-dim log_std for Ranger action space, got shape {tuple(log_std.shape)}")
+        with torch.no_grad():
+            log_std[:4].copy_(torch.log(configured[:4]).to(device=log_std.device, dtype=log_std.dtype))
+        log_std.requires_grad_(False)
+        return f"fixed suspension log_std=log({configured[:4].tolist()}); wheel log_std preserved"
     return "policy has no std/log_std; unchanged"
 
 
 def warm_start_ranger_actor(runner, checkpoint_path: str | Path, mode: str) -> None:
-    if mode not in {"actor_suspension", "actor_full"}:
-        raise ValueError(f"Unsupported warm-start mode: {mode!r}. Expected 'actor_suspension' or 'actor_full'.")
+    valid_modes = {
+        "actor_suspension",
+        "actor_wheel",
+        "actor_suspension_only",
+        "actor_wheel_reset_suspension",
+        "actor_wheel_reset_final",
+        "actor_reset_heads",
+        "actor_heads",
+        "actor_full",
+    }
+    if mode not in valid_modes:
+        raise ValueError(
+            f"Unsupported warm-start mode: {mode!r}. Expected one of {sorted(valid_modes)}."
+        )
 
     actor = get_ranger_actor(runner)
     policy = _get_ranger_policy(runner)
     checkpoint, model_state = _load_checkpoint_model_state(checkpoint_path)
-    modules = ACTOR_SUSPENSION_MODULES if mode == "actor_suspension" else ACTOR_FULL_MODULES
+    if mode == "actor_suspension":
+        modules = ACTOR_SUSPENSION_MODULES
+    elif mode == "actor_wheel_reset_suspension":
+        modules = ACTOR_WHEEL_MODULES
+    elif mode == "actor_reset_heads":
+        modules = ACTOR_SHARED_MODULES
+    else:
+        # actor_wheel also loads the complete actor so the existing suspension branch
+        # remains available for later staged reintroduction.
+        modules = ACTOR_FULL_MODULES
     _validate_no_forbidden_loaded_keys(model_state, modules)
 
     loaded_counts: dict[str, int] = {}
     for module_name in modules:
         loaded_counts[module_name] = _load_actor_module(actor, model_state, module_name)
+    suspension_reset_msg = None
+    wheel_reset_msg = None
+    wheel_output_layer = None
+    if mode == "actor_wheel_reset_suspension":
+        suspension_reset_msg = _reset_suspension_head(actor)
+    elif mode == "actor_reset_heads":
+        suspension_reset_msg = _reset_suspension_head(actor)
+        wheel_reset_msg = _reset_wheel_head(actor)
+    elif mode == "actor_wheel_reset_final":
+        wheel_output_layer, wheel_reset_msg = _reset_wheel_output_layer(actor)
 
     for parameter in actor.parameters():
         parameter.requires_grad = True
+    if mode in {
+        "actor_wheel",
+        "actor_suspension_only",
+        "actor_wheel_reset_suspension",
+        "actor_wheel_reset_final",
+        "actor_reset_heads",
+        "actor_heads",
+    }:
+        for parameter in actor.parameters():
+            parameter.requires_grad = False
+    if mode == "actor_wheel":
+        for parameter in actor.wheel_head.parameters():
+            parameter.requires_grad = True
+    elif mode in {"actor_suspension_only", "actor_wheel_reset_suspension"}:
+        for parameter in actor.suspension_head.parameters():
+            parameter.requires_grad = True
+    elif mode == "actor_wheel_reset_final":
+        assert wheel_output_layer is not None
+        for parameter in wheel_output_layer.parameters():
+            parameter.requires_grad = True
+    elif mode in {"actor_reset_heads", "actor_heads"}:
+        for head in (actor.suspension_head, actor.wheel_head):
+            for parameter in head.parameters():
+                parameter.requires_grad = True
 
     runner.current_learning_iteration = 0
 
@@ -166,14 +341,102 @@ def warm_start_ranger_actor(runner, checkpoint_path: str | Path, mode: str) -> N
         for module_name in modules:
             print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
         print("[WarmStart] random: actor.wheel_head")
-        std_msg = _reset_actor_suspension_action_std(policy)
+        std_msg = _reset_warm_start_action_std(policy)
+    elif mode == "actor_wheel_reset_suspension":
+        print("[WarmStart] loaded: navigation encoders/trunk + wheel head")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print(f"[WarmStart] reset: actor.suspension_head ({suspension_reset_msg})")
+        print("[WarmStart] trainable: actor.suspension_head only")
+        print("[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk/wheel_head")
+        std_msg = _reset_suspension_action_std(policy)
+    elif mode == "actor_wheel_reset_final":
+        print("[WarmStart] loaded: complete actor")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print(f"[WarmStart] reset: actor.wheel_head final Linear ({wheel_reset_msg})")
+        print("[WarmStart] trainable: actor.wheel_head final Linear only")
+        print(
+            "[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk/"
+            "suspension_head/wheel_head hidden layers"
+        )
+        std_msg = _reset_warm_start_action_std(policy)
+    elif mode == "actor_reset_heads":
+        print("[WarmStart] loaded: navigation encoders/trunk only")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print(f"[WarmStart] reset: actor.suspension_head ({suspension_reset_msg})")
+        print(f"[WarmStart] reset: actor.wheel_head ({wheel_reset_msg})")
+        print("[WarmStart] trainable: actor.suspension_head + actor.wheel_head")
+        print("[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk")
+        std_msg = _reset_warm_start_action_std(policy)
+    elif mode == "actor_wheel":
+        print("[WarmStart] loaded: complete actor")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print("[WarmStart] trainable: actor.wheel_head only")
+        print("[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk/suspension_head")
+        std_msg = _reset_warm_start_action_std(policy)
+    elif mode == "actor_suspension_only":
+        print("[WarmStart] loaded: complete actor")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print("[WarmStart] trainable: actor.suspension_head only")
+        print("[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk/wheel_head")
+        std_msg = _reset_warm_start_action_std(policy)
+    elif mode == "actor_heads":
+        print("[WarmStart] loaded: complete actor")
+        for module_name in modules:
+            print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+        print("[WarmStart] trainable: actor.suspension_head + actor.wheel_head")
+        print("[WarmStart] frozen and preserved: actor.map_encoder/state_encoder/actor_trunk")
+        std_msg = _reset_warm_start_action_std(policy)
     else:
         print("[WarmStart] loaded: complete actor")
         for module_name in modules:
             print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
-        std_msg = "kept freshly initialized policy std/log_std"
+        std_msg = _reset_warm_start_action_std(policy)
     print("[WarmStart] new: critic")
     print("[WarmStart] new: optimizer")
     print(f"[WarmStart] new: action std ({std_msg})")
     print("[WarmStart] iteration: 0")
-    print(f"[WarmStart] all actor parameters trainable: {all(parameter.requires_grad for parameter in actor.parameters())}")
+    trainable_names = [name for name, parameter in actor.named_parameters() if parameter.requires_grad]
+    frozen_names = [name for name, parameter in actor.named_parameters() if not parameter.requires_grad]
+    if mode == "actor_wheel_reset_suspension":
+        expected_trainable_names = {
+            f"suspension_head.{name}" for name, _ in actor.suspension_head.named_parameters()
+        }
+        if set(trainable_names) != expected_trainable_names:
+            raise RuntimeError(
+                "Reset-suspension warm start exposed an unexpected actor parameter set. "
+                f"Expected={sorted(expected_trainable_names)}, actual={sorted(trainable_names)}"
+            )
+        print("[WarmStart] validated: only actor.suspension_head is trainable")
+    elif mode == "actor_reset_heads":
+        expected_trainable_names = {
+            f"suspension_head.{name}" for name, _ in actor.suspension_head.named_parameters()
+        } | {
+            f"wheel_head.{name}" for name, _ in actor.wheel_head.named_parameters()
+        }
+        if set(trainable_names) != expected_trainable_names:
+            raise RuntimeError(
+                "Reset-heads warm start exposed an unexpected actor parameter set. "
+                f"Expected={sorted(expected_trainable_names)}, actual={sorted(trainable_names)}"
+            )
+        print("[WarmStart] validated: only actor.suspension_head and actor.wheel_head are trainable")
+    elif mode == "actor_wheel_reset_final":
+        assert wheel_output_layer is not None
+        output_parameter_ids = {id(parameter) for parameter in wheel_output_layer.parameters()}
+        expected_trainable_names = {
+            name for name, parameter in actor.named_parameters() if id(parameter) in output_parameter_ids
+        }
+        if set(trainable_names) != expected_trainable_names:
+            raise RuntimeError(
+                "Reset-wheel-final warm start exposed an unexpected actor parameter set. "
+                f"Expected={sorted(expected_trainable_names)}, actual={sorted(trainable_names)}"
+            )
+        print("[WarmStart] validated: only actor.wheel_head final Linear is trainable")
+    print(f"[WarmStart] trainable actor parameter tensors: {len(trainable_names)}")
+    print(f"[WarmStart] frozen actor parameter tensors: {len(frozen_names)}")
+    if frozen_names:
+        print(f"[WarmStart] frozen actor parameters: {frozen_names}")

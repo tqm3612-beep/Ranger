@@ -29,6 +29,11 @@ class RangerTerrainActorCriticCfg(RslRlPpoActorCriticCfg):
     privileged_hidden_dims: list[int] = [64]
     wheel_head_hidden_dims: list[int] = [128]
     suspension_head_hidden_dims: list[int] = [128]
+    action_training_mask: list[float] | None = None
+    action_output_mask: list[float] | None = None
+    action_exploration_mask: list[float] | None = None
+    initial_action_std: list[float] | None = None
+    inactive_action_std: float = 1.0e-6
 
 
 @configclass
@@ -70,6 +75,154 @@ class StandPPORunnerCfg(PPORunnerCfg):
 
 @configclass
 class ShortGoalFlatPPORunnerCfg(PPORunnerCfg):
+    """悬架车轮完全参与"""
     policy = RangerTerrainActorCriticCfg(
         init_noise_std=0.5,
     )
+
+    def __post_init__(self) -> None:
+        post_init = getattr(super(), "__post_init__", None)
+        if post_init is not None:
+            post_init()
+        self.algorithm.learning_rate = 3.0e-4
+        self.algorithm.entropy_coef = 1.0e-3
+
+
+@configclass
+class ShortGoalFlatV2PPORunnerCfg(ShortGoalFlatPPORunnerCfg):
+    """Wheel-only PPO loss while preserving the Ranger 8-D actor/checkpoint layout."""
+    """悬架置0,不参与训练和探索，不输出动作，车轮正常"""
+
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.5,
+        action_training_mask=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.05, 0.05, 0.05, 0.05, 0.25, 0.25, 0.25, 0.25],
+        inactive_action_std=1.0e-6,
+    )
+
+
+@configclass
+class ShortGoalFlatFrozenSuspensionWheelPPORunnerCfg(ShortGoalFlatPPORunnerCfg):
+    """Execute the preserved suspension policy deterministically and train wheel actions only."""
+
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.10,
+        action_training_mask=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.04, 0.04, 0.04, 0.04, 0.10, 0.10, 0.10, 0.10],
+        inactive_action_std=1.0e-6,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.learning_rate = 1.0e-4
+        self.algorithm.entropy_coef = 5.0e-4
+
+
+@configclass
+class ShortGoalFlatLimitedSuspensionPPORunnerCfg(ShortGoalFlatPPORunnerCfg):
+    """Train only the suspension dimensions while executing a deterministic wheel policy."""
+    """只训练悬架，车轮执行确定性策略，只执行5%悬架动作"""
+
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.05,
+        action_training_mask=[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+        initial_action_std=[0.05, 0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.10],
+        inactive_action_std=1.0e-6,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.learning_rate = 1.0e-4
+        self.algorithm.entropy_coef = 5.0e-4
+
+
+@configclass
+class ShortGoalFlatLimitedJointPPORunnerCfg(ShortGoalFlatPPORunnerCfg):
+    """Low-noise limited joint fine-tuning of both Ranger action heads."""
+    """悬架和车轮都输出动作并探索，悬架只执行5%动作"""
+
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.10,
+        action_training_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.04, 0.04, 0.04, 0.04, 0.10, 0.10, 0.10, 0.10],
+        inactive_action_std=1.0e-6,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.learning_rate = 7.5e-5
+        self.algorithm.entropy_coef = 5.0e-4
+
+
+@configclass
+class ShortGoalFlatV7PPORunnerCfg(ShortGoalFlatPPORunnerCfg):
+    """Stage V7: low-noise full-authority fine-tuning of both Ranger action heads."""
+
+    max_iterations = 150
+    save_interval = 25
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.05,
+        action_training_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.005, 0.005, 0.005, 0.005, 0.05, 0.05, 0.05, 0.05],
+        inactive_action_std=1.0e-6,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.learning_rate = 5.0e-5
+        self.algorithm.entropy_coef = 1.0e-4
+
+
+@configclass
+class ShortGoalFlatV8PPORunnerCfg(ShortGoalFlatV7PPORunnerCfg):
+    """Stage V8: fine-tune both action heads against the balanced-stop success gate."""
+
+    max_iterations = 500
+    save_interval = 25
+
+
+@configclass
+class ShortGoalFlatV9PPORunnerCfg(ShortGoalFlatV7PPORunnerCfg):
+    """Stage V9: jointly fine-tune both action heads for policy-controlled balanced stopping."""
+
+    max_iterations = 500
+    save_interval = 25
+    policy = RangerTerrainActorCriticCfg(
+        init_noise_std=0.01,
+        action_training_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.003, 0.003, 0.003, 0.003, 0.01, 0.01, 0.01, 0.01],
+        inactive_action_std=1.0e-6,
+    )
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.learning_rate = 1.0e-5
+        self.algorithm.entropy_coef = 1.0e-4
+
+
+@configclass
+class ShortGoalFlatV10PPORunnerCfg(ShortGoalFlatV9PPORunnerCfg):
+    """Stage V10: low-noise adaptation to 0.50 m capture with a precision bonus."""
+
+    max_iterations = 300
+    save_interval = 25
+
+
+@configclass
+class ShortGoalFlatV11PPORunnerCfg(ShortGoalFlatV10PPORunnerCfg):
+    """Stage V11: jointly adapt both actor heads for policy-controlled braking."""
+
+    max_iterations = 200
+    save_interval = 25

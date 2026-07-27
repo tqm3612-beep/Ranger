@@ -57,6 +57,7 @@ class WheelMotorCSVAction(ActionTerm):
         self._raw_actions = torch.zeros(self.num_envs, self.action_dim, device=self.device)
         self._processed_actions = torch.zeros_like(self._raw_actions)
         self._velocity_target = torch.zeros_like(self._raw_actions)
+        self._previous_velocity_target = torch.zeros_like(self._raw_actions)
         self._wheel_forward_sign = torch.tensor(
             [-1.0, -1.0, 1.0, 1.0],
             device=self._raw_actions.device,
@@ -120,6 +121,11 @@ class WheelMotorCSVAction(ActionTerm):
         return self._velocity_target
 
     @property
+    def previous_velocity_target(self) -> torch.Tensor:
+        """Velocity target from the previous policy step."""
+        return self._previous_velocity_target
+
+    @property
     def torque_actual(self) -> torch.Tensor:
         """Deprecated debug tensor retained for compatibility; always zero."""
         return self._torque_actual
@@ -137,11 +143,13 @@ class WheelMotorCSVAction(ActionTerm):
         if self._clip is not None:
             self._raw_actions[:] = torch.clamp(self._raw_actions, min=self._clip[:, :, 0], max=self._clip[:, :, 1])
 
+        self._previous_velocity_target[:] = self._velocity_target
+
+        # Preserve the policy's four independent wheel commands in raw joint order
+        # [w_lb, w_lf, w_rf, w_rb]. The sign tensor converts them to a common
+        # semantic forward convention before sending per-joint velocity targets.
         raw_wheel_actions = torch.clamp(self._raw_actions, min=-1.0, max=1.0)
-        left_cmd = raw_wheel_actions[:, 0:2].mean(dim=1, keepdim=True)
-        right_cmd = raw_wheel_actions[:, 2:4].mean(dim=1, keepdim=True)
-        semantic_wheel_cmd = torch.cat([left_cmd, left_cmd, right_cmd, right_cmd], dim=1)
-        velocity_des = semantic_wheel_cmd * self._velocity_limit * self._wheel_forward_sign
+        velocity_des = raw_wheel_actions * self._velocity_limit * self._wheel_forward_sign
         if self._command_time_constant > 0.0:
             alpha = self._env.step_dt / (self._command_time_constant + self._env.step_dt)
             velocity_cmd = self._velocity_target + alpha * (velocity_des - self._velocity_target)
@@ -188,10 +196,12 @@ class WheelMotorCSVAction(ActionTerm):
         self._validate_per_env_buffer("_raw_actions", self._raw_actions, env_ids)
         self._validate_per_env_buffer("_processed_actions", self._processed_actions, env_ids)
         self._validate_per_env_buffer("_velocity_target", self._velocity_target, env_ids)
+        self._validate_per_env_buffer("_previous_velocity_target", self._previous_velocity_target, env_ids)
         self._validate_per_env_buffer("_torque_actual", self._torque_actual, env_ids)
         self._raw_actions[env_ids, :] = 0.0
         self._processed_actions[env_ids, :] = 0.0
         self._velocity_target[env_ids, :] = 0.0
+        self._previous_velocity_target[env_ids, :] = 0.0
         self._torque_actual[env_ids, :] = 0.0
 
 

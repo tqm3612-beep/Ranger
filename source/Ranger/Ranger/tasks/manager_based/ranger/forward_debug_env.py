@@ -275,6 +275,18 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._short_goal_stop_phase_active = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         self._short_goal_stop_phase_stable_steps = torch.zeros((self.num_envs,), dtype=torch.long, device=self.device)
         self._short_goal_initial_side_sign = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._short_goal_path_length_m = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._short_goal_prev_root_xy = robot.data.root_pos_w[:, :2].detach().clone()
+        self._short_goal_initial_goal_distance_m = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._short_goal_min_goal_distance_m = torch.full(
+            (self.num_envs,), float("inf"), dtype=torch.float32, device=self.device
+        )
+        self._short_goal_max_distance_rebound_after_min_m = torch.zeros(
+            (self.num_envs,), dtype=torch.float32, device=self.device
+        )
+        self._short_goal_last_turn_sign = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._short_goal_turn_reversal_count = torch.zeros((self.num_envs,), dtype=torch.float32, device=self.device)
+        self._short_goal_turn_reversal_deadband = 0.03
         self._short_goal_stop_phase_enter_distance = float(getattr(self.cfg, "short_goal_stop_phase_enter_distance", 0.25))
         self._short_goal_stop_success_distance = float(getattr(self.cfg, "short_goal_stop_success_distance", 0.25))
         self._short_goal_stop_max_xy_speed = float(getattr(self.cfg, "short_goal_stop_max_xy_speed", 0.15))
@@ -1027,6 +1039,11 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         )
         short_goal_metric_names = (
             "goal_distance_mean",
+            "path_length_m",
+            "path_efficiency",
+            "min_goal_distance_m",
+            "max_distance_rebound_after_min_m",
+            "turn_reversal_count",
             "progress_mean",
             "success_rate",
             "base_xy_vel_mean",
@@ -1448,6 +1465,11 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         # D-stage active metrics: compact curriculum, asymmetry, traction, and posture checks.
         short_goal_metric_names = (
             "goal_distance_mean",
+            "path_length_m",
+            "path_efficiency",
+            "min_goal_distance_m",
+            "max_distance_rebound_after_min_m",
+            "turn_reversal_count",
             "progress_mean",
             "left_goal_progress_mean",
             "right_goal_progress_mean",
@@ -3568,8 +3590,24 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
 
             self._short_goal_hydraulic_action_prev[:] = leg_action_term.raw_actions
 
+            path_length = self._short_goal_path_length_m
+            path_efficiency = torch.where(
+                path_length > 1.0e-6,
+                torch.clamp(
+                    (self._short_goal_initial_goal_distance_m - goal_distance) / torch.clamp(path_length, min=1.0e-6),
+                    min=0.0,
+                    max=1.0,
+                ),
+                torch.zeros_like(path_length),
+            )
+
             return {
                 "goal_distance_mean": goal_distance,
+                "path_length_m": path_length,
+                "path_efficiency": path_efficiency,
+                "min_goal_distance_m": self._short_goal_min_goal_distance_m,
+                "max_distance_rebound_after_min_m": self._short_goal_max_distance_rebound_after_min_m,
+                "turn_reversal_count": self._short_goal_turn_reversal_count,
                 "progress_mean": progress_mean,
                 "left_goal_progress_mean": left_goal_progress,
                 "right_goal_progress_mean": right_goal_progress,
@@ -3968,6 +4006,57 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             "raw_action_w_rb": wheel_action_term.raw_actions[:, 3],
         }
 
+    def _update_short_goal_trajectory_quality(self, active_mask: torch.Tensor | None = None) -> None:
+        """Update per-episode XY path and turn-sequence diagnostics without affecting rewards."""
+
+        if not self._is_short_goal_task:
+            return
+        if active_mask is None:
+            active_mask = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+        else:
+            active_mask = active_mask.to(device=self.device, dtype=torch.bool)
+
+        robot = self.scene["robot"]
+        current_root_xy = robot.data.root_pos_w[:, :2].detach()
+        step_distance = torch.linalg.vector_norm(current_root_xy - self._short_goal_prev_root_xy, dim=1)
+        self._short_goal_path_length_m[active_mask] += step_distance[active_mask]
+        self._short_goal_prev_root_xy[:] = current_root_xy
+
+        _, goal_distance, _ = mdp.short_goal_target_body(self)
+        uninitialized = self._short_goal_initial_goal_distance_m <= 0.0
+        if torch.any(uninitialized):
+            self._short_goal_initial_goal_distance_m[uninitialized] = goal_distance[uninitialized]
+            self._short_goal_min_goal_distance_m[uninitialized] = goal_distance[uninitialized]
+
+        updated_min = torch.minimum(self._short_goal_min_goal_distance_m, goal_distance)
+        self._short_goal_min_goal_distance_m[active_mask] = updated_min[active_mask]
+        rebound = torch.clamp(goal_distance - updated_min, min=0.0)
+        self._short_goal_max_distance_rebound_after_min_m[active_mask] = torch.maximum(
+            self._short_goal_max_distance_rebound_after_min_m[active_mask],
+            rebound[active_mask],
+        )
+
+        wheel_action_term = self.action_manager.get_term("wheel_motor_csv")
+        semantic_wheel_target = wheel_action_term.velocity_target * self._wheel_forward_sign
+        semantic_left_target = semantic_wheel_target[:, :2].mean(dim=1)
+        semantic_right_target = semantic_wheel_target[:, 2:].mean(dim=1)
+        wheel_velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+        turn_mode = 0.5 * (semantic_right_target - semantic_left_target) / wheel_velocity_limit
+        deadband = float(self._short_goal_turn_reversal_deadband)
+        current_turn_sign = torch.where(
+            turn_mode > deadband,
+            torch.ones_like(turn_mode),
+            torch.where(turn_mode < -deadband, -torch.ones_like(turn_mode), torch.zeros_like(turn_mode)),
+        )
+        significant_turn = active_mask & (current_turn_sign != 0.0)
+        reversal = (
+            significant_turn
+            & (self._short_goal_last_turn_sign != 0.0)
+            & (current_turn_sign != self._short_goal_last_turn_sign)
+        )
+        self._short_goal_turn_reversal_count[reversal] += 1.0
+        self._short_goal_last_turn_sign[significant_turn] = current_turn_sign[significant_turn]
+
     def _accumulate_forward_debug_metrics(self) -> None:
         metric_values = self._compute_forward_debug_metric_values()
         if self._is_stand_training_task:
@@ -4130,6 +4219,13 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             return
         if self._is_short_goal_task:
             goal_distance = metric_values["goal_distance_mean"]
+            episode_end_names = {
+                "path_length_m",
+                "path_efficiency",
+                "min_goal_distance_m",
+                "max_distance_rebound_after_min_m",
+                "turn_reversal_count",
+            }
             stage_masks = {
                 # Check specific prefixes before the generic far_ prefix.
                 "aligned_cruise_": metric_values["_aligned_cruise_mask"].to(torch.bool),
@@ -4142,13 +4238,17 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
                 "middle_": (goal_distance > 1.0) & (goal_distance <= 3.0),
                 "approach_": goal_distance <= 1.0,
             }
+            reset_mask = self.reset_buf.to(torch.bool)
             for name in self._forward_debug_metric_names:
                 value = metric_values[name]
-                mask = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
-                for prefix, stage_mask in stage_masks.items():
-                    if name.startswith(prefix):
-                        mask = stage_mask
-                        break
+                if name in episode_end_names:
+                    mask = reset_mask
+                else:
+                    mask = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+                    for prefix, stage_mask in stage_masks.items():
+                        if name.startswith(prefix):
+                            mask = stage_mask
+                            break
                 if torch.any(mask):
                     self._forward_debug_metric_sums[name][mask] += value[mask]
                     self._forward_debug_metric_counts_by_name[name][mask] += 1.0
@@ -4198,6 +4298,11 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         if self._is_short_goal_task and not full_stdout:
             allowlist = {
                 "Metrics/short_goal/goal_distance_mean",
+                "Metrics/short_goal/path_length_m",
+                "Metrics/short_goal/path_efficiency",
+                "Metrics/short_goal/min_goal_distance_m",
+                "Metrics/short_goal/max_distance_rebound_after_min_m",
+                "Metrics/short_goal/turn_reversal_count",
                 "Metrics/short_goal/progress_mean",
                 "Metrics/short_goal/stopped_success_rate",
                 "Metrics/short_goal/near_goal_moving_rate",
@@ -4801,6 +4906,7 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             self._reset_settle_remaining_steps[settling_mask] -= 1
         self.episode_length_buf += (~settling_mask).to(self.episode_length_buf.dtype)
         self.common_step_counter += 1
+        self._update_short_goal_trajectory_quality(active_mask=~settling_mask)
         self._update_short_goal_stop_phase()
         self.reset_buf = self.termination_manager.compute()
         self.reset_terminated = self.termination_manager.terminated
@@ -5010,8 +5116,16 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         self._short_goal_stop_phase_active[env_ids] = False
         self._short_goal_stop_phase_stable_steps[env_ids] = 0
         if self._is_short_goal_task:
-            target_vec_b, _, _ = mdp.short_goal_target_body(self)
+            target_vec_b, goal_distance, _ = mdp.short_goal_target_body(self)
+            robot = self.scene["robot"]
             self._short_goal_initial_side_sign[env_ids] = torch.sign(target_vec_b[env_ids, 1])
+            self._short_goal_path_length_m[env_ids] = 0.0
+            self._short_goal_prev_root_xy[env_ids] = robot.data.root_pos_w[env_ids, :2]
+            self._short_goal_initial_goal_distance_m[env_ids] = goal_distance[env_ids]
+            self._short_goal_min_goal_distance_m[env_ids] = goal_distance[env_ids]
+            self._short_goal_max_distance_rebound_after_min_m[env_ids] = 0.0
+            self._short_goal_last_turn_sign[env_ids] = 0.0
+            self._short_goal_turn_reversal_count[env_ids] = 0.0
         self._yaw_turn_support_executed_raw_action[env_ids] = 0.0
         self._executed_hydraulic_action_prev[env_ids] = 0.0
         if self._is_goal_heading_task:

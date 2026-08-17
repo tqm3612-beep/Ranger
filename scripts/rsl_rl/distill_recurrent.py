@@ -198,25 +198,124 @@ def _restore_distillation_optimizer(
     return True
 
 
+def _build_teacher_anchor_mask(
+    num_envs: int,
+    teacher_anchor_fraction: float,
+    *,
+    device: torch.device | str,
+    seed: int,
+) -> torch.Tensor:
+    """Create a fixed seeded split between teacher-anchor and student-rollout environments."""
+
+    fraction = float(teacher_anchor_fraction)
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"teacher_anchor_fraction must be in (0, 1), got {fraction}.")
+    teacher_count = int(round(num_envs * fraction))
+    teacher_count = max(1, min(num_envs - 1, teacher_count))
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    teacher_indices = torch.randperm(num_envs, generator=generator)[:teacher_count]
+    mask = torch.zeros(num_envs, dtype=torch.bool)
+    mask[teacher_indices] = True
+    return mask.to(device=device)
+
+
 def _select_rollout_actions(
     teacher_actions: torch.Tensor,
     student_actions: torch.Tensor,
     *,
     rollout_mode: str,
     teacher_action_blend: float,
+    teacher_anchor_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Select deterministic environment actions for teacher, student, or blended rollout."""
+    """Select deterministic environment actions for teacher, student, blended, or dual-distribution rollout."""
 
     if rollout_mode == "teacher_rollout":
         return teacher_actions
     if rollout_mode == "student_rollout":
         return student_actions.detach()
+    if rollout_mode == "dual_distribution":
+        if teacher_anchor_mask is None:
+            raise ValueError("teacher_anchor_mask is required for dual_distribution rollout.")
+        mask = teacher_anchor_mask.to(device=teacher_actions.device, dtype=torch.bool).reshape(-1)
+        if mask.shape[0] != teacher_actions.shape[0]:
+            raise ValueError(
+                f"teacher_anchor_mask must have {teacher_actions.shape[0]} entries, got {mask.shape[0]}."
+            )
+        return torch.where(mask.unsqueeze(-1), teacher_actions, student_actions.detach())
     if rollout_mode != "blended_rollout":
         raise ValueError(f"Unsupported rollout_mode: {rollout_mode!r}")
     blend = float(teacher_action_blend)
     if not 0.0 <= blend <= 1.0:
         raise ValueError(f"teacher_action_blend must be in [0, 1], got {blend}.")
     return blend * teacher_actions + (1.0 - blend) * student_actions.detach()
+
+
+def _masked_distillation_losses(
+    student_actions: torch.Tensor,
+    teacher_actions: torch.Tensor,
+    stop_phase_mask: torch.Tensor,
+    env_mask: torch.Tensor,
+    *,
+    suspension_loss_weight: float,
+    wheel_loss_weight: float,
+    stop_phase_wheel_weight: float,
+    student_features: torch.Tensor | None,
+    teacher_features: torch.Tensor | None,
+    feature_loss_weight: float,
+) -> dict[str, torch.Tensor]:
+    """Compute the standard distillation loss on one selected environment group."""
+
+    mask = env_mask.to(device=student_actions.device, dtype=torch.bool).reshape(-1)
+    if mask.shape[0] != student_actions.shape[0] or not torch.any(mask):
+        raise ValueError("env_mask must select at least one environment from the current batch.")
+    selected_student_features = None if student_features is None else student_features[mask]
+    selected_teacher_features = None if teacher_features is None else teacher_features[mask]
+    return compute_distillation_losses(
+        student_actions[mask],
+        teacher_actions[mask],
+        stop_phase_mask.to(device=student_actions.device, dtype=torch.bool).reshape(-1)[mask],
+        suspension_loss_weight=float(suspension_loss_weight),
+        wheel_loss_weight=float(wheel_loss_weight),
+        stop_phase_wheel_weight=float(stop_phase_wheel_weight),
+        student_features=selected_student_features,
+        teacher_features=selected_teacher_features,
+        feature_loss_weight=float(feature_loss_weight),
+    )
+
+
+def _group_action_diagnostics(
+    student_actions: torch.Tensor,
+    teacher_actions: torch.Tensor,
+    stop_phase_mask: torch.Tensor,
+    env_mask: torch.Tensor,
+    *,
+    stop_phase_wheel_weight: float,
+) -> dict[str, float]:
+    """Compute detached action diagnostics for one rollout-distribution group."""
+
+    mask = env_mask.to(device=student_actions.device, dtype=torch.bool).reshape(-1)
+    if mask.shape[0] != student_actions.shape[0] or not torch.any(mask):
+        raise ValueError("env_mask must select at least one environment from the current batch.")
+    with torch.no_grad():
+        student_group = student_actions.detach()[mask]
+        teacher_group = teacher_actions.detach()[mask]
+        stop_group = stop_phase_mask.to(device=student_actions.device, dtype=torch.bool).reshape(-1)[mask]
+        squared_error = (student_group - teacher_group).square()
+        wheel_mse_per_sample = squared_error[..., 4:].mean(dim=-1)
+        wheel_weights = torch.where(
+            stop_group,
+            torch.full_like(wheel_mse_per_sample, float(stop_phase_wheel_weight)),
+            torch.ones_like(wheel_mse_per_sample),
+        )
+        return {
+            "action_mse_total": float(squared_error.mean().item()),
+            "wheel_mse_effective": float((wheel_mse_per_sample * wheel_weights).mean().item()),
+            "action_cosine": float(
+                F.cosine_similarity(student_group, teacher_group, dim=-1, eps=1.0e-8).mean().item()
+            ),
+            "stop_phase_rate": float(stop_group.float().mean().item()),
+        }
 
 
 def _save_student_checkpoint(
@@ -268,15 +367,42 @@ def main() -> None:
     )
     parser.add_argument(
         "--rollout_mode",
-        choices=("teacher_rollout", "blended_rollout", "student_rollout"),
+        choices=("teacher_rollout", "blended_rollout", "student_rollout", "dual_distribution"),
         default="teacher_rollout",
-        help="Which deterministic action source controls the environment while the teacher labels every visited state.",
+        help=(
+            "Which deterministic action source controls the environment while the teacher labels every visited state. "
+            "dual_distribution keeps separate teacher-anchor and pure-student env trajectories in the same batch."
+        ),
     )
     parser.add_argument(
         "--teacher_action_blend",
         type=float,
         default=0.5,
         help="Teacher fraction for blended_rollout: env_action=blend*teacher+(1-blend)*student.",
+    )
+    parser.add_argument(
+        "--teacher_anchor_fraction",
+        type=float,
+        default=0.5,
+        help=(
+            "Fraction of environments controlled by 100% teacher actions in dual_distribution mode. "
+            "The remaining environments are controlled by 100% student actions."
+        ),
+    )
+    parser.add_argument(
+        "--teacher_anchor_loss_weight",
+        type=float,
+        default=0.5,
+        help=(
+            "Loss fraction assigned to teacher-anchor environments in dual_distribution mode. "
+            "The student-rollout loss receives 1-weight. This is independent of teacher_anchor_fraction."
+        ),
+    )
+    parser.add_argument(
+        "--reset_distillation_optimizer",
+        action="store_true",
+        default=False,
+        help="Do not restore Adam moments from --student_checkpoint when starting a new distillation regime.",
     )
     parser.add_argument("--num_envs", type=int, default=64)
     parser.add_argument("--distill_steps", type=int, default=10000)
@@ -318,6 +444,13 @@ def main() -> None:
         raise ValueError("--learning_rate must be positive.")
     if args_cli.bptt_steps <= 0:
         raise ValueError("--bptt_steps must be positive.")
+    if args_cli.rollout_mode == "dual_distribution":
+        if args_cli.num_envs < 2:
+            raise ValueError("dual_distribution rollout requires --num_envs >= 2.")
+        if not 0.0 < args_cli.teacher_anchor_fraction < 1.0:
+            raise ValueError("--teacher_anchor_fraction must be in (0, 1) for dual_distribution rollout.")
+        if not 0.0 <= args_cli.teacher_anchor_loss_weight <= 1.0:
+            raise ValueError("--teacher_anchor_loss_weight must be in [0, 1] for dual_distribution rollout.")
     if not 0.0 <= args_cli.stop_phase_wheel_weight <= 1.0:
         raise ValueError("--stop_phase_wheel_weight must be in [0, 1].")
     if args_cli.feature_loss_weight < 0.0:
@@ -414,16 +547,30 @@ def main() -> None:
             raise RuntimeError("Student actor has no trainable parameters.")
         distillation_optimizer = torch.optim.Adam(actor_parameters, lr=float(args_cli.learning_rate))
         if student_checkpoint_path is not None:
-            restored_optimizer = _restore_distillation_optimizer(
-                student_checkpoint_path,
-                distillation_optimizer,
-                learning_rate=float(args_cli.learning_rate),
-                map_location=student_agent_cfg.device,
-            )
-            if restored_optimizer:
-                print("[Distill] Restored distillation optimizer state; using current --learning_rate.")
+            if args_cli.reset_distillation_optimizer:
+                print("[Distill] Starting a new Adam optimizer as requested by --reset_distillation_optimizer.")
             else:
-                print("[Distill] Student checkpoint has no distillation optimizer state; starting a new Adam optimizer.")
+                restored_optimizer = _restore_distillation_optimizer(
+                    student_checkpoint_path,
+                    distillation_optimizer,
+                    learning_rate=float(args_cli.learning_rate),
+                    map_location=student_agent_cfg.device,
+                )
+                if restored_optimizer:
+                    print("[Distill] Restored distillation optimizer state; using current --learning_rate.")
+                else:
+                    print("[Distill] Student checkpoint has no distillation optimizer state; starting a new Adam optimizer.")
+
+        teacher_anchor_mask: torch.Tensor | None = None
+        if args_cli.rollout_mode == "dual_distribution":
+            teacher_anchor_mask = _build_teacher_anchor_mask(
+                int(args_cli.num_envs),
+                float(args_cli.teacher_anchor_fraction),
+                device=student_agent_cfg.device,
+                seed=int(args_cli.seed),
+            )
+            if int(teacher_anchor_mask.sum().item()) == int(args_cli.num_envs):
+                raise RuntimeError("dual_distribution requires at least one student-rollout environment.")
 
         captured_features: dict[str, torch.Tensor] = {}
 
@@ -484,6 +631,21 @@ def main() -> None:
             "grad_norm",
             *(f"grad_norm_{module_name}" for module_name in grad_module_names),
         ]
+        if args_cli.rollout_mode == "dual_distribution":
+            metric_names.extend(
+                [
+                    "teacher_anchor_loss",
+                    "student_rollout_loss",
+                    "teacher_anchor_action_mse_total",
+                    "teacher_anchor_wheel_mse_effective",
+                    "teacher_anchor_action_cosine",
+                    "teacher_anchor_stop_phase_rate",
+                    "student_rollout_action_mse_total",
+                    "student_rollout_wheel_mse_effective",
+                    "student_rollout_action_cosine",
+                    "student_rollout_stop_phase_rate",
+                ]
+            )
         metrics_file = metrics_path.open("w", newline="", encoding="utf-8")
         metrics_writer = csv.DictWriter(metrics_file, fieldnames=metric_names)
         metrics_writer.writeheader()
@@ -494,6 +656,16 @@ def main() -> None:
         print(f"[Distill] rollout_mode: {args_cli.rollout_mode}")
         if args_cli.rollout_mode == "blended_rollout":
             print(f"[Distill] teacher_action_blend: {args_cli.teacher_action_blend}")
+        elif args_cli.rollout_mode == "dual_distribution":
+            assert teacher_anchor_mask is not None
+            teacher_anchor_count = int(teacher_anchor_mask.sum().item())
+            student_rollout_count = int(args_cli.num_envs) - teacher_anchor_count
+            print(
+                f"[Distill] dual_distribution: teacher_anchor={teacher_anchor_count} "
+                f"student_rollout={student_rollout_count} fraction={args_cli.teacher_anchor_fraction:.4f} "
+                f"anchor_loss_weight={args_cli.teacher_anchor_loss_weight:.4f} "
+                f"student_loss_weight={1.0 - args_cli.teacher_anchor_loss_weight:.4f}"
+            )
         print(f"[Distill] output_dir: {output_dir}")
         print(f"[Distill] feature_loss_weight: {args_cli.feature_loss_weight}")
         print(f"[Distill] stop_phase_wheel_weight: {args_cli.stop_phase_wheel_weight}")
@@ -524,7 +696,65 @@ def main() -> None:
                     teacher_features=teacher_features,
                     feature_loss_weight=float(args_cli.feature_loss_weight),
                 )
-                pending_loss = losses["loss"] if pending_loss is None else pending_loss + losses["loss"]
+
+                dual_diagnostics: dict[str, float] = {}
+                optimized_loss = losses["loss"]
+                if args_cli.rollout_mode == "dual_distribution":
+                    assert teacher_anchor_mask is not None
+                    teacher_anchor_losses = _masked_distillation_losses(
+                        student_actions,
+                        teacher_actions,
+                        stop_mask,
+                        teacher_anchor_mask,
+                        suspension_loss_weight=float(args_cli.suspension_loss_weight),
+                        wheel_loss_weight=float(args_cli.wheel_loss_weight),
+                        stop_phase_wheel_weight=float(args_cli.stop_phase_wheel_weight),
+                        student_features=student_features,
+                        teacher_features=teacher_features,
+                        feature_loss_weight=float(args_cli.feature_loss_weight),
+                    )
+                    student_rollout_losses = _masked_distillation_losses(
+                        student_actions,
+                        teacher_actions,
+                        stop_mask,
+                        ~teacher_anchor_mask,
+                        suspension_loss_weight=float(args_cli.suspension_loss_weight),
+                        wheel_loss_weight=float(args_cli.wheel_loss_weight),
+                        stop_phase_wheel_weight=float(args_cli.stop_phase_wheel_weight),
+                        student_features=student_features,
+                        teacher_features=teacher_features,
+                        feature_loss_weight=float(args_cli.feature_loss_weight),
+                    )
+                    anchor_loss_weight = float(args_cli.teacher_anchor_loss_weight)
+                    optimized_loss = (
+                        anchor_loss_weight * teacher_anchor_losses["loss"]
+                        + (1.0 - anchor_loss_weight) * student_rollout_losses["loss"]
+                    )
+                    dual_diagnostics = {
+                        "teacher_anchor_loss": float(teacher_anchor_losses["loss"].detach().item()),
+                        "student_rollout_loss": float(student_rollout_losses["loss"].detach().item()),
+                        **{
+                            f"teacher_anchor_{name}": float(teacher_anchor_losses[name].detach().item())
+                            for name in (
+                                "action_mse_total",
+                                "wheel_mse_effective",
+                                "action_cosine",
+                                "stop_phase_rate",
+                            )
+                        },
+                        **{
+                            f"student_rollout_{name}": float(student_rollout_losses[name].detach().item())
+                            for name in (
+                                "action_mse_total",
+                                "wheel_mse_effective",
+                                "action_cosine",
+                                "stop_phase_rate",
+                            )
+                        },
+                    }
+
+                losses["loss"] = optimized_loss
+                pending_loss = optimized_loss if pending_loss is None else pending_loss + optimized_loss
                 bptt_count += 1
 
                 env_actions = _select_rollout_actions(
@@ -532,6 +762,7 @@ def main() -> None:
                     student_actions,
                     rollout_mode=args_cli.rollout_mode,
                     teacher_action_blend=float(args_cli.teacher_action_blend),
+                    teacher_anchor_mask=teacher_anchor_mask,
                 )
                 step_result = env.step(env_actions)
                 obs, _, dones, _ = _parse_step_result(step_result)
@@ -592,6 +823,7 @@ def main() -> None:
                     "hidden_reset_max_abs": reset_max,
                     "grad_norm": grad_norm_value,
                     **module_grad_norms,
+                    **dual_diagnostics,
                 }
                 metrics_writer.writerow(row)
                 window_count += 1
@@ -607,6 +839,16 @@ def main() -> None:
                         f"feature={averages['feature_mse']:.6f} cosine={averages['action_cosine']:.4f} "
                         f"hidden_max={averages['actor_hidden_abs_max']:.4f} reset_max={averages['hidden_reset_max_abs']:.2e}"
                     )
+                    if args_cli.rollout_mode == "dual_distribution":
+                        print(
+                            "[Distill] dual "
+                            f"anchor_mse={averages['teacher_anchor_action_mse_total']:.6f} "
+                            f"anchor_eff_wheel={averages['teacher_anchor_wheel_mse_effective']:.6f} "
+                            f"anchor_cos={averages['teacher_anchor_action_cosine']:.4f} "
+                            f"student_mse={averages['student_rollout_action_mse_total']:.6f} "
+                            f"student_eff_wheel={averages['student_rollout_wheel_mse_effective']:.6f} "
+                            f"student_cos={averages['student_rollout_action_cosine']:.4f}"
+                        )
                     metrics_file.flush()
                     window_sums = {name: 0.0 for name in window_sums}
                     window_count = 0
@@ -620,6 +862,9 @@ def main() -> None:
                             "distillation_step": step,
                             "rollout_mode": args_cli.rollout_mode,
                             "teacher_action_blend": float(args_cli.teacher_action_blend),
+                            "teacher_anchor_fraction": float(args_cli.teacher_anchor_fraction),
+                            "teacher_anchor_loss_weight": float(args_cli.teacher_anchor_loss_weight),
+                            "reset_distillation_optimizer": bool(args_cli.reset_distillation_optimizer),
                             "teacher_checkpoint": str(teacher_checkpoint_path),
                         },
                     )
@@ -632,6 +877,9 @@ def main() -> None:
                     "distillation_step": int(args_cli.distill_steps),
                     "rollout_mode": args_cli.rollout_mode,
                     "teacher_action_blend": float(args_cli.teacher_action_blend),
+                    "teacher_anchor_fraction": float(args_cli.teacher_anchor_fraction),
+                    "teacher_anchor_loss_weight": float(args_cli.teacher_anchor_loss_weight),
+                    "reset_distillation_optimizer": bool(args_cli.reset_distillation_optimizer),
                     "teacher_checkpoint": str(teacher_checkpoint_path),
                     "student_init": args_cli.student_init,
                     "stop_phase_wheel_weight": float(args_cli.stop_phase_wheel_weight),

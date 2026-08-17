@@ -11,6 +11,8 @@ ACTOR_SHARED_MODULES = ("map_encoder", "state_encoder", "actor_trunk")
 ACTOR_SUSPENSION_MODULES = ACTOR_SHARED_MODULES + ("suspension_head",)
 ACTOR_WHEEL_MODULES = ACTOR_SHARED_MODULES + ("wheel_head",)
 ACTOR_FULL_MODULES = ACTOR_SHARED_MODULES + ("suspension_head", "wheel_head")
+RECURRENT_V10_COMPATIBLE_MODULES = ("map_encoder", "actor_trunk", "suspension_head", "wheel_head")
+RECURRENT_NEW_ACTOR_MODULES = ("prop_encoder", "goal_encoder", "fusion_norm", "memory", "hidden_norm")
 
 
 def _describe_public_attrs(obj: object) -> str:
@@ -58,6 +60,39 @@ def _get_ranger_policy(runner) -> nn.Module:
         if policy is not None and getattr(policy, "actor", None) is get_ranger_actor(runner):
             return policy
     raise AttributeError("Could not locate policy object that owns the Ranger actor.")
+
+
+def get_ranger_recurrent_policy(runner) -> nn.Module:
+    """Return a Ranger recurrent policy without applying feedforward actor assumptions."""
+
+    alg = getattr(runner, "alg", None)
+    if alg is None:
+        raise AttributeError(f"Runner has no 'alg' attribute. Runner type={type(runner).__name__}")
+
+    diagnostics: list[str] = []
+    for path, policy in (
+        ("runner.alg.policy", getattr(alg, "policy", None)),
+        ("runner.alg.actor_critic", getattr(alg, "actor_critic", None)),
+    ):
+        if policy is None:
+            diagnostics.append(f"{path}: missing")
+            continue
+        if not getattr(policy, "is_recurrent", False):
+            diagnostics.append(f"{path}: type={type(policy).__name__}, is_recurrent=False")
+            continue
+        actor = getattr(policy, "actor", None)
+        critic = getattr(policy, "critic", None)
+        if actor is None or critic is None:
+            diagnostics.append(f"{path}: missing actor/critic")
+            continue
+        required_actor_modules = RECURRENT_V10_COMPATIBLE_MODULES + RECURRENT_NEW_ACTOR_MODULES
+        missing = [name for name in required_actor_modules if not hasattr(actor, name)]
+        if missing:
+            diagnostics.append(f"{path}.actor: type={type(actor).__name__}, missing={missing}")
+            continue
+        return policy
+
+    raise AttributeError(f"Could not locate Ranger recurrent policy. Diagnostics={diagnostics}")
 
 
 def _load_checkpoint_model_state(checkpoint_path: str | Path) -> tuple[dict, dict[str, torch.Tensor]]:
@@ -440,3 +475,49 @@ def warm_start_ranger_actor(runner, checkpoint_path: str | Path, mode: str) -> N
     print(f"[WarmStart] frozen actor parameter tensors: {len(frozen_names)}")
     if frozen_names:
         print(f"[WarmStart] frozen actor parameters: {frozen_names}")
+
+
+def warm_start_ranger_recurrent_from_feedforward(runner, checkpoint_path: str | Path) -> None:
+    """Initialize only V10-compatible recurrent actor modules from a feedforward checkpoint."""
+
+    policy = get_ranger_recurrent_policy(runner)
+    actor = policy.actor
+    checkpoint, model_state = _load_checkpoint_model_state(checkpoint_path)
+
+    if not any(key.startswith("actor.state_encoder.") for key in model_state):
+        raise ValueError(
+            "recurrent_v10_actor expects a Ranger feedforward checkpoint containing actor.state_encoder.* keys."
+        )
+    if any(key.startswith("actor.memory.") for key in model_state):
+        raise ValueError("recurrent_v10_actor received a recurrent checkpoint; use --resume for recurrent checkpoints.")
+
+    _validate_no_forbidden_loaded_keys(model_state, RECURRENT_V10_COMPATIBLE_MODULES)
+    loaded_counts: dict[str, int] = {}
+    for module_name in RECURRENT_V10_COMPATIBLE_MODULES:
+        loaded_counts[module_name] = _load_actor_module(actor, model_state, module_name)
+
+    # The recurrent representation, critic, normalization state, action std, and
+    # optimizer intentionally remain those created by the current recurrent run.
+    for parameter in policy.parameters():
+        parameter.requires_grad_(True)
+    runner.current_learning_iteration = 0
+
+    frozen_names = [name for name, parameter in policy.named_parameters() if not parameter.requires_grad]
+    if frozen_names:
+        raise RuntimeError(
+            "recurrent_v10_actor unexpectedly froze policy parameters: " + ", ".join(frozen_names)
+        )
+
+    print(f"[WarmStart] source: {Path(checkpoint_path).expanduser()}")
+    print(f"[WarmStart] checkpoint keys: {sorted(checkpoint.keys())}")
+    print(f"[WarmStart] model_state_dict tensors: {len(model_state)}")
+    print("[WarmStart] mode: recurrent_v10_actor")
+    for module_name in RECURRENT_V10_COMPATIBLE_MODULES:
+        print(f"[WarmStart] loaded: actor.{module_name} ({loaded_counts[module_name]} tensors)")
+    for module_name in RECURRENT_NEW_ACTOR_MODULES:
+        print(f"[WarmStart] new: actor.{module_name}")
+    print("[WarmStart] new: critic")
+    print("[WarmStart] preserved from recurrent config: action std / observation normalizers")
+    print("[WarmStart] new: optimizer")
+    print("[WarmStart] trainable: complete recurrent actor + critic + action std")
+    print("[WarmStart] iteration: 0")

@@ -1543,6 +1543,13 @@ class RangerShortGoalFlatV10EnvCfg(RangerShortGoalFlatV9EnvCfg):
 
 
 @configclass
+class RangerShortGoalFlatCRecurrentEnvCfg(RangerShortGoalFlatV10EnvCfg):
+    """C-stage experiment alias: identical environment/reward behavior to V10."""
+
+    pass
+
+
+@configclass
 class RangerShortGoalFlatV11EnvCfg(RangerShortGoalFlatV10EnvCfg):
     """Stage V11: policy-controlled braking inside the latched 0.50 m stop phase."""
 

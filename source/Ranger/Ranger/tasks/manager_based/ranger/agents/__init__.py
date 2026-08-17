@@ -4,5 +4,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from .rsl_rl_custom_policy import RangerTerrainActorCritic
+from .rsl_rl_recurrent_policy import RangerTerrainActorCriticRecurrent
 
-__all__ = ["RangerTerrainActorCritic"]
+__all__ = ["RangerTerrainActorCritic", "RangerTerrainActorCriticRecurrent"]

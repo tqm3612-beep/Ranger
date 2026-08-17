@@ -189,9 +189,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
 from Ranger.tasks.manager_based.ranger import mdp as ranger_mdp
-from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic
+from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic, RangerTerrainActorCriticRecurrent
 
 rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
+rsl_on_policy_runner.RangerTerrainActorCriticRecurrent = RangerTerrainActorCriticRecurrent
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -269,23 +270,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # version 2.2 and below
         policy_nn = ppo_runner.alg.actor_critic
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
-    if obs_normalizer is None:
-        obs_normalizers = getattr(ppo_runner, "obs_normalizers", None)
-        if isinstance(obs_normalizers, dict):
-            obs_normalizer = obs_normalizers.get("policy", None)
-        else:
-            obs_normalizer = obs_normalizers
-    try:
-        export_policy_as_jit(policy_nn, obs_normalizer, path=export_model_dir, filename="policy.pt")
-    except Exception as e:
-        print(f"[WARN] Failed to export JIT policy, continue play without export: {e}")
-    try:
-        export_policy_as_onnx(policy_nn, normalizer=obs_normalizer, path=export_model_dir, filename="policy.onnx")
-    except Exception as e:
-        print(f"[WARN] Failed to export ONNX policy, continue play without export: {e}")
+    # export policy to onnx/jit. Isaac Lab's generic recurrent exporter assumes
+    # the stock ActorCriticRecurrent memory_a/memory_c layout, which does not
+    # match Ranger's custom dual-branch recurrent actor. Preserve the existing
+    # feedforward export path and skip recurrent export until a dedicated
+    # stateful exporter is implemented.
+    if getattr(policy_nn, "is_recurrent", False):
+        print("[INFO] Skipping JIT/ONNX export for custom recurrent Ranger policy.")
+    else:
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        obs_normalizer = getattr(ppo_runner, "obs_normalizer", None)
+        if obs_normalizer is None:
+            obs_normalizers = getattr(ppo_runner, "obs_normalizers", None)
+            if isinstance(obs_normalizers, dict):
+                obs_normalizer = obs_normalizers.get("policy", None)
+            else:
+                obs_normalizer = obs_normalizers
+        try:
+            export_policy_as_jit(policy_nn, obs_normalizer, path=export_model_dir, filename="policy.pt")
+        except Exception as e:
+            print(f"[WARN] Failed to export JIT policy, continue play without export: {e}")
+        try:
+            export_policy_as_onnx(policy_nn, normalizer=obs_normalizer, path=export_model_dir, filename="policy.onnx")
+        except Exception as e:
+            print(f"[WARN] Failed to export ONNX policy, continue play without export: {e}")
 
     dt = env.unwrapped.step_dt
 
@@ -630,9 +638,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             step_result = env.step(actions)
             if len(step_result) == 5:
-                obs, _, _, _, step_info = step_result
+                obs, _, terminated, truncated, step_info = step_result
+                dones = terminated | truncated
             else:
-                obs, _, _, step_info = step_result
+                obs, _, dones, step_info = step_result
+
+            # RSL-RL training resets recurrent memory in PPO.process_env_step().
+            # Deterministic play bypasses that path, so clear only the hidden slots
+            # for environments whose episodes ended on this step.
+            if getattr(policy_nn, "is_recurrent", False):
+                policy_nn.reset(dones)
 
             if collect_episode_state:
                 episode_age_steps += 1

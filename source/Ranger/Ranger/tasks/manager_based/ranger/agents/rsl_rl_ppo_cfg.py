@@ -37,6 +37,27 @@ class RangerTerrainActorCriticCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
+class RangerRecurrentActorCriticCfg(RslRlPpoActorCriticCfg):
+    """RSL-RL config surface for the fixed Ranger recurrent architecture."""
+
+    class_name: str = "RangerTerrainActorCriticRecurrent"
+    actor_obs_normalization: bool = False
+    critic_obs_normalization: bool = False
+    # Required by the generic RSL-RL actor-critic config schema. These are
+    # intentionally empty: internal recurrent network widths live only in
+    # _RangerRecurrentNetworkSpec and non-empty values are rejected by policy.
+    actor_hidden_dims: list[int] = []
+    critic_hidden_dims: list[int] = []
+    activation: str = "elu"
+
+    action_training_mask: list[float] | None = None
+    action_output_mask: list[float] | None = None
+    action_exploration_mask: list[float] | None = None
+    initial_action_std: list[float] | None = None
+    inactive_action_std: float = 1.0e-6
+
+
+@configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 16
     max_iterations = 150
@@ -218,6 +239,21 @@ class ShortGoalFlatV10PPORunnerCfg(ShortGoalFlatV9PPORunnerCfg):
 
     max_iterations = 300
     save_interval = 25
+
+
+@configclass
+class ShortGoalFlatCRecurrentPPORunnerCfg(ShortGoalFlatV10PPORunnerCfg):
+    """C-stage recurrent PPO wiring with the unchanged V10 environment/reward behavior."""
+
+    num_steps_per_env = 16
+    policy = RangerRecurrentActorCriticCfg(
+        init_noise_std=0.01,
+        action_training_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        initial_action_std=[0.003, 0.003, 0.003, 0.003, 0.01, 0.01, 0.01, 0.01],
+        inactive_action_std=1.0e-6,
+    )
 
 
 @configclass

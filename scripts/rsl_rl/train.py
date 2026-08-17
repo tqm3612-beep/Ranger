@@ -53,6 +53,7 @@ parser.add_argument(
         "actor_reset_heads",
         "actor_heads",
         "actor_full",
+        "recurrent_v10_actor",
     ),
     default=None,
     help=(
@@ -68,7 +69,9 @@ parser.add_argument(
         "'actor_reset_heads' loads only the shared encoders/trunk, resets both action heads, "
         "and trains both action heads. "
         "'actor_heads' loads the complete actor and trains both action heads while freezing encoders/trunk. "
-        "'actor_full' loads the complete actor."
+        "'actor_full' loads the complete actor. "
+        "'recurrent_v10_actor' is recurrent-only and copies only the V10-compatible map encoder, actor trunk, "
+        "suspension head, and wheel head; recurrent representation/critic/std stay newly initialized."
     ),
 )
 # append RSL-RL cli arguments
@@ -155,8 +158,8 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
-from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic
-from warm_start import warm_start_ranger_actor
+from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic, RangerTerrainActorCriticRecurrent
+from warm_start import warm_start_ranger_actor, warm_start_ranger_recurrent_from_feedforward
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -164,6 +167,7 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
+rsl_on_policy_runner.RangerTerrainActorCriticRecurrent = RangerTerrainActorCriticRecurrent
 
 
 def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str) -> str:
@@ -279,11 +283,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner.load(resume_path)
         _reset_action_std_from_env(runner)
     elif args_cli.warm_start_checkpoint is not None:
-        warm_start_ranger_actor(
-            runner=runner,
-            checkpoint_path=args_cli.warm_start_checkpoint,
-            mode=args_cli.warm_start_mode,
-        )
+        is_recurrent_policy = bool(getattr(runner.alg.policy, "is_recurrent", False))
+        if is_recurrent_policy:
+            if args_cli.warm_start_mode != "recurrent_v10_actor":
+                raise ValueError(
+                    "RangerTerrainActorCriticRecurrent requires --warm_start_mode recurrent_v10_actor when "
+                    "initializing from a feedforward V10 checkpoint. Use --resume for recurrent checkpoints."
+                )
+            warm_start_ranger_recurrent_from_feedforward(
+                runner=runner,
+                checkpoint_path=args_cli.warm_start_checkpoint,
+            )
+        else:
+            if args_cli.warm_start_mode == "recurrent_v10_actor":
+                raise ValueError("--warm_start_mode recurrent_v10_actor is valid only for the recurrent Ranger task.")
+            warm_start_ranger_actor(
+                runner=runner,
+                checkpoint_path=args_cli.warm_start_checkpoint,
+                mode=args_cli.warm_start_mode,
+            )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

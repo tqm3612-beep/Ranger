@@ -63,8 +63,7 @@ _build
 # Teleop Recorded Dataset
 datasets
 
-# Tests
-tests/
+# Tests are tracked; Python/pytest caches remain ignored by the rules above.
 
 # Docker history
 .isaac-lab-docker-history

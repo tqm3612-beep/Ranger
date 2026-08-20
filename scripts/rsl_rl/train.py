@@ -42,6 +42,150 @@ parser.add_argument(
     help="Checkpoint used only to initialize actor parameters.",
 )
 parser.add_argument(
+    "--teacher_checkpoint",
+    type=str,
+    default=None,
+    help="Frozen V10 teacher checkpoint for Ranger Teacher-PPO. The teacher never controls rollout actions.",
+)
+parser.add_argument(
+    "--teacher_loss_coef",
+    type=float,
+    default=None,
+    help="Override Teacher-PPO action regularization coefficient. Leave unset to use the task config.",
+)
+parser.add_argument(
+    "--teacher_ppo_actor_loss_scale",
+    type=float,
+    default=None,
+    help="Scale actor-side PPO/entropy/teacher losses while leaving critic value loss unchanged.",
+)
+parser.add_argument(
+    "--teacher_ppo_surrogate_scale",
+    type=float,
+    default=None,
+    help="Scale only the PPO surrogate term; set to zero for auxiliary-only actor repair.",
+)
+parser.add_argument(
+    "--teacher_ppo_actor_learning_rate",
+    type=float,
+    default=None,
+    help="Optional split-optimizer actor/log-std learning rate; critic keeps the PPO learning rate.",
+)
+parser.add_argument(
+    "--teacher_ppo_actor_train_scope",
+    choices=("all", "wheel_head", "wheel_residual"),
+    default=None,
+    help="Optionally restrict actor optimization to the wheel action head during local repair.",
+)
+parser.add_argument(
+    "--teacher_ppo_large_heading_action_prior_coef",
+    type=float,
+    default=None,
+    help="Student-only large-heading wheel-action auxiliary coefficient; zero disables the repair prior.",
+)
+parser.add_argument(
+    "--teacher_ppo_lam",
+    type=float,
+    default=None,
+    help="Optional Teacher-PPO GAE lambda override. Used to probe longer-horizon actor credit assignment.",
+)
+parser.add_argument(
+    "--teacher_ppo_model_only_resume",
+    action="store_true",
+    default=False,
+    help="Load only model_state_dict from the resume checkpoint, leaving the newly configured optimizer intact.",
+)
+parser.add_argument(
+    "--teacher_ppo_critic_only",
+    action="store_true",
+    default=False,
+    help="Teacher-PPO TP0 mode: update only the recurrent critic and leave actor/std unchanged.",
+)
+parser.add_argument(
+    "--teacher_ppo_diagnostic_only",
+    action="store_true",
+    default=False,
+    help=(
+        "Teacher-PPO diagnostic mode: compute PPO/teacher gradient diagnostics and advantage bins "
+        "without applying optimizer updates."
+    ),
+)
+parser.add_argument(
+    "--teacher_ppo_diagnostic_rollout_steps",
+    type=int,
+    default=None,
+    help="Override num_steps_per_env only for Teacher-PPO diagnostic-only runs.",
+)
+parser.add_argument(
+    "--teacher_ppo_joint_probe",
+    action="store_true",
+    default=False,
+    help=(
+        "Conservative continuation mode for J-series joint actor-critic probes: 192-step rollout, "
+        "1 epoch, 4 minibatches, clip=0.1, fixed schedule, learning_rate=1e-6."
+    ),
+)
+parser.add_argument(
+    "--teacher_ppo_critic_probe",
+    action="store_true",
+    default=False,
+    help=(
+        "Conservative critic-only continuation mode: 192-step rollout, 1 epoch, 4 minibatches, "
+        "clip=0.1, fixed schedule, learning_rate=1e-6, save_interval=1."
+    ),
+)
+parser.add_argument(
+    "--teacher_ppo_long_return_critic_probe",
+    action="store_true",
+    default=False,
+    help=(
+        "Conservative actor-frozen critic continuation using lambda=1.0 long-return targets: "
+        "192-step rollout, 1 epoch, 4 minibatches, clip=0.1, fixed schedule, learning_rate=1e-6."
+    ),
+)
+parser.add_argument(
+    "--critic_relearning_actor_checkpoint",
+    type=str,
+    default=None,
+    help="Bounded recurrent actor checkpoint used only to initialize critic-relearning runs.",
+)
+parser.add_argument(
+    "--critic_relearning_v10_checkpoint",
+    type=str,
+    default=None,
+    help="Feedforward V10 checkpoint providing critic map/privileged representation weights.",
+)
+parser.add_argument(
+    "--critic_relearning_rollout_steps",
+    type=int,
+    default=192,
+    help="Rollout length for critic relearning. Used with lambda=1 long-return targets.",
+)
+parser.add_argument(
+    "--critic_relearning_perturb_burst",
+    type=int,
+    default=0,
+    help=(
+        "Number of steps per perturbation period that use local wheel-action perturbations during critic relearning. "
+        "Default 0 keeps C2-A on clean bounded-R6 rollouts; use a positive value only for the later coverage phase."
+    ),
+)
+parser.add_argument(
+    "--critic_relearning_learning_rate",
+    type=float,
+    default=None,
+    help="Optional critic-only learning-rate override for critic relearning experiments.",
+)
+parser.add_argument(
+    "--critic_relearning_joint_actor",
+    action="store_true",
+    default=False,
+    help=(
+        "Initialize from the same clean critic-relearning sources but keep actor/log-std trainable for a "
+        "conservative one-iteration joint actor-critic probe."
+    ),
+)
+parser.add_argument(
     "--warm_start_mode",
     type=str,
     choices=(
@@ -84,6 +228,47 @@ if args_cli.resume and args_cli.warm_start_checkpoint is not None:
     raise ValueError("--resume and --warm_start_checkpoint cannot be used together.")
 if args_cli.warm_start_checkpoint is not None and args_cli.warm_start_mode is None:
     raise ValueError("--warm_start_mode is required when --warm_start_checkpoint is provided.")
+if args_cli.teacher_loss_coef is not None and args_cli.teacher_loss_coef < 0.0:
+    raise ValueError("--teacher_loss_coef must be non-negative.")
+if args_cli.teacher_ppo_actor_loss_scale is not None and args_cli.teacher_ppo_actor_loss_scale <= 0.0:
+    raise ValueError("--teacher_ppo_actor_loss_scale must be positive.")
+if args_cli.teacher_ppo_surrogate_scale is not None and args_cli.teacher_ppo_surrogate_scale < 0.0:
+    raise ValueError("--teacher_ppo_surrogate_scale must be non-negative.")
+if args_cli.teacher_ppo_actor_learning_rate is not None and args_cli.teacher_ppo_actor_learning_rate <= 0.0:
+    raise ValueError("--teacher_ppo_actor_learning_rate must be positive.")
+if args_cli.teacher_ppo_actor_train_scope is not None and args_cli.teacher_ppo_actor_learning_rate is None:
+    raise ValueError("--teacher_ppo_actor_train_scope requires --teacher_ppo_actor_learning_rate.")
+if args_cli.teacher_ppo_large_heading_action_prior_coef is not None and args_cli.teacher_ppo_large_heading_action_prior_coef < 0.0:
+    raise ValueError("--teacher_ppo_large_heading_action_prior_coef must be non-negative.")
+if args_cli.teacher_ppo_lam is not None and not (0.0 <= args_cli.teacher_ppo_lam <= 1.0):
+    raise ValueError("--teacher_ppo_lam must be in [0, 1].")
+if args_cli.teacher_ppo_model_only_resume and not args_cli.resume:
+    raise ValueError("--teacher_ppo_model_only_resume requires --resume.")
+if args_cli.teacher_ppo_diagnostic_rollout_steps is not None:
+    if not args_cli.teacher_ppo_diagnostic_only:
+        raise ValueError("--teacher_ppo_diagnostic_rollout_steps requires --teacher_ppo_diagnostic_only.")
+    if args_cli.teacher_ppo_diagnostic_rollout_steps < 2:
+        raise ValueError("--teacher_ppo_diagnostic_rollout_steps must be at least 2.")
+critic_relearning_requested = (
+    args_cli.critic_relearning_actor_checkpoint is not None
+    or args_cli.critic_relearning_v10_checkpoint is not None
+)
+if critic_relearning_requested:
+    if args_cli.critic_relearning_actor_checkpoint is None or args_cli.critic_relearning_v10_checkpoint is None:
+        raise ValueError(
+            "critic relearning requires both --critic_relearning_actor_checkpoint and "
+            "--critic_relearning_v10_checkpoint."
+        )
+    if args_cli.resume or args_cli.warm_start_checkpoint is not None:
+        raise ValueError("critic relearning uses a clean initialization and cannot be combined with --resume/warm-start.")
+    if args_cli.critic_relearning_rollout_steps < 32:
+        raise ValueError("--critic_relearning_rollout_steps must be at least 32.")
+    if args_cli.critic_relearning_perturb_burst < 0:
+        raise ValueError("--critic_relearning_perturb_burst must be non-negative.")
+    if args_cli.critic_relearning_learning_rate is not None and args_cli.critic_relearning_learning_rate <= 0.0:
+        raise ValueError("--critic_relearning_learning_rate must be positive when provided.")
+elif args_cli.critic_relearning_joint_actor:
+    raise ValueError("--critic_relearning_joint_actor requires the critic-relearning actor and V10 checkpoints.")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -124,6 +309,7 @@ import gymnasium as gym
 import os
 import torch
 from datetime import datetime
+from pathlib import Path
 
 from rsl_rl.runners import OnPolicyRunner
 import rsl_rl.runners.on_policy_runner as rsl_on_policy_runner
@@ -158,8 +344,17 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import Ranger.tasks  # noqa: F401
-from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic, RangerTerrainActorCriticRecurrent
-from warm_start import warm_start_ranger_actor, warm_start_ranger_recurrent_from_feedforward
+from Ranger.tasks.manager_based.ranger.agents import (
+    RangerTeacherRegularizedPPO,
+    RangerTerrainActorCritic,
+    RangerTerrainActorCriticRecurrent,
+)
+from Ranger.tasks.manager_based.ranger.agents.rsl_rl_ppo_cfg import ShortGoalFlatV10PPORunnerCfg
+from warm_start import (
+    warm_start_ranger_actor,
+    warm_start_ranger_recurrent_critic_relearning,
+    warm_start_ranger_recurrent_from_feedforward,
+)
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -168,6 +363,7 @@ torch.backends.cudnn.benchmark = False
 
 rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
 rsl_on_policy_runner.RangerTerrainActorCriticRecurrent = RangerTerrainActorCriticRecurrent
+rsl_on_policy_runner.RangerTeacherRegularizedPPO = RangerTeacherRegularizedPPO
 
 
 def _resolve_resume_path(log_root_path: str, load_run: str, load_checkpoint: str) -> str:
@@ -209,6 +405,50 @@ def _reset_action_std_from_env(runner: OnPolicyRunner) -> None:
     print(f"[INFO] Reset action std to {reset_std_value} from RANGER_RESET_ACTION_STD.")
 
 
+def _configure_teacher_regularized_ppo(runner: OnPolicyRunner) -> None:
+    """Attach the frozen V10 teacher only when Teacher-PPO regularization is active."""
+
+    algorithm = runner.alg
+    if not isinstance(algorithm, RangerTeacherRegularizedPPO):
+        return
+    if algorithm.critic_only:
+        if algorithm.teacher_loss_coef > 0.0:
+            raise ValueError("Teacher-PPO critic_only mode requires teacher_loss_coef=0.")
+        print("[TeacherPPO] critic_only=True: actor/std are unchanged and no teacher is instantiated.")
+        return
+    if algorithm.teacher_loss_coef <= 0.0:
+        print("[TeacherPPO] teacher_loss_coef=0: running pure recurrent PPO without a teacher.")
+        return
+    if algorithm.teacher_checkpoint is None:
+        raise ValueError("Teacher-PPO with teacher_loss_coef>0 requires --teacher_checkpoint.")
+
+    teacher_checkpoint_path = Path(algorithm.teacher_checkpoint).expanduser().resolve()
+    if not teacher_checkpoint_path.is_file():
+        raise FileNotFoundError(f"Teacher checkpoint not found: {teacher_checkpoint_path}")
+
+    obs = runner.env.get_observations()
+    teacher_runner_cfg = ShortGoalFlatV10PPORunnerCfg()
+    teacher_policy_kwargs = teacher_runner_cfg.policy.to_dict()
+    teacher_policy_kwargs.pop("class_name", None)
+    teacher = RangerTerrainActorCritic(
+        obs=obs,
+        obs_groups=runner.cfg["obs_groups"],
+        num_actions=int(runner.env.num_actions),
+        **teacher_policy_kwargs,
+    ).to(runner.device)
+
+    checkpoint = torch.load(teacher_checkpoint_path, map_location=runner.device, weights_only=False)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise KeyError("Teacher checkpoint must contain model_state_dict.")
+    teacher.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    algorithm.configure_teacher(teacher)
+    print(
+        "[TeacherPPO] Frozen V10 teacher configured: "
+        f"checkpoint={teacher_checkpoint_path} coef={algorithm.teacher_loss_coef:.6g} "
+        f"stop_phase_wheel_weight={algorithm.teacher_stop_phase_wheel_weight:.3f}"
+    )
+
+
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlOnPolicyRunnerCfg):
     """Train with RSL-RL agent."""
@@ -218,6 +458,157 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+
+    teacher_ppo_selected = getattr(agent_cfg.algorithm, "class_name", "") == "RangerTeacherRegularizedPPO"
+    teacher_ppo_args_used = (
+        args_cli.teacher_checkpoint is not None
+        or args_cli.teacher_loss_coef is not None
+        or args_cli.teacher_ppo_actor_loss_scale is not None
+        or args_cli.teacher_ppo_surrogate_scale is not None
+        or args_cli.teacher_ppo_actor_learning_rate is not None
+        or args_cli.teacher_ppo_actor_train_scope is not None
+        or args_cli.teacher_ppo_large_heading_action_prior_coef is not None
+        or args_cli.teacher_ppo_lam is not None
+        or args_cli.teacher_ppo_model_only_resume
+        or args_cli.teacher_ppo_critic_only
+        or args_cli.teacher_ppo_diagnostic_only
+        or args_cli.teacher_ppo_joint_probe
+        or args_cli.teacher_ppo_critic_probe
+        or args_cli.teacher_ppo_long_return_critic_probe
+        or critic_relearning_requested
+    )
+    if teacher_ppo_args_used and not teacher_ppo_selected:
+        raise ValueError(
+            "Teacher-PPO CLI options require task Template-Ranger-ShortGoalFlat-C-Recurrent-TeacherPPO."
+        )
+    if teacher_ppo_selected:
+        if args_cli.teacher_checkpoint is not None:
+            agent_cfg.algorithm.teacher_checkpoint = str(Path(args_cli.teacher_checkpoint).expanduser().resolve())
+        if args_cli.teacher_loss_coef is not None:
+            agent_cfg.algorithm.teacher_loss_coef = float(args_cli.teacher_loss_coef)
+        if args_cli.teacher_ppo_actor_loss_scale is not None:
+            agent_cfg.algorithm.actor_loss_scale = float(args_cli.teacher_ppo_actor_loss_scale)
+        if args_cli.teacher_ppo_surrogate_scale is not None:
+            agent_cfg.algorithm.ppo_surrogate_scale = float(args_cli.teacher_ppo_surrogate_scale)
+            print(f"[TeacherPPO] PPO surrogate scale override: {agent_cfg.algorithm.ppo_surrogate_scale:g}")
+        if args_cli.teacher_ppo_actor_learning_rate is not None:
+            agent_cfg.algorithm.actor_learning_rate = float(args_cli.teacher_ppo_actor_learning_rate)
+        if args_cli.teacher_ppo_actor_train_scope is not None:
+            agent_cfg.algorithm.actor_train_scope = str(args_cli.teacher_ppo_actor_train_scope)
+            print(f"[TeacherPPO] actor train scope override: {agent_cfg.algorithm.actor_train_scope}")
+        if args_cli.teacher_ppo_large_heading_action_prior_coef is not None:
+            agent_cfg.algorithm.large_heading_action_prior_coef = float(args_cli.teacher_ppo_large_heading_action_prior_coef)
+            print(
+                "[TeacherPPO] student-only large-heading action prior coefficient: "
+                f"{agent_cfg.algorithm.large_heading_action_prior_coef:g}"
+            )
+        if args_cli.teacher_ppo_lam is not None:
+            agent_cfg.algorithm.lam = float(args_cli.teacher_ppo_lam)
+            print(f"[TeacherPPO] GAE lambda override: lam={agent_cfg.algorithm.lam:g}")
+        if args_cli.teacher_ppo_critic_only:
+            agent_cfg.algorithm.critic_only = True
+        if args_cli.teacher_ppo_diagnostic_only:
+            agent_cfg.algorithm.diagnostic_only = True
+        if args_cli.teacher_ppo_diagnostic_rollout_steps is not None:
+            agent_cfg.num_steps_per_env = int(args_cli.teacher_ppo_diagnostic_rollout_steps)
+            print(
+                "[TeacherPPO] diagnostic-only rollout steps override: "
+                f"num_steps_per_env={agent_cfg.num_steps_per_env}"
+            )
+        if args_cli.teacher_ppo_joint_probe:
+            agent_cfg.algorithm.critic_only = False
+            agent_cfg.algorithm.diagnostic_only = False
+            agent_cfg.algorithm.critic_relearning = False
+            agent_cfg.algorithm.critic_relearning_perturb_burst = 0
+            agent_cfg.algorithm.learning_rate = 1.0e-6
+            agent_cfg.algorithm.num_learning_epochs = 1
+            agent_cfg.algorithm.num_mini_batches = 4
+            agent_cfg.algorithm.clip_param = 0.1
+            agent_cfg.algorithm.schedule = "fixed"
+            agent_cfg.algorithm.use_clipped_value_loss = True
+            agent_cfg.num_steps_per_env = 192
+            agent_cfg.save_interval = 1
+            print(
+                "[JointProbe] continuation configured: num_steps_per_env=192, epochs=1, minibatches=4, "
+                "clip=0.1, learning_rate=1e-6, fixed schedule, save_interval=1"
+            )
+        if args_cli.teacher_ppo_critic_probe:
+            agent_cfg.algorithm.critic_only = True
+            agent_cfg.algorithm.diagnostic_only = False
+            agent_cfg.algorithm.critic_relearning = False
+            agent_cfg.algorithm.critic_relearning_perturb_burst = 0
+            agent_cfg.algorithm.learning_rate = 1.0e-6
+            agent_cfg.algorithm.num_learning_epochs = 1
+            agent_cfg.algorithm.num_mini_batches = 4
+            agent_cfg.algorithm.clip_param = 0.1
+            agent_cfg.algorithm.schedule = "fixed"
+            agent_cfg.algorithm.use_clipped_value_loss = True
+            agent_cfg.num_steps_per_env = 192
+            agent_cfg.save_interval = 1
+            print(
+                "[CriticProbe] continuation configured: critic_only=True, num_steps_per_env=192, epochs=1, "
+                "minibatches=4, clip=0.1, learning_rate=1e-6, fixed schedule, save_interval=1"
+            )
+        if args_cli.teacher_ppo_long_return_critic_probe:
+            agent_cfg.algorithm.critic_only = True
+            agent_cfg.algorithm.diagnostic_only = False
+            agent_cfg.algorithm.critic_relearning = True
+            agent_cfg.algorithm.critic_relearning_return_lam = 1.0
+            agent_cfg.algorithm.critic_relearning_perturb_burst = 0
+            agent_cfg.algorithm.learning_rate = (
+                float(args_cli.critic_relearning_learning_rate)
+                if args_cli.critic_relearning_learning_rate is not None
+                else 1.0e-6
+            )
+            agent_cfg.algorithm.num_learning_epochs = 1
+            agent_cfg.algorithm.num_mini_batches = 4
+            agent_cfg.algorithm.clip_param = 0.1
+            agent_cfg.algorithm.schedule = "fixed"
+            agent_cfg.algorithm.use_clipped_value_loss = True
+            agent_cfg.num_steps_per_env = 192
+            agent_cfg.save_interval = 1
+            print(
+                "[LongReturnCriticProbe] continuation configured: critic_only=True, lambda_return=1.0, "
+                "num_steps_per_env=192, epochs=1, minibatches=4, clip=0.1, "
+                f"learning_rate={agent_cfg.algorithm.learning_rate:g}, fixed schedule, save_interval=1"
+            )
+        if critic_relearning_requested:
+            agent_cfg.num_steps_per_env = int(args_cli.critic_relearning_rollout_steps)
+            if args_cli.critic_relearning_joint_actor:
+                agent_cfg.algorithm.critic_only = False
+                agent_cfg.algorithm.critic_relearning = False
+                agent_cfg.algorithm.critic_relearning_perturb_burst = 0
+                agent_cfg.algorithm.learning_rate = (
+                    float(args_cli.critic_relearning_learning_rate)
+                    if args_cli.critic_relearning_learning_rate is not None
+                    else 1.0e-6
+                )
+                agent_cfg.algorithm.num_learning_epochs = 1
+                agent_cfg.algorithm.num_mini_batches = 4
+                agent_cfg.algorithm.clip_param = 0.1
+                agent_cfg.algorithm.schedule = "fixed"
+                agent_cfg.algorithm.use_clipped_value_loss = True
+                print(
+                    "[JointProbe] configured: fresh V10-representation recurrent critic + trainable bounded actor, "
+                    f"num_steps_per_env={agent_cfg.num_steps_per_env}, epochs=1, minibatches=4, "
+                    f"clip=0.1, learning_rate={agent_cfg.algorithm.learning_rate:.3g}, "
+                    f"teacher_loss_coef={agent_cfg.algorithm.teacher_loss_coef:.6g}"
+                )
+            else:
+                agent_cfg.algorithm.critic_only = True
+                agent_cfg.algorithm.critic_relearning = True
+                agent_cfg.algorithm.critic_relearning_return_lam = 1.0
+                agent_cfg.algorithm.critic_relearning_perturb_burst = int(args_cli.critic_relearning_perturb_burst)
+                if args_cli.critic_relearning_learning_rate is not None:
+                    agent_cfg.algorithm.learning_rate = float(args_cli.critic_relearning_learning_rate)
+                agent_cfg.algorithm.teacher_loss_coef = 0.0
+                agent_cfg.algorithm.use_clipped_value_loss = False
+                print(
+                    "[CriticRelearn] configured: actor frozen, teacher disabled, unclipped critic loss, "
+                    f"num_steps_per_env={agent_cfg.num_steps_per_env}, return_lambda=1.0, "
+                    f"perturb_burst={agent_cfg.algorithm.critic_relearning_perturb_burst}, "
+                    f"learning_rate={agent_cfg.algorithm.learning_rate:.3g}"
+                )
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -280,7 +671,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        runner.load(resume_path)
+        teacher_model_only_resume = teacher_ppo_selected and (
+            bool(getattr(agent_cfg.algorithm, "diagnostic_only", False)) or args_cli.teacher_ppo_model_only_resume
+        )
+        if teacher_model_only_resume:
+            model_only_checkpoint = torch.load(resume_path, map_location=runner.device, weights_only=False)
+            if not isinstance(model_only_checkpoint, dict) or "model_state_dict" not in model_only_checkpoint:
+                raise KeyError("Teacher-PPO model-only resume requires checkpoint['model_state_dict'].")
+            runner.alg.policy.load_state_dict(model_only_checkpoint["model_state_dict"], strict=True)
+            runner.current_learning_iteration = int(model_only_checkpoint.get("iter", 0))
+            mode_name = "diagnostic-only" if bool(getattr(agent_cfg.algorithm, "diagnostic_only", False)) else "training"
+            print(
+                f"[TeacherPPO] {mode_name} model-only resume: loaded model_state_dict; "
+                "optimizer state intentionally skipped."
+            )
+        else:
+            runner.load(resume_path)
+        if args_cli.teacher_ppo_long_return_critic_probe and args_cli.critic_relearning_learning_rate is not None:
+            resumed_lr = float(args_cli.critic_relearning_learning_rate)
+            runner.alg.learning_rate = resumed_lr
+            for param_group in runner.alg.optimizer.param_groups:
+                param_group["lr"] = resumed_lr
+            print(f"[LongReturnCriticProbe] post-resume optimizer learning_rate reset to {resumed_lr:g}")
         _reset_action_std_from_env(runner)
     elif args_cli.warm_start_checkpoint is not None:
         is_recurrent_policy = bool(getattr(runner.alg.policy, "is_recurrent", False))
@@ -302,6 +714,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 checkpoint_path=args_cli.warm_start_checkpoint,
                 mode=args_cli.warm_start_mode,
             )
+    elif critic_relearning_requested:
+        warm_start_ranger_recurrent_critic_relearning(
+            runner=runner,
+            actor_checkpoint_path=args_cli.critic_relearning_actor_checkpoint,
+            v10_checkpoint_path=args_cli.critic_relearning_v10_checkpoint,
+            freeze_actor=not args_cli.critic_relearning_joint_actor,
+        )
+
+    _configure_teacher_regularized_ppo(runner)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -8,12 +8,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.distributions import Normal
 
 from rsl_rl.networks import EmpiricalNormalization, HiddenState, Memory
+from rsl_rl.utils import unpad_trajectories
 
 from .rsl_rl_custom_policy import _TerrainMapEncoder, _activation, _build_mlp
 
@@ -51,6 +54,7 @@ class _RangerRecurrentNetworkSpec:
     suspension_head_hidden_dims: tuple[int, ...] = (128,)
     suspension_action_dim: int = 4
     wheel_head_hidden_dims: tuple[int, ...] = (128,)
+    wheel_goal_residual_hidden_dims: tuple[int, ...] = (64,)
     wheel_action_dim: int = 4
 
     privileged_hidden_dims: tuple[int, ...] = (64,)
@@ -154,11 +158,19 @@ class _RangerRecurrentActor(nn.Module):
             network_spec.wheel_action_dim,
             activation,
         )
+        self.wheel_goal_residual = _build_mlp(
+            network_spec.goal_dim,
+            list(network_spec.wheel_goal_residual_hidden_dims),
+            network_spec.wheel_action_dim,
+            activation,
+        )
 
         nn.init.zeros_(self.suspension_head[-1].weight)
         nn.init.zeros_(self.suspension_head[-1].bias)
         nn.init.zeros_(self.wheel_head[-1].weight)
         nn.init.zeros_(self.wheel_head[-1].bias)
+        nn.init.zeros_(self.wheel_goal_residual[-1].weight)
+        nn.init.zeros_(self.wheel_goal_residual[-1].bias)
 
     def _encode(self, obs: torch.Tensor) -> torch.Tensor:
         prefix_shape = obs.shape[:-1]
@@ -195,7 +207,13 @@ class _RangerRecurrentActor(nn.Module):
             out = out.squeeze(0)
         out = self.hidden_norm(out)
         trunk = self.actor_trunk_activation(self.actor_trunk(out))
-        return torch.cat((self.suspension_head(trunk), self.wheel_head(trunk)), dim=-1)
+        state_obs = obs[..., : self.state_dim]
+        goal_start, goal_end = self.network_spec.goal_state_range
+        goal_obs = state_obs[..., goal_start:goal_end]
+        if masks is not None:
+            goal_obs = unpad_trajectories(goal_obs, masks)
+        wheel_output = self.wheel_head(trunk) + self.wheel_goal_residual(goal_obs)
+        return torch.cat((self.suspension_head(trunk), wheel_output), dim=-1)
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory.reset(dones)
@@ -479,19 +497,44 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'.")
 
         self.distribution = None
+        # Keep the pre-tanh Gaussian mean in a numerically invertible range. Legacy
+        # Ranger heads often emit magnitudes above 10; direct tanh would round those
+        # actions to exactly +/-1 in float32, making atanh(action) unusable for PPO
+        # likelihood ratios. A smooth cap at +/-5 leaves the executed command almost
+        # unchanged while preserving a stable one-to-one tanh transform.
+        self._latent_action_mean_limit = 5.0
         Normal.set_default_validate_args(False)
 
     @property
     def action_mean(self) -> torch.Tensor:
+        """Latent Gaussian mean used by RSL-RL storage and adaptive-KL bookkeeping."""
+
         return self.distribution.mean
 
     @property
+    def bounded_action_mean(self) -> torch.Tensor:
+        """Deterministic environment-space action corresponding to the latent Gaussian mean."""
+
+        return torch.tanh(self.distribution.mean)
+
+    @property
     def action_std(self) -> torch.Tensor:
+        """Latent Gaussian standard deviation used by RSL-RL adaptive-KL bookkeeping."""
+
         return self.distribution.stddev
+
+    @staticmethod
+    def _tanh_log_det_jacobian(latent_action: torch.Tensor) -> torch.Tensor:
+        """Stable ``log(1 - tanh(z)^2)`` for the tanh action transform."""
+
+        return 2.0 * (math.log(2.0) - latent_action - F.softplus(-2.0 * latent_action))
 
     @property
     def entropy(self) -> torch.Tensor:
-        entropy = self.distribution.entropy()
+        """Monte-Carlo entropy estimate for the tanh-squashed Gaussian policy."""
+
+        latent_sample = self.distribution.rsample()
+        entropy = self.distribution.entropy() + self._tanh_log_det_jacobian(latent_sample)
         mask = self._action_training_mask.to(device=entropy.device, dtype=entropy.dtype)
         return (entropy * mask).sum(dim=-1)
 
@@ -506,6 +549,10 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         mask = self._action_output_mask.to(device=mean.device, dtype=mean.dtype)
         return mean * mask
 
+    def _bound_latent_mean(self, raw_mean: torch.Tensor) -> torch.Tensor:
+        limit = float(self._latent_action_mean_limit)
+        return limit * torch.tanh(raw_mean / limit)
+
     def _update_distribution(
         self,
         obs: TensorDict,
@@ -514,7 +561,8 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
     ) -> None:
         actor_obs = self.get_actor_obs(obs)
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        mean = self._apply_action_output_mask(self.actor(actor_obs, masks, hidden_state))
+        raw_mean = self._apply_action_output_mask(self.actor(actor_obs, masks, hidden_state))
+        mean = self._bound_latent_mean(raw_mean)
         exploration_mask = self._action_exploration_mask.to(device=mean.device, dtype=mean.dtype)
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
@@ -531,7 +579,8 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         **kwargs: dict[str, Any],
     ) -> torch.Tensor:
         self._update_distribution(obs, masks, hidden_state)
-        return self.distribution.sample()
+        latent_action = self.distribution.sample()
+        return torch.tanh(latent_action)
 
     def act_inference(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
         if isinstance(obs, TensorDict):
@@ -539,7 +588,9 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         else:
             actor_obs = obs
         actor_obs = self.actor_obs_normalizer(actor_obs)
-        return self._apply_action_output_mask(self.actor(actor_obs))
+        raw_mean = self._apply_action_output_mask(self.actor(actor_obs))
+        latent_mean = self._bound_latent_mean(raw_mean)
+        return torch.tanh(latent_mean)
 
     def evaluate(
         self,
@@ -559,7 +610,12 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         return torch.cat([obs[group] for group in self.obs_groups["critic"]], dim=-1)
 
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
-        log_prob = self.distribution.log_prob(actions)
+        """Return log-probability of bounded actions under the tanh-squashed Gaussian."""
+
+        eps = 1.0e-6
+        bounded_actions = torch.clamp(actions, min=-1.0 + eps, max=1.0 - eps)
+        latent_actions = torch.atanh(bounded_actions)
+        log_prob = self.distribution.log_prob(latent_actions) - self._tanh_log_det_jacobian(latent_actions)
         mask = self._action_training_mask.to(device=log_prob.device, dtype=log_prob.dtype)
         return (log_prob * mask).sum(dim=-1)
 
@@ -573,5 +629,22 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
             self.critic_obs_normalizer.update(self.get_critic_obs(obs))
 
     def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
-        super().load_state_dict(state_dict, strict=strict)
+        """Load recurrent checkpoints, migrating legacy positive ``std`` to ``log_std`` when needed."""
+
+        migrated_state = state_dict.copy()
+        if self.noise_std_type == "log" and "std" in migrated_state and "log_std" not in migrated_state:
+            legacy_std = migrated_state.pop("std")
+            migrated_state["log_std"] = torch.log(torch.clamp(legacy_std, min=1.0e-8))
+        elif self.noise_std_type == "scalar" and "log_std" in migrated_state and "std" not in migrated_state:
+            legacy_log_std = migrated_state.pop("log_std")
+            migrated_state["std"] = torch.exp(legacy_log_std)
+
+        # Legacy recurrent checkpoints predate the direct goal-conditioned wheel residual.
+        # Its output layer is zero-initialized, so filling missing residual parameters from the
+        # freshly constructed module preserves the old policy behavior exactly at load time.
+        current_state = self.state_dict()
+        for key, value in current_state.items():
+            if key.startswith("actor.wheel_goal_residual.") and key not in migrated_state:
+                migrated_state[key] = value
+        super().load_state_dict(migrated_state, strict=strict)
         return True

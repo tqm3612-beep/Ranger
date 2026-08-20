@@ -449,6 +449,65 @@ def goal_heading_wheel_diff_l1(
     return torch.abs((left_mean - right_mean) - expected_diff)
 
 
+def short_goal_large_heading_common_mode_penalty(
+    env: ManagerBasedRLEnv,
+    heading_start: float = 0.70,
+    heading_full: float = 1.05,
+    action_name: str = "wheel_motor_csv",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize translational wheel common-mode while a large heading correction is still required.
+
+    Unlike state-only yaw/progress terms, this term assigns the cost directly to the wheel target
+    issued at the current step. The gate is zero below heading_start and reaches one at
+    heading_full. The common-mode is normalized by the wheel target velocity limit.
+    """
+
+    wheel_action_term = env.action_manager.get_term(action_name)
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    heading_abs = torch.abs(heading_error)
+    heading_gate = torch.clamp(
+        (heading_abs - float(heading_start)) / max(float(heading_full) - float(heading_start), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    common_mode = semantic_target.mean(dim=1)
+    velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    normalized_common = torch.abs(common_mode) / velocity_limit
+    penalty = heading_gate * normalized_common
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_large_heading_turn_mode_prior_l1(
+    env: ManagerBasedRLEnv,
+    heading_start: float = 0.70,
+    heading_full: float = 1.05,
+    turn_gain: float = 0.75,
+    action_name: str = "wheel_motor_csv",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Require strong, correctly signed wheel turn-mode while heading error is large."""
+
+    raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
+    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    wheel_action_term = env.action_manager.get_term(action_name)
+    velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
+    left_mean = semantic_target[:, :2].mean(dim=1) / velocity_limit
+    right_mean = semantic_target[:, 2:].mean(dim=1) / velocity_limit
+    actual_turn_mode = 0.5 * (right_mean - left_mean)
+    _, _, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+    heading_abs = torch.abs(heading_error)
+    heading_gate = torch.clamp(
+        (heading_abs - float(heading_start)) / max(float(heading_full) - float(heading_start), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    desired_turn_mode = float(turn_gain) * torch.sin(heading_error)
+    penalty = heading_gate * torch.abs(actual_turn_mode - desired_turn_mode)
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
 def short_goal_progress_reward(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

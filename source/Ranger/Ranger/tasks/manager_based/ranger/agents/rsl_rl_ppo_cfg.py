@@ -58,6 +58,35 @@ class RangerRecurrentActorCriticCfg(RslRlPpoActorCriticCfg):
 
 
 @configclass
+class RangerTeacherRegularizedPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
+    """PPO configuration with optional frozen V10 action regularization."""
+
+    class_name: str = "RangerTeacherRegularizedPPO"
+    teacher_loss_coef: float = 0.0
+    teacher_checkpoint: str | None = None
+    teacher_suspension_loss_weight: float = 1.0
+    teacher_wheel_loss_weight: float = 1.0
+    teacher_stop_phase_wheel_weight: float = 0.0
+    actor_loss_scale: float = 1.0
+    ppo_surrogate_scale: float = 1.0
+    actor_learning_rate: float | None = None
+    actor_train_scope: str = "all"
+    large_heading_action_prior_coef: float = 0.0
+    large_heading_action_prior_start: float = 0.70
+    large_heading_action_prior_full: float = 1.05
+    large_heading_action_prior_common_target: float = 0.45
+    large_heading_action_prior_turn_gain: float = 0.55
+    critic_only: bool = False
+    diagnostic_only: bool = False
+    critic_relearning: bool = False
+    critic_relearning_return_lam: float = 1.0
+    critic_relearning_common_delta: float = 0.25
+    critic_relearning_turn_scale: float = 0.35
+    critic_relearning_perturb_period: int = 48
+    critic_relearning_perturb_burst: int = 12
+
+
+@configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 16
     max_iterations = 150
@@ -248,11 +277,39 @@ class ShortGoalFlatCRecurrentPPORunnerCfg(ShortGoalFlatV10PPORunnerCfg):
     num_steps_per_env = 16
     policy = RangerRecurrentActorCriticCfg(
         init_noise_std=0.01,
+        noise_std_type="log",
         action_training_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         action_output_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         action_exploration_mask=[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         initial_action_std=[0.003, 0.003, 0.003, 0.003, 0.01, 0.01, 0.01, 0.01],
         inactive_action_std=1.0e-6,
+    )
+
+
+@configclass
+class ShortGoalFlatCRecurrentTeacherPPORunnerCfg(ShortGoalFlatCRecurrentPPORunnerCfg):
+    """Recurrent PPO with a frozen V10 teacher used only during PPO updates."""
+
+    max_iterations = 25
+    save_interval = 5
+    algorithm = RangerTeacherRegularizedPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=1.0e-4,
+        num_learning_epochs=2,
+        num_mini_batches=4,
+        learning_rate=1.0e-5,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        teacher_loss_coef=0.0,
+        teacher_suspension_loss_weight=1.0,
+        teacher_wheel_loss_weight=1.0,
+        teacher_stop_phase_wheel_weight=0.0,
+        critic_only=False,
     )
 
 

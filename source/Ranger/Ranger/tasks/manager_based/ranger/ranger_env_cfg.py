@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
@@ -1544,9 +1545,50 @@ class RangerShortGoalFlatV10EnvCfg(RangerShortGoalFlatV9EnvCfg):
 
 @configclass
 class RangerShortGoalFlatCRecurrentEnvCfg(RangerShortGoalFlatV10EnvCfg):
-    """C-stage experiment alias: identical environment/reward behavior to V10."""
+    """C-stage recurrent task with extra turn-first margin for large heading errors."""
 
-    pass
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # The V10 reward keeps a 15% progress/speed floor even above ~46 deg heading error.
+        # That admits a fragile drive-while-turning solution at long-range large-angle goals.
+        # Recurrent PPO must instead be able to stop translating and build yaw authority first.
+        self.rewards.progress_to_goal.params["alignment_floor"] = 0.0
+        self.rewards.cruise_underspeed.params["alignment_floor"] = 0.0
+        self.rewards.yaw_rate_tracking.weight = -0.30
+        self.rewards.large_heading_common_mode = RewTerm(
+            func=mdp.short_goal_large_heading_common_mode_penalty,
+            weight=-0.50,
+            params={
+                "heading_start": 0.70,
+                "heading_full": 1.05,
+                "action_name": "wheel_motor_csv",
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.large_heading_turn_mode = RewTerm(
+            func=mdp.short_goal_large_heading_turn_mode_prior_l1,
+            weight=-0.75,
+            params={
+                "heading_start": 0.70,
+                "heading_full": 1.05,
+                "turn_gain": 0.75,
+                "action_name": "wheel_motor_csv",
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Optional repair curriculum used only for the autonomous Teacher-off recovery phase.
+        # It oversamples the long-range outer-heading bands that expose the fragile V10/J4 arc solution.
+        if os.getenv("RANGER_RECURRENT_TURN_REPAIR", "0") == "1":
+            self.events.reset_short_goal_target.params.update(
+                {
+                    "distance_bands": ((3.0, 5.0), (5.0, 8.0), (8.0, 12.0)),
+                    "distance_weights": (0.10, 0.30, 0.60),
+                    "heading_bands_deg": ((-75.0, -45.0), (45.0, 75.0)),
+                    "heading_weights": (0.50, 0.50),
+                }
+            )
 
 
 @configclass

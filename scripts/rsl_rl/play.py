@@ -98,6 +98,15 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--trajectory_trace_csv",
+    type=str,
+    default=None,
+    help=(
+        "Optional per-policy-step, per-environment trajectory CSV with initial/current goal geometry, "
+        "toward-goal velocity, desired/actual yaw rate, and wheel common/turn modes."
+    ),
+)
+parser.add_argument(
     "--video_subdir",
     type=str,
     default="play",
@@ -256,7 +265,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     ppo_runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    ppo_runner.load(resume_path)
+    # Inference never needs optimizer state. Loading only the model keeps play compatible
+    # with checkpoints trained using different optimizer parameter-group layouts.
+    ppo_runner.load(resume_path, load_optimizer=False)
 
     # obtain the trained policy for inference
     policy = ppo_runner.get_inference_policy(device=env.unwrapped.device)
@@ -317,6 +328,63 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         (env.unwrapped.num_envs,), -1, dtype=torch.long, device=env.unwrapped.device
     )
     episode_ids = torch.zeros(env.unwrapped.num_envs, dtype=torch.long, device=env.unwrapped.device)
+
+    trajectory_trace_file = None
+    trajectory_trace_writer = None
+    trajectory_trace_fields = [
+        "policy_step",
+        "env_id",
+        "episode_id",
+        "episode_step_before_action",
+        "initial_goal_distance_m",
+        "initial_goal_heading_rad",
+        "initial_goal_heading_deg",
+        "goal_side",
+        "goal_distance_m",
+        "heading_error_rad",
+        "heading_error_deg",
+        "robot_root_x_w_m",
+        "robot_root_y_w_m",
+        "goal_target_x_w_m",
+        "goal_target_y_w_m",
+        "base_vx_body_mps",
+        "base_vy_body_mps",
+        "velocity_toward_goal_mps",
+        "desired_yaw_rate_radps",
+        "actual_yaw_rate_radps",
+        "yaw_rate_error_radps",
+        "policy_wheel_raw_lb",
+        "policy_wheel_raw_lf",
+        "policy_wheel_raw_rf",
+        "policy_wheel_raw_rb",
+        "wheel_common_mode_raw",
+        "wheel_turn_mode_raw",
+        "wheel_common_mode_clamped",
+        "wheel_turn_mode_clamped",
+        "wheel_action_saturation_fraction",
+        "stop_phase_active",
+        "termination_any_after_step",
+        "stopped_goal_reached_after_step",
+        "time_out_after_step",
+        "termination_terms_after_step",
+    ]
+    initial_goal_distance = torch.full(
+        (env.unwrapped.num_envs,), float("nan"), dtype=torch.float32, device=env.unwrapped.device
+    )
+    initial_goal_heading = torch.full_like(initial_goal_distance, float("nan"))
+    if args_cli.trajectory_trace_csv is not None:
+        trajectory_trace_path = os.path.abspath(os.path.expanduser(args_cli.trajectory_trace_csv))
+        trajectory_trace_dir = os.path.dirname(trajectory_trace_path)
+        if trajectory_trace_dir:
+            os.makedirs(trajectory_trace_dir, exist_ok=True)
+        trajectory_trace_file = open(trajectory_trace_path, "w", newline="", encoding="utf-8")
+        trajectory_trace_writer = csv.DictWriter(
+            trajectory_trace_file,
+            fieldnames=trajectory_trace_fields,
+            extrasaction="ignore",
+        )
+        trajectory_trace_writer.writeheader()
+        print(f"[TrajectoryTrace] CSV writing to: {trajectory_trace_path}")
 
     success_gate_trace_file = None
     success_gate_trace_writer = None
@@ -603,6 +671,100 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             rows.append(row)
         return rows
 
+    def collect_trajectory_rows(
+        actions: torch.Tensor,
+        stop_phase_active: torch.Tensor,
+    ) -> list[dict[str, object]]:
+        """Collect one diagnostic row per environment before the current env.step()."""
+
+        unwrapped = env.unwrapped
+        robot = unwrapped.scene["robot"]
+        target_vec_b, goal_distance, heading_error = ranger_mdp.short_goal_target_body(unwrapped)
+
+        first_step_mask = episode_age_steps == 0
+        initial_goal_distance[first_step_mask] = goal_distance[first_step_mask]
+        initial_goal_heading[first_step_mask] = heading_error[first_step_mask]
+
+        target_dir_b = target_vec_b[:, :2] / torch.clamp(goal_distance.unsqueeze(1), min=1.0e-6)
+        base_xy_velocity = robot.data.root_lin_vel_b[:, :2]
+        velocity_toward_goal = torch.sum(base_xy_velocity * target_dir_b, dim=1)
+        actual_yaw_rate = robot.data.root_ang_vel_b[:, 2]
+
+        yaw_tracking_term = getattr(unwrapped.cfg.rewards, "yaw_rate_tracking", None)
+        yaw_tracking_params = {} if yaw_tracking_term is None else yaw_tracking_term.params
+        yaw_rate_max = float(yaw_tracking_params.get("yaw_rate_max", 0.45))
+        heading_deadband = float(yaw_tracking_params.get("heading_deadband", 0.04))
+        heading_scale = float(yaw_tracking_params.get("heading_scale", 0.30))
+        effective_heading_error = torch.sign(heading_error) * torch.relu(
+            torch.abs(heading_error) - max(heading_deadband, 0.0)
+        )
+        desired_yaw_rate = yaw_rate_max * torch.tanh(
+            effective_heading_error / max(heading_scale, 1.0e-6)
+        )
+
+        wheel_actions = actions[:, 4:8]
+        semantic_left_action = wheel_actions[:, :2].mean(dim=1)
+        semantic_right_action = wheel_actions[:, 2:].mean(dim=1)
+        wheel_common_mode = 0.5 * (semantic_left_action + semantic_right_action)
+        wheel_turn_mode = 0.5 * (semantic_right_action - semantic_left_action)
+        wheel_actions_clamped = torch.clamp(wheel_actions, min=-1.0, max=1.0)
+        clamped_left_action = wheel_actions_clamped[:, :2].mean(dim=1)
+        clamped_right_action = wheel_actions_clamped[:, 2:].mean(dim=1)
+        wheel_common_mode_clamped = 0.5 * (clamped_left_action + clamped_right_action)
+        wheel_turn_mode_clamped = 0.5 * (clamped_right_action - clamped_left_action)
+        wheel_action_saturation_fraction = (torch.abs(wheel_actions) > 1.0).to(torch.float32).mean(dim=1)
+
+        target_pos_w = getattr(unwrapped, "_ranger_short_goal_pos_w", None)
+        if not isinstance(target_pos_w, torch.Tensor) or target_pos_w.shape[0] != unwrapped.num_envs:
+            target_pos_w = torch.full_like(robot.data.root_pos_w, float("nan"))
+
+        rows: list[dict[str, object]] = []
+        wheel_names = ("lb", "lf", "rf", "rb")
+        for env_id in range(unwrapped.num_envs):
+            initial_heading_value = float(initial_goal_heading[env_id].item())
+            goal_side = (
+                "left"
+                if initial_heading_value > 0.0
+                else ("right" if initial_heading_value < 0.0 else "straight")
+            )
+            row: dict[str, object] = {
+                "policy_step": timestep,
+                "env_id": env_id,
+                "episode_id": int(episode_ids[env_id].item()),
+                "episode_step_before_action": int(episode_age_steps[env_id].item()),
+                "initial_goal_distance_m": float(initial_goal_distance[env_id].item()),
+                "initial_goal_heading_rad": initial_heading_value,
+                "initial_goal_heading_deg": math.degrees(initial_heading_value),
+                "goal_side": goal_side,
+                "goal_distance_m": float(goal_distance[env_id].item()),
+                "heading_error_rad": float(heading_error[env_id].item()),
+                "heading_error_deg": math.degrees(float(heading_error[env_id].item())),
+                "robot_root_x_w_m": float(robot.data.root_pos_w[env_id, 0].item()),
+                "robot_root_y_w_m": float(robot.data.root_pos_w[env_id, 1].item()),
+                "goal_target_x_w_m": float(target_pos_w[env_id, 0].item()),
+                "goal_target_y_w_m": float(target_pos_w[env_id, 1].item()),
+                "base_vx_body_mps": float(base_xy_velocity[env_id, 0].item()),
+                "base_vy_body_mps": float(base_xy_velocity[env_id, 1].item()),
+                "velocity_toward_goal_mps": float(velocity_toward_goal[env_id].item()),
+                "desired_yaw_rate_radps": float(desired_yaw_rate[env_id].item()),
+                "actual_yaw_rate_radps": float(actual_yaw_rate[env_id].item()),
+                "yaw_rate_error_radps": float((actual_yaw_rate - desired_yaw_rate)[env_id].item()),
+                "wheel_common_mode_raw": float(wheel_common_mode[env_id].item()),
+                "wheel_turn_mode_raw": float(wheel_turn_mode[env_id].item()),
+                "wheel_common_mode_clamped": float(wheel_common_mode_clamped[env_id].item()),
+                "wheel_turn_mode_clamped": float(wheel_turn_mode_clamped[env_id].item()),
+                "wheel_action_saturation_fraction": float(wheel_action_saturation_fraction[env_id].item()),
+                "stop_phase_active": int(stop_phase_active[env_id].item()),
+                "termination_any_after_step": 0,
+                "stopped_goal_reached_after_step": 0,
+                "time_out_after_step": 0,
+                "termination_terms_after_step": "",
+            }
+            for wheel_idx, wheel_name in enumerate(wheel_names):
+                row[f"policy_wheel_raw_{wheel_name}"] = float(wheel_actions[env_id, wheel_idx].item())
+            rows.append(row)
+        return rows
+
     update_recording_camera()
 
     # simulate environment
@@ -610,7 +772,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
-            collect_episode_state = args_cli.evaluation_summary or success_gate_trace_writer is not None
+            collect_episode_state = (
+                args_cli.evaluation_summary
+                or success_gate_trace_writer is not None
+                or trajectory_trace_writer is not None
+            )
             stop_phase_active = torch.zeros(
                 env.unwrapped.num_envs, dtype=torch.bool, device=env.unwrapped.device
             )
@@ -628,12 +794,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             success_gate_rows = None
+            trajectory_rows = None
             if success_gate_trace_writer is not None:
                 success_gate_rows = collect_success_gate_rows(
                     actions,
                     stop_phase_active,
                     first_observed_stop,
                 )
+            if trajectory_trace_writer is not None:
+                trajectory_rows = collect_trajectory_rows(actions, stop_phase_active)
 
             # env stepping
             step_result = env.step(actions)
@@ -682,6 +851,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     success_gate_trace_writer.writerows(success_gate_rows)
                     if timestep % 60 == 0:
                         success_gate_trace_file.flush()
+
+                if trajectory_rows is not None:
+                    for env_id, row in enumerate(trajectory_rows):
+                        row["termination_any_after_step"] = int(term_any[env_id].item())
+                        row["stopped_goal_reached_after_step"] = int(success_mask[env_id].item())
+                        row["time_out_after_step"] = int(timeout_mask[env_id].item())
+                        row["termination_terms_after_step"] = ";".join(termination_names_by_env[env_id])
+                    trajectory_trace_writer.writerows(trajectory_rows)
+                    if timestep % 60 == 0:
+                        trajectory_trace_file.flush()
 
                 if args_cli.evaluation_summary:
                     completed_episode_steps_sum += int(episode_age_steps[term_any].sum().item())
@@ -734,6 +913,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if success_gate_trace_file is not None:
         success_gate_trace_file.flush()
         success_gate_trace_file.close()
+    if trajectory_trace_file is not None:
+        trajectory_trace_file.flush()
+        trajectory_trace_file.close()
 
     if args_cli.evaluation_summary:
         success_count = int(termination_counts.get("stopped_goal_reached", 0))

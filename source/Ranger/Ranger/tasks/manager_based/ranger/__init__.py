@@ -175,6 +175,19 @@ gym.register(
 
 
 gym.register(
+    id="Template-Ranger-ShortGoalFlat-C-Recurrent-TeacherPPO",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalFlatCRecurrentEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatCRecurrentTeacherPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
     id="Template-Ranger-ShortGoalFlat-v11",
     entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,

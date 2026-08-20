@@ -521,3 +521,97 @@ def warm_start_ranger_recurrent_from_feedforward(runner, checkpoint_path: str | 
     print("[WarmStart] new: optimizer")
     print("[WarmStart] trainable: complete recurrent actor + critic + action std")
     print("[WarmStart] iteration: 0")
+
+
+def warm_start_ranger_recurrent_critic_relearning(
+    runner,
+    actor_checkpoint_path: str | Path,
+    v10_checkpoint_path: str | Path,
+    freeze_actor: bool = True,
+) -> None:
+    """Initialize a clean recurrent critic while preserving the bounded recurrent actor.
+
+    The actor and log-std come from the bounded recurrent checkpoint. The critic remains
+    freshly initialized except for V10 critic map/privileged encoders, whose structures
+    match exactly. With ``freeze_actor=True`` the optimizer contains critic parameters only;
+    with ``freeze_actor=False`` actor/log-std stay trainable and the optimizer is rebuilt over
+    the complete recurrent policy. No old recurrent critic optimizer state leaks into either mode.
+    """
+
+    policy = get_ranger_recurrent_policy(runner)
+    actor_checkpoint, actor_state = _load_checkpoint_model_state(actor_checkpoint_path)
+    if not any(key.startswith("actor.memory.") for key in actor_state):
+        raise ValueError("critic relearning expects a recurrent actor checkpoint containing actor.memory.* keys.")
+
+    actor_module_state = {
+        key.removeprefix("actor."): value
+        for key, value in actor_state.items()
+        if key.startswith("actor.")
+    }
+    policy.actor.load_state_dict(actor_module_state, strict=True)
+    if "log_std" not in actor_state:
+        raise KeyError("critic relearning actor checkpoint is missing log_std.")
+    if tuple(actor_state["log_std"].shape) != tuple(policy.log_std.shape):
+        raise ValueError(
+            "critic relearning log_std shape mismatch: "
+            f"checkpoint={tuple(actor_state['log_std'].shape)} current={tuple(policy.log_std.shape)}"
+        )
+    with torch.no_grad():
+        policy.log_std.copy_(actor_state["log_std"].to(device=policy.log_std.device, dtype=policy.log_std.dtype))
+
+    v10_checkpoint, v10_state = _load_checkpoint_model_state(v10_checkpoint_path)
+    if any(key.startswith("critic.memory.") for key in v10_state):
+        raise ValueError("critic relearning V10 representation source must be feedforward, not recurrent.")
+
+    transferred_modules = ("map_encoder", "privileged_encoder")
+    transferred_counts: dict[str, int] = {}
+    for module_name in transferred_modules:
+        prefix = f"critic.{module_name}."
+        source_state = {
+            key[len(prefix) :]: value
+            for key, value in v10_state.items()
+            if key.startswith(prefix)
+        }
+        if not source_state:
+            raise KeyError(f"V10 checkpoint has no tensors for {prefix}*")
+        module = getattr(policy.critic, module_name)
+        module.load_state_dict(source_state, strict=True)
+        transferred_counts[module_name] = len(source_state)
+
+    for parameter in policy.actor.parameters():
+        parameter.requires_grad_(not freeze_actor)
+    policy.log_std.requires_grad_(not freeze_actor)
+    for parameter in policy.critic.parameters():
+        parameter.requires_grad_(True)
+
+    optimizer_parameters = policy.critic.parameters() if freeze_actor else policy.parameters()
+    runner.alg.optimizer = torch.optim.Adam(optimizer_parameters, lr=runner.alg.learning_rate)
+    runner.current_learning_iteration = 0
+
+    if freeze_actor:
+        trainable_non_critic = [
+            name for name, parameter in policy.named_parameters()
+            if parameter.requires_grad and not name.startswith("critic.")
+        ]
+        if trainable_non_critic:
+            raise RuntimeError(
+                "critic relearning unexpectedly left non-critic parameters trainable: " + ", ".join(trainable_non_critic)
+            )
+
+    print(f"[CriticRelearn] actor source: {Path(actor_checkpoint_path).expanduser()}")
+    print(f"[CriticRelearn] actor checkpoint keys: {sorted(actor_checkpoint.keys())}")
+    if freeze_actor:
+        print("[CriticRelearn] loaded and frozen: complete recurrent actor + log_std")
+    else:
+        print("[JointProbe] loaded and trainable: complete recurrent actor + log_std")
+    print(f"[CriticRelearn] V10 representation source: {Path(v10_checkpoint_path).expanduser()}")
+    print(f"[CriticRelearn] V10 checkpoint keys: {sorted(v10_checkpoint.keys())}")
+    for module_name in transferred_modules:
+        print(f"[CriticRelearn] transferred: critic.{module_name} ({transferred_counts[module_name]} tensors)")
+    print("[CriticRelearn] fresh: critic.prop_encoder / goal_encoder / fusion_norm / GRU / hidden_norm / value_head")
+    if freeze_actor:
+        print("[CriticRelearn] fresh optimizer: Adam(critic parameters only)")
+        print("[CriticRelearn] iteration: 0")
+    else:
+        print("[JointProbe] fresh optimizer: Adam(complete recurrent policy)")
+        print("[JointProbe] iteration: 0")

@@ -5,5 +5,10 @@
 
 from .rsl_rl_custom_policy import RangerTerrainActorCritic
 from .rsl_rl_recurrent_policy import RangerTerrainActorCriticRecurrent
+from .rsl_rl_teacher_regularized_ppo import RangerTeacherRegularizedPPO
 
-__all__ = ["RangerTerrainActorCritic", "RangerTerrainActorCriticRecurrent"]
+__all__ = [
+    "RangerTerrainActorCritic",
+    "RangerTerrainActorCriticRecurrent",
+    "RangerTeacherRegularizedPPO",
+]

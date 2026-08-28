@@ -32,13 +32,16 @@ class _RangerRecurrentNetworkSpec:
     """
 
     state_dim: int = 42
+    base_ang_vel_observation_scale: float = 3.0
+    goal_heading_rate_slot: int = 1
+    goal_heading_rate_observation_scale: float = 2.0
     prop_state_ranges: tuple[tuple[int, int], ...] = ((0, 26), (34, 42))
     goal_state_range: tuple[int, int] = (26, 34)
 
     prop_hidden_dims: tuple[int, ...] = (128,)
     prop_latent_dim: int = 128
-    goal_hidden_dims: tuple[int, ...] = (64,)
-    goal_latent_dim: int = 64
+    goal_hidden_dims: tuple[int, ...] = (128,)
+    goal_latent_dim: int = 128
 
     terrain_channels: int = 8
     terrain_grid_shape: tuple[int, int] = (21, 13)
@@ -54,7 +57,7 @@ class _RangerRecurrentNetworkSpec:
     suspension_head_hidden_dims: tuple[int, ...] = (128,)
     suspension_action_dim: int = 4
     wheel_head_hidden_dims: tuple[int, ...] = (128,)
-    wheel_goal_residual_hidden_dims: tuple[int, ...] = (64,)
+    wheel_control_residual_hidden_dims: tuple[int, ...] = (64,)
     wheel_action_dim: int = 4
 
     privileged_hidden_dims: tuple[int, ...] = (64,)
@@ -99,6 +102,11 @@ class _RangerRecurrentActor(nn.Module):
         num_actions: int,
         activation: str,
         network_spec: _RangerRecurrentNetworkSpec,
+        use_recurrent: bool = True,
+        use_gru_residual: bool = False,
+        residual_action_scale: float = 0.1,
+        use_hidden_goal_residual: bool = False,
+        hidden_goal_residual_scale: float = 1.0,
     ) -> None:
         super().__init__()
         if state_dim != network_spec.state_dim:
@@ -112,6 +120,19 @@ class _RangerRecurrentActor(nn.Module):
         self.state_dim = int(state_dim)
         self.map_dim = int(map_dim)
         self.num_actions = int(num_actions)
+        self.use_recurrent = bool(use_recurrent)
+        self.use_gru_residual = bool(use_gru_residual)
+        self.use_hidden_goal_residual = bool(use_hidden_goal_residual)
+        if self.use_recurrent and self.use_gru_residual:
+            raise ValueError("GRU residual mode is only valid for the aligned-latent old-trunk actor path.")
+        if residual_action_scale < 0.0:
+            raise ValueError(f"residual_action_scale must be non-negative, got {residual_action_scale}.")
+        self.residual_action_scale = float(residual_action_scale)
+        if hidden_goal_residual_scale < 0.0:
+            raise ValueError(
+                f"hidden_goal_residual_scale must be non-negative, got {hidden_goal_residual_scale}."
+            )
+        self.hidden_goal_residual_scale = float(hidden_goal_residual_scale)
         if self.map_dim != network_spec.map_dim:
             raise ValueError(
                 f"Terrain map dim mismatch: expected {network_spec.map_dim} from "
@@ -132,6 +153,7 @@ class _RangerRecurrentActor(nn.Module):
             activation=activation,
         )
         self.fusion_norm = nn.LayerNorm(network_spec.actor_fusion_dim)
+        self.latent_alignment_projection = nn.Linear(network_spec.actor_fusion_dim, 128)
         self.memory = Memory(
             network_spec.actor_fusion_dim,
             network_spec.rnn_hidden_dim,
@@ -158,21 +180,31 @@ class _RangerRecurrentActor(nn.Module):
             network_spec.wheel_action_dim,
             activation,
         )
-        self.wheel_goal_residual = _build_mlp(
-            network_spec.goal_dim,
-            list(network_spec.wheel_goal_residual_hidden_dims),
+        self.wheel_control_residual = _build_mlp(
+            network_spec.goal_dim + 1,
+            list(network_spec.wheel_control_residual_hidden_dims),
             network_spec.wheel_action_dim,
             activation,
         )
+        self.residual_memory = Memory(
+            128,
+            network_spec.rnn_hidden_dim,
+            network_spec.rnn_num_layers,
+            network_spec.rnn_type,
+        )
+        self.residual_hidden_norm = nn.LayerNorm(network_spec.rnn_hidden_dim)
+        self.residual_head = nn.Linear(network_spec.rnn_hidden_dim, num_actions)
 
         nn.init.zeros_(self.suspension_head[-1].weight)
         nn.init.zeros_(self.suspension_head[-1].bias)
         nn.init.zeros_(self.wheel_head[-1].weight)
         nn.init.zeros_(self.wheel_head[-1].bias)
-        nn.init.zeros_(self.wheel_goal_residual[-1].weight)
-        nn.init.zeros_(self.wheel_goal_residual[-1].bias)
+        nn.init.zeros_(self.wheel_control_residual[-1].weight)
+        nn.init.zeros_(self.wheel_control_residual[-1].bias)
+        nn.init.zeros_(self.residual_head.weight)
+        nn.init.zeros_(self.residual_head.bias)
 
-    def _encode(self, obs: torch.Tensor) -> torch.Tensor:
+    def _split_encode(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         prefix_shape = obs.shape[:-1]
         flat_obs = obs.reshape(-1, obs.shape[-1])
         state_obs = flat_obs[:, : self.state_dim]
@@ -182,6 +214,8 @@ class _RangerRecurrentActor(nn.Module):
         )
         goal_start, goal_end = self.network_spec.goal_state_range
         goal_obs = state_obs[:, goal_start:goal_end]
+        goal_encoder_obs = goal_obs.clone()
+        goal_encoder_obs[:, self.network_spec.goal_heading_rate_slot] = 0.0
         map_obs = map_obs.view(
             flat_obs.shape[0],
             self.network_spec.terrain_channels,
@@ -189,11 +223,64 @@ class _RangerRecurrentActor(nn.Module):
             self.network_spec.terrain_grid_shape[1],
         )
 
-        encoded = torch.cat(
-            (self.prop_encoder(prop_obs), self.goal_encoder(goal_obs), self.map_encoder(map_obs)),
-            dim=-1,
+        prop_latent = self.prop_encoder(prop_obs)
+        goal_latent = self.goal_encoder(goal_encoder_obs)
+        map_latent = self.map_encoder(map_obs)
+        return (
+            prop_latent.reshape(*prefix_shape, prop_latent.shape[-1]),
+            goal_latent.reshape(*prefix_shape, goal_latent.shape[-1]),
+            map_latent.reshape(*prefix_shape, map_latent.shape[-1]),
+            goal_obs.reshape(*prefix_shape, goal_obs.shape[-1]),
         )
+
+    def _encode(self, obs: torch.Tensor) -> torch.Tensor:
+        prefix_shape = obs.shape[:-1]
+        prop_latent, goal_latent, map_latent, _ = self._split_encode(obs)
+        encoded = torch.cat((prop_latent, goal_latent, map_latent), dim=-1)
         return self.fusion_norm(encoded).reshape(*prefix_shape, encoded.shape[-1])
+
+    def alignment_latent(self, obs: torch.Tensor) -> torch.Tensor:
+        return self.latent_alignment_projection(self._encode(obs))
+
+    def _set_bypass_hidden_state(self, obs: torch.Tensor) -> None:
+        batch_size = int(obs.shape[0])
+        weight = self.latent_alignment_projection.weight
+        target_memory = self.residual_memory if self.use_gru_residual else self.memory
+        target_memory.hidden_state = weight.new_zeros(
+            self.network_spec.rnn_num_layers,
+            batch_size,
+            self.network_spec.rnn_hidden_dim,
+        )
+
+    def _old_trunk_action(
+        self,
+        map_latent: torch.Tensor,
+        state_latent: torch.Tensor,
+        masks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        trunk_input = torch.cat((map_latent, state_latent), dim=-1)
+        if masks is not None:
+            trunk_input = unpad_trajectories(trunk_input, masks)
+        trunk = self.actor_trunk_activation(self.actor_trunk(trunk_input))
+        return torch.cat((self.suspension_head(trunk), self.wheel_head(trunk)), dim=-1)
+
+    def residual_delta(
+        self,
+        obs: torch.Tensor,
+        masks: torch.Tensor | None = None,
+        hidden_state: HiddenState = None,
+    ) -> torch.Tensor:
+        state_latent = self.alignment_latent(obs)
+        out = self.residual_memory(state_latent, masks, hidden_state)
+        if masks is None:
+            out = out.squeeze(0)
+        out = self.residual_hidden_norm(out)
+        return self.residual_head(out)
+
+    def base_action(self, obs: torch.Tensor, masks: torch.Tensor | None = None) -> torch.Tensor:
+        _, _, map_latent, _ = self._split_encode(obs)
+        state_latent = self.alignment_latent(obs)
+        return self._old_trunk_action(map_latent, state_latent, masks)
 
     def forward(
         self,
@@ -201,25 +288,54 @@ class _RangerRecurrentActor(nn.Module):
         masks: torch.Tensor | None = None,
         hidden_state: HiddenState = None,
     ) -> torch.Tensor:
-        fused = self._encode(obs)
-        out = self.memory(fused, masks, hidden_state)
-        if masks is None:
-            out = out.squeeze(0)
-        out = self.hidden_norm(out)
-        trunk = self.actor_trunk_activation(self.actor_trunk(out))
-        state_obs = obs[..., : self.state_dim]
-        goal_start, goal_end = self.network_spec.goal_state_range
-        goal_obs = state_obs[..., goal_start:goal_end]
+        if self.use_recurrent:
+            fused = self._encode(obs)
+            out = self.memory(fused, masks, hidden_state)
+            if masks is None:
+                out = out.squeeze(0)
+            out = self.hidden_norm(out)
+            trunk_input = out
+            state_obs = obs[..., : self.state_dim]
+            goal_start, goal_end = self.network_spec.goal_state_range
+            goal_obs = state_obs[..., goal_start:goal_end]
+            yaw_rate_obs = state_obs[..., 2:3] * self.network_spec.base_ang_vel_observation_scale
+        else:
+            _, _, map_latent, goal_obs = self._split_encode(obs)
+            state_latent = self.alignment_latent(obs)
+            if masks is None:
+                self._set_bypass_hidden_state(obs)
+            base_action = self._old_trunk_action(map_latent, state_latent, masks)
+            if self.use_gru_residual:
+                return base_action + self.residual_action_scale * self.residual_delta(obs, masks, hidden_state)
+            return base_action
+
+        trunk = self.actor_trunk_activation(self.actor_trunk(trunk_input))
         if masks is not None:
             goal_obs = unpad_trajectories(goal_obs, masks)
-        wheel_output = self.wheel_head(trunk) + self.wheel_goal_residual(goal_obs)
-        return torch.cat((self.suspension_head(trunk), wheel_output), dim=-1)
+            yaw_rate_obs = unpad_trajectories(yaw_rate_obs, masks)
+        wheel_output = self.wheel_head(trunk)
+        if self.use_recurrent:
+            wheel_feedback_obs = torch.cat((goal_obs, yaw_rate_obs), dim=-1)
+            wheel_output = wheel_output + self.wheel_control_residual(wheel_feedback_obs)
+        action = torch.cat((self.suspension_head(trunk), wheel_output), dim=-1)
+        if self.use_hidden_goal_residual:
+            hidden_indicator = goal_obs[..., 0:1].clamp(min=0.0, max=1.0)
+            residual = self.residual_head(out)
+            bounded_residual = torch.tanh(residual)
+            wheel_residual = torch.cat(
+                (torch.zeros_like(bounded_residual[..., :4]), bounded_residual[..., 4:]), dim=-1
+            )
+            action = action + self.hidden_goal_residual_scale * hidden_indicator * wheel_residual
+        return action
 
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.memory.reset(dones)
+        self.residual_memory.reset(dones)
 
     @property
     def hidden_state(self) -> HiddenState:
+        if self.use_gru_residual:
+            return self.residual_memory.hidden_state
         return self.memory.hidden_state
 
 
@@ -295,6 +411,8 @@ class _RangerRecurrentCritic(nn.Module):
         )
         goal_start, goal_end = self.network_spec.goal_state_range
         goal_obs = state_obs[:, goal_start:goal_end]
+        goal_encoder_obs = goal_obs.clone()
+        goal_encoder_obs[:, self.network_spec.goal_heading_rate_slot] = 0.0
         map_obs = map_obs.view(
             flat_obs.shape[0],
             self.network_spec.terrain_channels,
@@ -305,7 +423,7 @@ class _RangerRecurrentCritic(nn.Module):
         encoded = torch.cat(
             (
                 self.prop_encoder(prop_obs),
-                self.goal_encoder(goal_obs),
+                self.goal_encoder(goal_encoder_obs),
                 self.map_encoder(map_obs),
                 self.privileged_encoder(priv_obs),
             ),
@@ -369,6 +487,17 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         action_exploration_mask: list[float] | None = None,
         initial_action_std: list[float] | None = None,
         inactive_action_std: float = 1.0e-6,
+        trainable_modules: list[str] | None = None,
+        frozen_modules: list[str] | None = None,
+        actor_trainable_modules: list[str] | None = None,
+        actor_frozen_modules: list[str] | None = None,
+        critic_trainable_modules: list[str] | None = None,
+        critic_frozen_modules: list[str] | None = None,
+        use_recurrent_actor: bool = True,
+        use_gru_residual: bool = False,
+        residual_action_scale: float = 0.1,
+        use_hidden_goal_residual: bool = False,
+        hidden_goal_residual_scale: float = 1.0,
         rnn_type: str = _RANGER_RECURRENT_NETWORK_SPEC.rnn_type,
         rnn_hidden_dim: int = _RANGER_RECURRENT_NETWORK_SPEC.rnn_hidden_dim,
         rnn_num_layers: int = _RANGER_RECURRENT_NETWORK_SPEC.rnn_num_layers,
@@ -422,6 +551,15 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         self.privileged_obs_group = privileged_obs_group
         self.state_dependent_std = state_dependent_std
         self.network_spec = network_spec
+        self.use_recurrent_actor = bool(use_recurrent_actor)
+        self.use_gru_residual = bool(use_gru_residual)
+        if self.use_gru_residual and self.use_recurrent_actor:
+            raise ValueError("use_gru_residual requires use_recurrent_actor=False.")
+        if residual_action_scale < 0.0:
+            raise ValueError(f"residual_action_scale must be non-negative, got {residual_action_scale}.")
+        self.residual_action_scale = float(residual_action_scale)
+        self.use_hidden_goal_residual = bool(use_hidden_goal_residual)
+        self.hidden_goal_residual_scale = float(hidden_goal_residual_scale)
         self.rnn_hidden_dim = network_spec.rnn_hidden_dim
         self.rnn_num_layers = network_spec.rnn_num_layers
         if inactive_action_std <= 0.0:
@@ -470,6 +608,11 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
             num_actions=num_actions,
             activation=activation,
             network_spec=network_spec,
+            use_recurrent=self.use_recurrent_actor,
+            use_gru_residual=self.use_gru_residual,
+            residual_action_scale=self.residual_action_scale,
+            use_hidden_goal_residual=self.use_hidden_goal_residual,
+            hidden_goal_residual_scale=self.hidden_goal_residual_scale,
         )
         self.critic = _RangerRecurrentCritic(
             state_dim=self.state_dim,
@@ -477,6 +620,18 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
             privileged_dim=self.privileged_dim,
             activation=activation,
             network_spec=network_spec,
+        )
+        self._configure_module_trainability(
+            self.actor,
+            trainable_modules if actor_trainable_modules is None else actor_trainable_modules,
+            frozen_modules if actor_frozen_modules is None else actor_frozen_modules,
+            owner_name="actor",
+        )
+        self._configure_module_trainability(
+            self.critic,
+            critic_trainable_modules,
+            frozen_modules if critic_frozen_modules is None else critic_frozen_modules,
+            owner_name="critic",
         )
 
         self.actor_obs_normalization = actor_obs_normalization
@@ -504,6 +659,43 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         # unchanged while preserving a stable one-to-one tanh transform.
         self._latent_action_mean_limit = 5.0
         Normal.set_default_validate_args(False)
+
+    @staticmethod
+    def _configure_module_trainability(
+        module_owner: nn.Module,
+        trainable_modules: list[str] | None,
+        frozen_modules: list[str] | None,
+        owner_name: str,
+    ) -> None:
+        """Apply config-driven module freezing without changing checkpoint keys."""
+
+        child_modules = dict(module_owner.named_children())
+        valid_names = set(child_modules)
+
+        def _validate_list(field_name: str, module_names: list[str] | None) -> set[str]:
+            if module_names is None:
+                return set()
+            requested = set(module_names)
+            unknown = sorted(requested - valid_names)
+            if unknown:
+                raise ValueError(
+                    f"Unknown {owner_name} {field_name}: {unknown}. "
+                    f"Valid modules are: {sorted(valid_names)}."
+                )
+            return requested
+
+        trainable = _validate_list("trainable_modules", trainable_modules)
+        frozen = _validate_list("frozen_modules", frozen_modules)
+
+        if trainable_modules is not None:
+            for name, child in child_modules.items():
+                requires_grad = name in trainable
+                for parameter in child.parameters():
+                    parameter.requires_grad = requires_grad
+
+        for name in frozen:
+            for parameter in child_modules[name].parameters():
+                parameter.requires_grad = False
 
     @property
     def action_mean(self) -> torch.Tensor:
@@ -541,6 +733,12 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
     def reset(self, dones: torch.Tensor | None = None) -> None:
         self.actor.reset(dones)
         self.critic.reset(dones)
+
+    def reset_memory(self) -> None:
+        """Reset recurrent memory state for inference-only recurrent policy usage."""
+        self.actor.memory.hidden_state = None
+        self.actor.residual_memory.hidden_state = None
+        self.critic.memory.hidden_state = None
 
     def forward(self) -> NoReturn:
         raise NotImplementedError
@@ -603,6 +801,18 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
         critic_obs = self.critic_obs_normalizer(critic_obs)
         return self.critic(critic_obs, masks, hidden_state)
 
+    def alignment_latent(self, obs: TensorDict) -> torch.Tensor:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        return self.actor.alignment_latent(actor_obs)
+
+    def residual_delta(self, obs: TensorDict) -> torch.Tensor:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        return self.actor.residual_delta(actor_obs)
+
+    def base_action(self, obs: TensorDict) -> torch.Tensor:
+        actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+        return self.actor.base_action(actor_obs)
+
     def get_actor_obs(self, obs: TensorDict) -> torch.Tensor:
         return torch.cat([obs[group] for group in self.obs_groups["policy"]], dim=-1)
 
@@ -639,12 +849,42 @@ class RangerTerrainActorCriticRecurrent(nn.Module):
             legacy_log_std = migrated_state.pop("log_std")
             migrated_state["std"] = torch.exp(legacy_log_std)
 
-        # Legacy recurrent checkpoints predate the direct goal-conditioned wheel residual.
-        # Its output layer is zero-initialized, so filling missing residual parameters from the
-        # freshly constructed module preserves the old policy behavior exactly at load time.
+        # Legacy recurrent checkpoints used an 8-D goal-only wheel residual. Embed it into the
+        # current 9-D goal+yaw-rate wheel-control residual by copying the old goal columns and
+        # leaving the new yaw-rate column at zero. This preserves the checkpoint's initial wheel
+        # action while exposing yaw rate for subsequent residual training.
         current_state = self.state_dict()
-        for key, value in current_state.items():
-            if key.startswith("actor.wheel_goal_residual.") and key not in migrated_state:
-                migrated_state[key] = value
+        new_prefix = "actor.wheel_control_residual."
+        old_goal_prefix = "actor.wheel_goal_residual."
+        old_rate_prefix = "actor.wheel_heading_rate_residual."
+        if not any(key.startswith(new_prefix) for key in migrated_state):
+            for key, value in current_state.items():
+                if key.startswith(new_prefix):
+                    migrated_state[key] = value.clone()
+
+            old_first_key = f"{old_goal_prefix}0.weight"
+            new_first_key = f"{new_prefix}0.weight"
+            if old_first_key in migrated_state and new_first_key in migrated_state:
+                old_weight = migrated_state[old_first_key]
+                new_weight = migrated_state[new_first_key].clone()
+                if old_weight.shape[0] == new_weight.shape[0] and old_weight.shape[1] + 1 == new_weight.shape[1]:
+                    new_weight[:, : old_weight.shape[1]] = old_weight
+                    # ShortGoal slot 1 was identically zero in legacy checkpoints and is
+                    # now reserved for normalized heading-error rate.  Zero its migrated
+                    # column so enabling the new feedback observation does not change the
+                    # model108 action before B12 training starts.
+                    new_weight[:, self.network_spec.goal_heading_rate_slot] = 0.0
+                    new_weight[:, old_weight.shape[1] :] = 0.0
+                    migrated_state[new_first_key] = new_weight
+                    for old_key, old_value in list(migrated_state.items()):
+                        if old_key.startswith(old_goal_prefix) and old_key != old_first_key:
+                            suffix = old_key[len(old_goal_prefix) :]
+                            new_key = f"{new_prefix}{suffix}"
+                            if new_key in migrated_state and migrated_state[new_key].shape == old_value.shape:
+                                migrated_state[new_key] = old_value
+
+        for key in list(migrated_state):
+            if key.startswith(old_goal_prefix) or key.startswith(old_rate_prefix):
+                migrated_state.pop(key)
         super().load_state_dict(migrated_state, strict=strict)
         return True

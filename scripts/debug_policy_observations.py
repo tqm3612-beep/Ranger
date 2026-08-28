@@ -33,8 +33,6 @@ import Ranger.tasks  # noqa: F401
 from Ranger.assets.ranger.ranger_cfg import RANGER_URDF_PATH, RANGER_USD_PATH
 from Ranger.tasks.manager_based.ranger import mdp
 from Ranger.tasks.manager_based.ranger.ranger_env_cfg import (
-    COMMAND_OBS_PARAMS,
-    LOCAL_NAVIGATION_MAP_PARAMS,
     _expected_policy_obs_dim,
     _expected_policy_map_obs_dim,
     _expected_policy_state_obs_dim,
@@ -116,8 +114,10 @@ def main() -> None:
         _require_all_finite("policy_state_obs", policy_state_obs)
         _require_all_finite("policy_map_obs", policy_map_obs)
 
-        command_obs = mdp.command_observation(env.unwrapped, **COMMAND_OBS_PARAMS)
-        nav_layers = mdp.local_navigation_map_layers(env.unwrapped, **LOCAL_NAVIGATION_MAP_PARAMS)
+        command_params = dict(env.unwrapped.cfg.observations.policy_state.command_state.params)
+        map_params = dict(env.unwrapped.cfg.observations.policy_map.local_navigation_map.params)
+        command_obs = mdp.command_observation(env.unwrapped, **command_params)
+        nav_layers = mdp.local_navigation_map_layers(env.unwrapped, **map_params)
 
         _print_stats("policy_state_obs", policy_state_obs)
         _print_stats("policy_map_obs", policy_map_obs)

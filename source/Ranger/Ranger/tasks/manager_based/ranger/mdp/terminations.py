@@ -14,6 +14,7 @@ import torch
 
 from isaaclab.assets import RigidObject
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import euler_xyz_from_quat
 
 from .observations import short_goal_target_body
@@ -41,6 +42,24 @@ def root_height_below_minimum_with_grace(
 
     grace_active = env.episode_length_buf < grace_steps
     return torch.logical_and(low_height, ~grace_active)
+
+
+def obstacle_collision(
+    env: ManagerBasedRLEnv,
+    sensor_names: tuple[str, ...],
+    force_threshold: float = 20.0,
+) -> torch.Tensor:
+    """Terminate when any filtered chassis/wheel sensor hits the obstacle."""
+
+    collision = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    for sensor_name in sensor_names:
+        sensor: ContactSensor = env.scene.sensors[sensor_name]
+        force_history = sensor.data.force_matrix_w_history
+        if force_history is None:
+            raise RuntimeError(f"Contact sensor '{sensor_name}' must filter contacts against the obstacle.")
+        max_force = torch.linalg.vector_norm(force_history, dim=-1).flatten(start_dim=1).amax(dim=1)
+        collision |= max_force > float(force_threshold)
+    return collision
 
 
 def short_goal_reached(

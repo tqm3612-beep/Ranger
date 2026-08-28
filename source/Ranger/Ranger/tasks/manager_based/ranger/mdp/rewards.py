@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,12 @@ from .observations import (
     SHORT_GOAL_PREV_HEADING_ERROR_ATTR,
     SHORT_GOAL_PREV_DISTANCE_ATTR,
     SHORT_GOAL_REACHED_ATTR,
+    OBSTACLE_POSITION_ATTR,
+    OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR,
+    OBSTACLE_ROUTE_PHASE_ATTR,
+    OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR,
+    OBSTACLE_ROUTE_PREV_DISTANCE_ATTR,
+    OBSTACLE_ROUTE_WAYPOINT_ATTR,
     goal_heading_target_body,
     short_goal_target_body,
     speed_command,
@@ -882,6 +889,153 @@ def failure_termination_penalty(
     return failed.to(torch.float32)
 
 
+def obstacle_contact_penalty(
+    env: ManagerBasedRLEnv,
+    sensor_names: tuple[str, ...],
+    force_threshold: float = 5.0,
+) -> torch.Tensor:
+    """Return a binary penalty when the chassis or a wheel contacts the obstacle."""
+
+    collision = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    for sensor_name in sensor_names:
+        sensor: ContactSensor = env.scene.sensors[sensor_name]
+        force_history = sensor.data.force_matrix_w_history
+        if force_history is None:
+            raise RuntimeError(f"Contact sensor '{sensor_name}' must filter contacts against the obstacle.")
+        max_force = torch.linalg.vector_norm(force_history, dim=-1).flatten(start_dim=1).amax(dim=1)
+        collision |= max_force > float(force_threshold)
+    return collision.to(torch.float32)
+
+
+def fixed_obstacle_proximity_penalty(
+    env: ManagerBasedRLEnv,
+    obstacle_local_position: tuple[float, float] | None = None,
+    safety_radius: float = 2.0,
+    transition_width: float = 0.8,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Provide dense pre-contact shaping around a known training obstacle."""
+
+    if float(safety_radius) <= 0.0:
+        raise ValueError("safety_radius must be positive.")
+    if float(transition_width) <= 0.0:
+        raise ValueError("transition_width must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    obstacle_xy_w = getattr(env, OBSTACLE_POSITION_ATTR, None)
+    if obstacle_xy_w is None:
+        if obstacle_local_position is None:
+            raise RuntimeError("Obstacle positions are unavailable; initialize them in the reset event.")
+        obstacle_xy_w = env.scene.env_origins[:, :2] + torch.tensor(
+            obstacle_local_position,
+            device=env.device,
+            dtype=asset.data.root_pos_w.dtype,
+        ).unsqueeze(0)
+    center_distance = torch.linalg.vector_norm(asset.data.root_pos_w[:, :2] - obstacle_xy_w, dim=1)
+    penetration = torch.relu(float(safety_radius) - center_distance)
+    return torch.square(torch.clamp(penetration / float(transition_width), max=1.0))
+
+
+def _obstacle_route_state(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float,
+    exit_fade_distance: float,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[Articulation, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    asset: Articulation = env.scene[asset_cfg.name]
+    obstacle_xy_w = getattr(env, OBSTACLE_POSITION_ATTR, None)
+    side_waypoint_xy_w = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR, None)
+    exit_waypoint_xy_w = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, None)
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR, None)
+    if obstacle_xy_w is None or side_waypoint_xy_w is None or exit_waypoint_xy_w is None or route_phase is None:
+        raise RuntimeError("Obstacle route state is unavailable; initialize it in the reset event.")
+    if float(side_clearance_radius) <= 0.0 or float(exit_fade_distance) <= 0.0:
+        raise ValueError("side_clearance_radius and exit_fade_distance must be positive.")
+
+    root_xy = asset.data.root_pos_w[:, :2]
+    obstacle_clearance = torch.linalg.vector_norm(root_xy - obstacle_xy_w, dim=1)
+    side_complete = (
+        (route_phase == 0)
+        & (root_xy[:, 0] >= side_waypoint_xy_w[:, 0])
+        & (obstacle_clearance >= float(side_clearance_radius))
+    )
+    route_phase[side_complete] = 1
+    exit_complete = (
+        (route_phase == 1)
+        & (root_xy[:, 0] >= exit_waypoint_xy_w[:, 0])
+        & (obstacle_clearance >= float(side_clearance_radius))
+    )
+    route_phase[exit_complete] = 2
+
+    active_waypoint = torch.where(
+        (route_phase == 0).unsqueeze(1),
+        side_waypoint_xy_w,
+        exit_waypoint_xy_w,
+    )
+    waypoint_delta_w = active_waypoint - root_xy
+    exit_distance_x = exit_waypoint_xy_w[:, 0] - root_xy[:, 0]
+    exit_gate = torch.clamp(exit_distance_x / float(exit_fade_distance), min=0.0, max=1.0)
+    route_gate = torch.where(
+        route_phase == 0,
+        torch.ones_like(exit_gate),
+        torch.where(route_phase == 1, exit_gate, torch.zeros_like(exit_gate)),
+    )
+    return asset, obstacle_xy_w, waypoint_delta_w, route_gate, route_phase
+
+
+def obstacle_route_progress(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float = 1.15,
+    exit_fade_distance: float = 1.0,
+    max_progress_per_step: float = 0.08,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward progress toward a temporary safe-side waypoint before passing the obstacle."""
+
+    _, _, waypoint_delta_w, route_gate, route_phase = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    current_distance = torch.linalg.vector_norm(waypoint_delta_w, dim=1)
+    previous_distance = getattr(env, OBSTACLE_ROUTE_PREV_DISTANCE_ATTR, None)
+    if previous_distance is None:
+        raise RuntimeError("Obstacle route distance is unavailable; initialize it in the reset event.")
+    progress_phase = getattr(env, OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR, None)
+    if progress_phase is None:
+        raise RuntimeError("Obstacle route progress phase is unavailable; initialize it in the reset event.")
+    phase_changed = progress_phase != route_phase
+    progress = torch.clamp(
+        previous_distance - current_distance,
+        min=-float(max_progress_per_step),
+        max=float(max_progress_per_step),
+    )
+    progress = torch.where(phase_changed, torch.zeros_like(progress), progress)
+    previous_distance.copy_(current_distance)
+    progress_phase.copy_(route_phase)
+    return route_gate.to(progress.dtype) * progress
+
+
+def obstacle_route_heading_error(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float = 1.15,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize heading error to the temporary safe-side waypoint before obstacle passage."""
+
+    asset, _, waypoint_delta_w, route_gate, _ = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)),
+        dim=1,
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1),
+        waypoint_delta_3d,
+    )
+    heading_error = torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0])
+    return route_gate.to(heading_error.dtype) * torch.square(heading_error / math.pi)
+
+
 def short_goal_near_stop_penalty(
     env: ManagerBasedRLEnv,
     stop_distance: float = 0.5,
@@ -1011,6 +1165,74 @@ def short_goal_speed_profile_penalty(
     )
     yaw_penalty = near_gate * torch.square(yaw_rate / max(float(yaw_rate_ref), 1.0e-6))
     penalty = linear_penalty + float(yaw_component_weight) * yaw_penalty
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_pre_stop_xy_speed_envelope_penalty(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    full_speed_distance: float = 2.0,
+    allowed_speed_at_enter: float = 0.15,
+    allowed_speed_at_full: float = 0.80,
+    excess_speed_reference: float = 0.40,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize planar speed above a tightening envelope before the stop phase.
+
+    Unlike the directional braking term, this also observes lateral body motion.
+    It remains inactive after stop-phase latching, where the dedicated stop terms
+    take over, and outside ``full_speed_distance`` so cruise behavior is unchanged.
+    """
+
+    if float(full_speed_distance) <= float(enter_distance):
+        raise ValueError("full_speed_distance must be greater than enter_distance.")
+    if float(allowed_speed_at_enter) < 0.0:
+        raise ValueError("allowed_speed_at_enter must be non-negative.")
+    if float(allowed_speed_at_full) < float(allowed_speed_at_enter):
+        raise ValueError("allowed_speed_at_full must be at least allowed_speed_at_enter.")
+    if float(excess_speed_reference) <= 0.0:
+        raise ValueError("excess_speed_reference must be positive.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    distance_fraction = torch.clamp(
+        (goal_distance - float(enter_distance))
+        / (float(full_speed_distance) - float(enter_distance)),
+        min=0.0,
+        max=1.0,
+    )
+    allowance = float(allowed_speed_at_enter) + distance_fraction * (
+        float(allowed_speed_at_full) - float(allowed_speed_at_enter)
+    )
+    base_xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    excess = torch.relu(base_xy_speed - allowance)
+    active = (goal_distance <= float(full_speed_distance)).to(excess.dtype)
+    penalty = active * torch.square(excess / float(excess_speed_reference))
+    return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_near_lateral_velocity_penalty(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.50,
+    active_distance: float = 2.50,
+    lateral_speed_reference: float = 0.40,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize body lateral motion only during the final goal approach."""
+
+    if float(active_distance) <= float(stop_distance):
+        raise ValueError("active_distance must be greater than stop_distance.")
+    if float(lateral_speed_reference) <= 0.0:
+        raise ValueError("lateral_speed_reference must be positive.")
+    asset: Articulation = env.scene[asset_cfg.name]
+    _, goal_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    near_gate = torch.clamp(
+        (float(active_distance) - goal_distance) / (float(active_distance) - float(stop_distance)),
+        min=0.0,
+        max=1.0,
+    )
+    lateral_speed = asset.data.root_lin_vel_b[:, 1]
+    penalty = near_gate * torch.square(lateral_speed / float(lateral_speed_reference))
     return _short_goal_navigation_gate(env, dtype=penalty.dtype) * penalty
 
 

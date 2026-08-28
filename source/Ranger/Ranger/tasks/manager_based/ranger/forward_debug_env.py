@@ -3258,8 +3258,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             wheel_joint_vel_mean = wheel_joint_vel.mean(dim=1)
             semantic_wheel_velocity_target_mean = semantic_wheel_velocity_target.mean(dim=1)
             semantic_wheel_joint_vel_mean = semantic_wheel_joint_vel.mean(dim=1)
-            wheel_left_target_mean = wheel_velocity_target[:, 0:2].mean(dim=1)
-            wheel_right_target_mean = wheel_velocity_target[:, 2:4].mean(dim=1)
+            wheel_left_target_mean = semantic_wheel_velocity_target[:, 0:2].mean(dim=1)
+            wheel_right_target_mean = semantic_wheel_velocity_target[:, 2:4].mean(dim=1)
             wheel_common_mode_target = 0.5 * (wheel_left_target_mean + wheel_right_target_mean)
             wheel_differential_target = wheel_right_target_mean - wheel_left_target_mean
             goal_left_mask = self._short_goal_initial_side_sign > 0.0

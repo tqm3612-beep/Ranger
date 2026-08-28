@@ -580,3 +580,33 @@ RANGER_VISUALIZE_GOAL=1 /home/tqm/miniconda3/envs/isaaclab/bin/python scripts/rs
 
 阶段讨论：可以考虑提前启动后续感知分支实验，但不应直接把 large-heading rare catastrophic branch 视为“未来复杂环境会自然消失”。更合适的路线是保留 J4 作为运动核心参考，在初期冻结或强锚定已有 actor/trunk/head，只训练新增 perception encoder / fusion 或受控 residual，使“激活感知”与“重学基础运动”分离。这样可以验证复杂环境是否确实诱导新的 action structure，同时避免把当前 PPO update instability 混入地形/障碍学习。
 
+---
+
+## 2026-08-20 — P0 Teacher-Free Perception Activation smoke test
+
+建立独立 perception 分支，不修改旧 `RangerShortGoalFlatCRecurrentEnvCfg`：
+
+- `RangerPerceptionP0EnvCfg` 直接继承 `RangerShortGoalFlatV10EnvCfg`，仅把 `policy_map.local_navigation_map.use_neutral_map=False`；
+- `RangerPerceptionP0NeutralEnvCfg` 作为同任务 neutral-map 控制组；
+- 两者统一使用 `PerceptionP0RecurrentPPORunnerCfg`，保持 J4 的 recurrent actor 架构；
+- P0 全程仅 play/inference，没有 PPO update，没有 Teacher，也没有 partial freeze。
+
+首先以 4 env / seed2 / 900 steps 做 smoke test：neutral 7/7 success，real-map 6/6 success，均无 timeout 或其他失败，说明 real map 接入没有造成即时策略崩溃。
+
+随后以 64 env / seed2 / 900 steps 做扩大评估：
+
+| Metric | Neutral map | Real map |
+| --- | ---: | ---: |
+| completed episodes | 110 | 107 |
+| stopped-goal success | 100% | 100% |
+| mean success steps | 406.582 | 405.869 |
+| path efficiency | 0.863881 | 0.861027 |
+| max rebound after min | 0.027265 m | 0.023437 m |
+| heading error abs mean | 0.557768 | 0.586702 |
+| approach heading error abs mean | 0.635095 | 0.702911 |
+| yaw correct direction rate | 0.698337 | 0.713247 |
+| yaw wrong direction rate | 0.243705 | 0.240624 |
+| far velocity toward goal | 1.042616 m/s | 1.121676 m/s |
+
+初步结论：在 flat ground 上，仅把 neutral map 替换成真实 8-channel map 后，J4 的主要运动能力保持稳定，没有出现明显 regression。行为并非数值完全一致：real-map 组 heading error 略高、far forward speed 略高，但 path efficiency、完成时间、rebound、yaw-direction 指标总体仍处于同一行为区间。P0 因而通过“不会立即摧毁 J4”的第一层 smoke-test，可以继续进入 map 数值/语义验证和 simple-terrain P1-A；当前结果仍不能证明 J4 已经真正利用 perception，因为 flat real-map 本身缺少有意义的 terrain variation。
+

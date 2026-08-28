@@ -13,10 +13,18 @@ import torch
 import torch.nn.functional as F
 
 import isaaclab.utils.math as math_utils
-from isaaclab.assets import Articulation
+from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
+
+from ..terrain_cfg import (
+    RANGER_WAVE_AMPLITUDE_M,
+    RANGER_WAVE_GOAL_MARKER_HEIGHT_M,
+    RANGER_WAVE_GOAL_X_M,
+    RANGER_WAVE_START_X_M,
+    RANGER_WAVE_WAVELENGTH_M,
+)
 
 
 SPEED_COMMAND_ATTR = "_ranger_speed_command"
@@ -35,7 +43,16 @@ SUSPENSION_STROKE_RATE_ATTR = "_ranger_suspension_stroke_rate"
 SUSPENSION_STROKE_RATE_STEP_ATTR = "_ranger_suspension_stroke_rate_step"
 COMMAND_OBS_CACHE_ATTR = "_ranger_command_obs_cache"
 COMMAND_OBS_CACHE_STEP_ATTR = "_ranger_command_obs_cache_step"
+GOAL_VISIBILITY_OFFSETS_ATTR = "_ranger_goal_visibility_offsets"
+GOAL_VISIBLE_MASK_ATTR = "_ranger_goal_visible_mask"
 WHEEL_CONTACT_SENSOR_BODY_IDS_ATTR = "_ranger_wheel_contact_sensor_body_ids"
+OBSTACLE_POSITION_ATTR = "_ranger_obstacle_position_w"
+OBSTACLE_ROUTE_WAYPOINT_ATTR = "_ranger_obstacle_route_waypoint_w"
+OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR = "_ranger_obstacle_route_exit_waypoint_w"
+OBSTACLE_ROUTE_PREV_DISTANCE_ATTR = "_ranger_obstacle_route_prev_distance"
+OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR = "_ranger_obstacle_route_progress_phase"
+OBSTACLE_ROUTE_PHASE_ATTR = "_ranger_obstacle_route_phase"
+OBSTACLE_TRAINING_SCENARIO_ATTR = "_ranger_obstacle_training_scenario"
 
 
 def _obs_debug_enabled() -> bool:
@@ -479,6 +496,41 @@ def reset_short_goal_target(
         prev_heading_error[env_ids] = float("nan")
 
 
+def reset_wave_terrain_short_goal_target(
+    env: ManagerBasedEnv,
+    env_ids,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Place the wave-terrain goal near local x=30 m on a neutral-height crossing."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    env_origins = getattr(env.scene, "env_origins", None)
+    if env_origins is None or env_origins.shape[0] != env.num_envs:
+        env_origins = asset.data.root_pos_w
+
+    goal_delta_x = float(RANGER_WAVE_GOAL_X_M - RANGER_WAVE_START_X_M)
+    local_goal_x = torch.full((env_ids.numel(),), float(RANGER_WAVE_GOAL_X_M), device=env.device)
+    terrain_height = float(RANGER_WAVE_AMPLITUDE_M) * torch.sin(
+        2.0 * math.pi * local_goal_x / float(RANGER_WAVE_WAVELENGTH_M)
+    )
+
+    target_pos_w[env_ids, 0] = env_origins[env_ids, 0] + goal_delta_x
+    target_pos_w[env_ids, 1] = env_origins[env_ids, 1]
+    target_pos_w[env_ids, 2] = terrain_height + float(RANGER_WAVE_GOAL_MARKER_HEIGHT_M)
+
+    target_xy_w = target_pos_w[env_ids, :2] - asset.data.root_pos_w[env_ids, :2]
+    prev_goal_distance[env_ids] = torch.norm(target_xy_w, dim=1)
+    goal_reached[env_ids] = False
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is not None and prev_heading_error.shape == (env.num_envs,):
+        prev_heading_error[env_ids] = float("nan")
+
+
 def reset_short_goal_turn_target(
     env: ManagerBasedEnv,
     env_ids,
@@ -595,6 +647,346 @@ def reset_short_goal_stratified_target(
         prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
         setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
     prev_heading_error[env_ids] = heading
+
+
+def reset_short_goal_behind_fixed_obstacle(
+    env: ManagerBasedEnv,
+    env_ids,
+    obstacle_local_position: tuple[float, float] = (3.5, 0.0),
+    distance_beyond_obstacle_range: tuple[float, float] = (3.5, 6.0),
+    lateral_offset_range: tuple[float, float] = (-0.30, 0.30),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Place the goal behind a fixed obstacle so the direct path intersects it."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+    if distance_beyond_obstacle_range[1] <= distance_beyond_obstacle_range[0]:
+        raise ValueError("distance_beyond_obstacle_range must satisfy high > low.")
+    if lateral_offset_range[1] < lateral_offset_range[0]:
+        raise ValueError("lateral_offset_range must satisfy high >= low.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    num = env_ids.numel()
+    root_pos_w = asset.data.root_pos_w[env_ids]
+    obstacle_xy_w = env.scene.env_origins[env_ids, :2] + torch.tensor(
+        obstacle_local_position,
+        device=env.device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    obstacle_vec_xy = obstacle_xy_w - root_pos_w[:, :2]
+    obstacle_distance = torch.linalg.vector_norm(obstacle_vec_xy, dim=1)
+    obstacle_direction = obstacle_vec_xy / torch.clamp(obstacle_distance.unsqueeze(1), min=1.0e-6)
+    obstacle_lateral = torch.stack((-obstacle_direction[:, 1], obstacle_direction[:, 0]), dim=1)
+
+    distance_beyond = torch.empty((num,), device=env.device, dtype=torch.float32).uniform_(
+        float(distance_beyond_obstacle_range[0]),
+        float(distance_beyond_obstacle_range[1]),
+    )
+    lateral_offset = torch.empty((num,), device=env.device, dtype=torch.float32).uniform_(
+        float(lateral_offset_range[0]),
+        float(lateral_offset_range[1]),
+    )
+    target_xy_w = (
+        obstacle_xy_w
+        + obstacle_direction * distance_beyond.unsqueeze(1)
+        + obstacle_lateral * lateral_offset.unsqueeze(1)
+    )
+    target_pos_w[env_ids, :2] = target_xy_w
+    target_pos_w[env_ids, 2] = root_pos_w[:, 2]
+
+    target_vec_w = target_pos_w[env_ids] - root_pos_w
+    target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w[env_ids], target_vec_w)
+    distance = torch.linalg.vector_norm(target_vec_b[:, :2], dim=1)
+    heading = torch.atan2(target_vec_b[:, 1], target_vec_b[:, 0])
+    prev_goal_distance[env_ids] = distance
+    goal_reached[env_ids] = False
+
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
+        prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=torch.float32)
+        setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
+    prev_heading_error[env_ids] = heading
+
+
+def reset_short_goal_behind_random_obstacle(
+    env: ManagerBasedEnv,
+    env_ids,
+    obstacle_x_range: tuple[float, float] = (3.2, 3.8),
+    obstacle_abs_y_range: tuple[float, float] = (0.15, 0.40),
+    route_lateral_offset: float = 1.10,
+    route_side_forward_offset: float = 0.40,
+    route_exit_forward_offset: float = 2.00,
+    route_exit_lateral_scale: float = 0.55,
+    distance_beyond_obstacle_range: tuple[float, float] = (3.5, 6.0),
+    lateral_offset_range: tuple[float, float] = (-0.30, 0.30),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    obstacle_cfg: SceneEntityCfg = SceneEntityCfg("obstacle"),
+) -> None:
+    """Randomize a blocking obstacle and initialize a privileged P0 route waypoint."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+    if obstacle_x_range[1] <= obstacle_x_range[0]:
+        raise ValueError("obstacle_x_range must satisfy high > low.")
+    if obstacle_abs_y_range[0] <= 0.0 or obstacle_abs_y_range[1] <= obstacle_abs_y_range[0]:
+        raise ValueError("obstacle_abs_y_range must be positive and satisfy high > low.")
+    if route_lateral_offset <= 0.0:
+        raise ValueError("route_lateral_offset must be positive.")
+    if route_side_forward_offset < 0.0:
+        raise ValueError("route_side_forward_offset must be non-negative.")
+    if route_exit_forward_offset <= route_side_forward_offset:
+        raise ValueError("route_exit_forward_offset must be greater than route_side_forward_offset.")
+    if not 0.0 <= route_exit_lateral_scale <= 1.0:
+        raise ValueError("route_exit_lateral_scale must be in [0, 1].")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    obstacle: RigidObject = env.scene[obstacle_cfg.name]
+    num = env_ids.numel()
+    dtype = asset.data.root_pos_w.dtype
+    origins = env.scene.env_origins[env_ids]
+
+    obstacle_x = torch.empty((num,), device=env.device, dtype=dtype).uniform_(*obstacle_x_range)
+    obstacle_abs_y = torch.empty((num,), device=env.device, dtype=dtype).uniform_(*obstacle_abs_y_range)
+    obstacle_side = torch.where(
+        torch.rand((num,), device=env.device) < 0.5,
+        -torch.ones((num,), device=env.device, dtype=dtype),
+        torch.ones((num,), device=env.device, dtype=dtype),
+    )
+    obstacle_y = obstacle_side * obstacle_abs_y
+    obstacle_pose = obstacle.data.default_root_state[env_ids, :7].clone()
+    obstacle_pose[:, 0] = origins[:, 0] + obstacle_x
+    obstacle_pose[:, 1] = origins[:, 1] + obstacle_y
+    obstacle_pose[:, 2] = origins[:, 2] + 0.60
+    obstacle.write_root_pose_to_sim(obstacle_pose, env_ids=env_ids)
+
+    obstacle_position = getattr(env, OBSTACLE_POSITION_ATTR, None)
+    if obstacle_position is None or obstacle_position.shape != (env.num_envs, 2):
+        obstacle_position = torch.zeros((env.num_envs, 2), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_POSITION_ATTR, obstacle_position)
+    obstacle_position[env_ids] = obstacle_pose[:, :2]
+
+    route_waypoint = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR, None)
+    if route_waypoint is None or route_waypoint.shape != (env.num_envs, 2):
+        route_waypoint = torch.zeros((env.num_envs, 2), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR, route_waypoint)
+    route_waypoint[env_ids, 0] = obstacle_pose[:, 0] + float(route_side_forward_offset)
+    route_waypoint[env_ids, 1] = origins[:, 1] - obstacle_side * float(route_lateral_offset)
+
+    exit_waypoint = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, None)
+    if exit_waypoint is None or exit_waypoint.shape != (env.num_envs, 2):
+        exit_waypoint = torch.zeros((env.num_envs, 2), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, exit_waypoint)
+    exit_waypoint[env_ids, 0] = obstacle_pose[:, 0] + float(route_exit_forward_offset)
+    exit_waypoint[env_ids, 1] = origins[:, 1] - obstacle_side * float(route_lateral_offset) * float(
+        route_exit_lateral_scale
+    )
+
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR, None)
+    if route_phase is None or route_phase.shape != (env.num_envs,):
+        route_phase = torch.zeros((env.num_envs,), device=env.device, dtype=torch.long)
+        setattr(env, OBSTACLE_ROUTE_PHASE_ATTR, route_phase)
+    route_phase[env_ids] = 0
+    progress_phase = getattr(env, OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR, None)
+    if progress_phase is None or progress_phase.shape != (env.num_envs,):
+        progress_phase = torch.zeros((env.num_envs,), device=env.device, dtype=torch.long)
+        setattr(env, OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR, progress_phase)
+    progress_phase[env_ids] = 0
+
+    root_xy = asset.data.root_pos_w[env_ids, :2]
+    route_prev_distance = getattr(env, OBSTACLE_ROUTE_PREV_DISTANCE_ATTR, None)
+    if route_prev_distance is None or route_prev_distance.shape != (env.num_envs,):
+        route_prev_distance = torch.zeros((env.num_envs,), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_ROUTE_PREV_DISTANCE_ATTR, route_prev_distance)
+    route_prev_distance[env_ids] = torch.linalg.vector_norm(route_waypoint[env_ids] - root_xy, dim=1)
+
+    distance_beyond = torch.empty((num,), device=env.device, dtype=dtype).uniform_(
+        *distance_beyond_obstacle_range
+    )
+    goal_lateral = torch.empty((num,), device=env.device, dtype=dtype).uniform_(*lateral_offset_range)
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    target_pos_w[env_ids, 0] = obstacle_pose[:, 0] + distance_beyond
+    target_pos_w[env_ids, 1] = origins[:, 1] + goal_lateral
+    target_pos_w[env_ids, 2] = asset.data.root_pos_w[env_ids, 2]
+
+    target_vec_w = target_pos_w[env_ids] - asset.data.root_pos_w[env_ids]
+    target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w[env_ids], target_vec_w)
+    distance = torch.linalg.vector_norm(target_vec_b[:, :2], dim=1)
+    heading = torch.atan2(target_vec_b[:, 1], target_vec_b[:, 0])
+    prev_goal_distance[env_ids] = distance
+    goal_reached[env_ids] = False
+
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is None or prev_heading_error.shape != (env.num_envs,):
+        prev_heading_error = torch.full((env.num_envs,), float("nan"), device=env.device, dtype=dtype)
+        setattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, prev_heading_error)
+    prev_heading_error[env_ids] = heading
+
+
+def reset_short_goal_obstacle_phase_mixture(
+    env: ManagerBasedEnv,
+    env_ids,
+    scenario_weights: tuple[float, float, float] = (0.50, 0.25, 0.25),
+    obstacle_x_range: tuple[float, float] = (3.2, 3.8),
+    obstacle_abs_y_range: tuple[float, float] = (0.15, 0.40),
+    route_lateral_offset: float = 1.10,
+    route_side_forward_offset: float = 0.40,
+    route_exit_forward_offset: float = 2.00,
+    route_exit_lateral_scale: float = 0.55,
+    distance_beyond_obstacle_range: tuple[float, float] = (5.5, 8.0),
+    lateral_offset_range: tuple[float, float] = (-0.30, 0.30),
+    exit_x_after_obstacle_range: tuple[float, float] = (0.55, 1.10),
+    exit_lateral_jitter: float = 0.12,
+    exit_heading_error_range_deg: tuple[float, float] = (-25.0, 25.0),
+    exit_stratify_heading_sign: bool = False,
+    exit_forward_speed_range: tuple[float, float] = (0.0, 0.0),
+    stop_distance_range: tuple[float, float] = (1.0, 2.5),
+    stop_lateral_offset_range: tuple[float, float] = (-0.20, 0.20),
+    stop_heading_error_range_deg: tuple[float, float] = (-20.0, 20.0),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    obstacle_cfg: SceneEntityCfg = SceneEntityCfg("obstacle"),
+) -> None:
+    """Reset a fixed mixture of full-route, obstacle-exit, and near-goal episodes."""
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+    weights = torch.tensor(scenario_weights, device=env.device, dtype=torch.float32)
+    if tuple(weights.shape) != (3,) or torch.any(weights < 0.0) or float(weights.sum().item()) <= 0.0:
+        raise ValueError("scenario_weights must contain three non-negative values with positive sum.")
+    if exit_x_after_obstacle_range[1] <= exit_x_after_obstacle_range[0]:
+        raise ValueError("exit_x_after_obstacle_range must satisfy high > low.")
+    if exit_heading_error_range_deg[1] <= exit_heading_error_range_deg[0]:
+        raise ValueError("exit_heading_error_range_deg must satisfy high > low.")
+    if exit_forward_speed_range[0] < 0.0 or exit_forward_speed_range[1] < exit_forward_speed_range[0]:
+        raise ValueError("exit_forward_speed_range must be non-negative and satisfy high >= low.")
+    if stop_distance_range[1] <= stop_distance_range[0]:
+        raise ValueError("stop_distance_range must satisfy high > low.")
+
+    reset_short_goal_behind_random_obstacle(
+        env,
+        env_ids,
+        obstacle_x_range=obstacle_x_range,
+        obstacle_abs_y_range=obstacle_abs_y_range,
+        route_lateral_offset=route_lateral_offset,
+        route_side_forward_offset=route_side_forward_offset,
+        route_exit_forward_offset=route_exit_forward_offset,
+        route_exit_lateral_scale=route_exit_lateral_scale,
+        distance_beyond_obstacle_range=distance_beyond_obstacle_range,
+        lateral_offset_range=lateral_offset_range,
+        asset_cfg=asset_cfg,
+        obstacle_cfg=obstacle_cfg,
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    weights = weights / weights.sum()
+    # A deterministic env partition gives every PPO rollout the same scenario balance.
+    cumulative = torch.cumsum(weights, dim=0)
+    fractions = (torch.remainder(env_ids, 20).to(torch.float32) + 0.5) / 20.0
+    scenario = torch.bucketize(fractions, cumulative[:2])
+    scenario_state = getattr(env, OBSTACLE_TRAINING_SCENARIO_ATTR, None)
+    if scenario_state is None or scenario_state.shape != (env.num_envs,):
+        scenario_state = torch.zeros((env.num_envs,), device=env.device, dtype=torch.long)
+        setattr(env, OBSTACLE_TRAINING_SCENARIO_ATTR, scenario_state)
+    scenario_state[env_ids] = scenario
+
+    obstacle_xy = getattr(env, OBSTACLE_POSITION_ATTR)
+    side_waypoint = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR)
+    exit_waypoint = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR)
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR)
+    progress_phase = getattr(env, OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR)
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+
+    root_pose = torch.cat((asset.data.root_pos_w[env_ids], asset.data.root_quat_w[env_ids]), dim=1).clone()
+    root_velocity = torch.zeros((env_ids.numel(), 6), device=env.device, dtype=root_pose.dtype)
+
+    exit_mask = scenario == 1
+    if torch.any(exit_mask):
+        local_ids = torch.nonzero(exit_mask, as_tuple=False).squeeze(1)
+        selected_env_ids = env_ids[local_ids]
+        count = local_ids.numel()
+        root_pose[local_ids, 0] = obstacle_xy[selected_env_ids, 0] + torch.empty(
+            count, device=env.device, dtype=root_pose.dtype
+        ).uniform_(*exit_x_after_obstacle_range)
+        bypass_sign = torch.sign(side_waypoint[selected_env_ids, 1] - env.scene.env_origins[selected_env_ids, 1])
+        root_pose[local_ids, 1] = side_waypoint[selected_env_ids, 1] + bypass_sign * torch.empty(
+            count, device=env.device, dtype=root_pose.dtype
+        ).uniform_(-float(exit_lateral_jitter), float(exit_lateral_jitter))
+        goal_delta = target_pos_w[selected_env_ids, :2] - root_pose[local_ids, :2]
+        goal_yaw = torch.atan2(goal_delta[:, 1], goal_delta[:, 0])
+        if exit_stratify_heading_sign:
+            if exit_heading_error_range_deg[0] >= 0.0 or exit_heading_error_range_deg[1] <= 0.0:
+                raise ValueError("Stratified exit headings require a range spanning zero.")
+            negative = torch.remainder(selected_env_ids, 2) == 0
+            negative_error = -torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+                0.0, math.radians(abs(float(exit_heading_error_range_deg[0])))
+            )
+            positive_error = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+                0.0, math.radians(float(exit_heading_error_range_deg[1]))
+            )
+            yaw_error = torch.where(negative, negative_error, positive_error)
+        else:
+            yaw_error = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+                math.radians(float(exit_heading_error_range_deg[0])),
+                math.radians(float(exit_heading_error_range_deg[1])),
+            )
+        zeros = torch.zeros_like(goal_yaw)
+        initial_yaw = goal_yaw + yaw_error
+        root_pose[local_ids, 3:7] = math_utils.quat_from_euler_xyz(zeros, zeros, initial_yaw)
+        forward_speed = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+            *exit_forward_speed_range
+        )
+        root_velocity[local_ids, 0] = forward_speed * torch.cos(initial_yaw)
+        root_velocity[local_ids, 1] = forward_speed * torch.sin(initial_yaw)
+        route_phase[selected_env_ids] = 1
+        progress_phase[selected_env_ids] = 1
+
+    stop_mask = scenario == 2
+    if torch.any(stop_mask):
+        local_ids = torch.nonzero(stop_mask, as_tuple=False).squeeze(1)
+        selected_env_ids = env_ids[local_ids]
+        count = local_ids.numel()
+        distance = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(*stop_distance_range)
+        lateral = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+            *stop_lateral_offset_range
+        )
+        root_pose[local_ids, 0] = target_pos_w[selected_env_ids, 0] - distance
+        root_pose[local_ids, 1] = target_pos_w[selected_env_ids, 1] + lateral
+        goal_delta = target_pos_w[selected_env_ids, :2] - root_pose[local_ids, :2]
+        goal_yaw = torch.atan2(goal_delta[:, 1], goal_delta[:, 0])
+        yaw_error = torch.empty(count, device=env.device, dtype=root_pose.dtype).uniform_(
+            math.radians(float(stop_heading_error_range_deg[0])),
+            math.radians(float(stop_heading_error_range_deg[1])),
+        )
+        zeros = torch.zeros_like(goal_yaw)
+        root_pose[local_ids, 3:7] = math_utils.quat_from_euler_xyz(zeros, zeros, goal_yaw + yaw_error)
+        route_phase[selected_env_ids] = 2
+        progress_phase[selected_env_ids] = 2
+
+    moved_mask = scenario != 0
+    if torch.any(moved_mask):
+        moved_local_ids = torch.nonzero(moved_mask, as_tuple=False).squeeze(1)
+        moved_env_ids = env_ids[moved_local_ids]
+        asset.write_root_pose_to_sim(root_pose[moved_local_ids], env_ids=moved_env_ids)
+        asset.write_root_velocity_to_sim(root_velocity[moved_local_ids], env_ids=moved_env_ids)
+
+    active_waypoint = torch.where(
+        (route_phase[env_ids] == 0).unsqueeze(1),
+        side_waypoint[env_ids],
+        exit_waypoint[env_ids],
+    )
+    route_prev_distance = getattr(env, OBSTACLE_ROUTE_PREV_DISTANCE_ATTR)
+    route_prev_distance[env_ids] = torch.linalg.vector_norm(active_waypoint - root_pose[:, :2], dim=1)
+    target_delta = target_pos_w[env_ids, :2] - root_pose[:, :2]
+    prev_goal_distance[env_ids] = torch.linalg.vector_norm(target_delta, dim=1)
+    goal_reached[env_ids] = False
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is not None and prev_heading_error.shape == (env.num_envs,):
+        root_yaw = math_utils.euler_xyz_from_quat(root_pose[:, 3:7])[2]
+        prev_heading_error[env_ids] = math_utils.wrap_to_pi(torch.atan2(target_delta[:, 1], target_delta[:, 0]) - root_yaw)
 
 
 def goal_heading_target_pos_w(env: ManagerBasedEnv) -> torch.Tensor:
@@ -953,6 +1345,12 @@ def command_observation(
     short_goal_near_distance_range: float = 3.0,
     short_goal_global_distance_unit: float = 1.0,
     short_goal_velocity_reference: float = 1.5,
+    short_goal_heading_rate_reference: float | None = None,
+    goal_visibility_mode: str = "always",
+    goal_visible_steps: int = 5,
+    goal_hidden_steps: int = 25,
+    goal_hidden_indicator_index: int | None = None,
+    observation_cache_key: str = "default",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Return the fixed eight-dimensional command/goal observation for actor state."""
@@ -966,8 +1364,15 @@ def command_observation(
     del max_command_duration
 
     current_step = int(env.common_step_counter)
-    cached_obs = getattr(env, COMMAND_OBS_CACHE_ATTR, None)
-    cached_step = getattr(env, COMMAND_OBS_CACHE_STEP_ATTR, None)
+    cache_key = str(observation_cache_key)
+    cached_observations = getattr(env, COMMAND_OBS_CACHE_ATTR, {})
+    cached_steps = getattr(env, COMMAND_OBS_CACHE_STEP_ATTR, {})
+    if not isinstance(cached_observations, dict):
+        cached_observations = {}
+    if not isinstance(cached_steps, dict):
+        cached_steps = {}
+    cached_obs = cached_observations.get(cache_key)
+    cached_step = cached_steps.get(cache_key)
     if (
         cached_obs is not None
         and cached_obs.shape == (env.num_envs, 8)
@@ -1013,6 +1418,28 @@ def command_observation(
         obs[:, 7] = torch.cos(heading_error)
     elif goal_source == "short_goal":
         target_vec_b, distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+        if short_goal_heading_rate_reference is not None:
+            heading_rate_reference = float(short_goal_heading_rate_reference)
+            if heading_rate_reference <= 0.0:
+                raise ValueError("short_goal_heading_rate_reference must be positive when provided.")
+            asset: Articulation = env.scene[asset_cfg.name]
+            target_x = target_vec_b[:, 0]
+            target_y = target_vec_b[:, 1]
+            velocity_x = asset.data.root_lin_vel_b[:, 0]
+            velocity_y = asset.data.root_lin_vel_b[:, 1]
+            yaw_rate = asset.data.root_ang_vel_b[:, 2]
+            radius_sq = torch.clamp(target_x.square() + target_y.square(), min=1.0e-4)
+            los_rate = (target_y * velocity_x - target_x * velocity_y) / radius_sq
+            heading_error_rate = los_rate - yaw_rate
+            # Slot 1 is unused by ShortGoal.  Expose the true point-goal bearing-rate
+            # state there for the wheel-control feedback branch, normalized to a
+            # bounded scale.  The recurrent goal encoder masks this reserved slot so
+            # legacy checkpoint features remain unchanged.
+            obs[:, 1] = torch.clamp(
+                heading_error_rate / heading_rate_reference,
+                min=-1.0,
+                max=1.0,
+            )
         stop_phase_active = getattr(env, "_short_goal_stop_phase_active", None)
         if stop_phase_active is not None and stop_phase_active.shape == (env.num_envs,):
             # ShortGoal does not use the three command slots; reuse slot 2 for the
@@ -1075,8 +1502,46 @@ def command_observation(
     else:
         raise ValueError(f"Unsupported goal_source: {goal_source}")
 
-    setattr(env, COMMAND_OBS_CACHE_ATTR, obs)
-    setattr(env, COMMAND_OBS_CACHE_STEP_ATTR, current_step)
+    visible_mask = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+    if goal_visibility_mode == "random_hidden":
+        cycle = max(int(goal_visible_steps) + int(goal_hidden_steps), 1)
+        visible = (current_step % cycle) < int(goal_visible_steps)
+        if not visible:
+            obs[:, 3:8] = 0.0
+            visible_mask.zero_()
+    elif goal_visibility_mode == "staggered_hidden":
+        visible_steps = int(goal_visible_steps)
+        hidden_steps = int(goal_hidden_steps)
+        if visible_steps <= 0 or hidden_steps <= 0:
+            raise ValueError("staggered_hidden requires positive visible and hidden step counts.")
+        cycle = visible_steps + hidden_steps
+        offsets = getattr(env, GOAL_VISIBILITY_OFFSETS_ATTR, None)
+        if not isinstance(offsets, torch.Tensor) or offsets.shape != (env.num_envs,):
+            offsets = torch.randint(0, cycle, (env.num_envs,), device=env.device)
+            setattr(env, GOAL_VISIBILITY_OFFSETS_ATTR, offsets)
+        episode_steps = env.episode_length_buf.to(device=env.device, dtype=torch.long)
+        phase = torch.remainder(episode_steps + offsets, cycle)
+        # Every reset begins with a full visible prefix. Afterwards the seeded
+        # per-environment offsets keep visible/hidden transitions asynchronous.
+        visible_mask = (episode_steps < visible_steps) | (phase < visible_steps)
+        obs[~visible_mask, 3:8] = 0.0
+    elif goal_visibility_mode != "always":
+        raise ValueError(f"Unsupported goal_visibility_mode: {goal_visibility_mode}")
+
+    if goal_hidden_indicator_index is not None:
+        indicator_index = int(goal_hidden_indicator_index)
+        if not 0 <= indicator_index < obs.shape[1]:
+            raise ValueError(
+                f"goal_hidden_indicator_index must be in [0, {obs.shape[1]}), got {indicator_index}."
+            )
+        obs[:, indicator_index] = (~visible_mask).to(obs.dtype)
+
+    if goal_visibility_mode != "always":
+        setattr(env, GOAL_VISIBLE_MASK_ATTR, visible_mask)
+    cached_observations[cache_key] = obs
+    cached_steps[cache_key] = current_step
+    setattr(env, COMMAND_OBS_CACHE_ATTR, cached_observations)
+    setattr(env, COMMAND_OBS_CACHE_STEP_ATTR, cached_steps)
     _obs_debug(f"exit policy_state/command_state shape={tuple(obs.shape)}")
     return obs
 
@@ -1514,13 +1979,13 @@ def _build_local_height_map(
     ray_hits_w = []
     for sensor_name in sensor_names:
         sensor: RayCaster = env.scene.sensors[sensor_name]
-        if hasattr(sensor.data, "ray_hits_w"):
-            hits_w = sensor.data.ray_hits_w
-        else:
-            # RayCasterCamera stores world-space hits on the sensor object and may
-            # update a subset of environments internally, so refresh all envs here.
-            sensor._update_buffers_impl(slice(None))
-            hits_w = sensor.ray_hits_w
+        hits_w = getattr(sensor.data, "ray_hits_w", None)
+        if hits_w is None:
+            # RayCasterCamera variants update through the data property but keep
+            # world-space hits on the sensor object instead of the data container.
+            hits_w = getattr(sensor, "ray_hits_w", None)
+        if hits_w is None:
+            raise RuntimeError(f"Ray sensor '{sensor_name}' did not provide world-space hit points.")
         ray_hits_w.append(hits_w)
     points_w = torch.cat(ray_hits_w, dim=1)
 

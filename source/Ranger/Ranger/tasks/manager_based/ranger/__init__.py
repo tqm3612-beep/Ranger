@@ -158,7 +158,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalFlatV10EnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatV10PPORunnerCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatCRecurrentPPORunnerCfg",
     },
 )
 
@@ -170,6 +170,373 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalFlatCRecurrentEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatCRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-ShortGoalMemory-v1",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalMemoryV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatCRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-ShortGoalMemory-v2",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerShortGoalMemoryV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:ShortGoalFlatCRecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Perception-P0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerPerceptionP0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PerceptionP0RecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Perception-P0-Neutral",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerPerceptionP0NeutralEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PerceptionP0RecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-ControlTransfer",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ControlTransferEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ControlTransferPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP0PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2BootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B5",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2WheelControlBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B5-Closeout",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2CloseoutBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B6-RateResidual",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2HeadingRateResidualBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B7-BalancedRateResidual",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2BalancedRateResidualBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B8-FastRateResidual",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FastBalancedRateResidualBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B9-UnifiedWheelResidual",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2UnifiedWheelResidualBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B11-TaperedCommonResidual",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2TaperedCommonResidualBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B12-HeadingRateFeedback",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2HeadingRateFeedbackBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B13-FixedRolloutIntensive",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FixedRolloutIntensiveBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B14-FixedRolloutFastLR",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FixedRolloutFastLRBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B10-UnifiedWheelControl",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2EnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2UnifiedWheelControlBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Stop",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05StopEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05StopPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Full",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05FullEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05FullPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Memory-M0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2MemoryM0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2MemoryM0PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Memory-M1",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2MemoryM1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2MemoryM1PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Terrain-P0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2TerrainP0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2TerrainP0PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Terrain-P1",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2TerrainP1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2TerrainP1PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Terrain-P15-BrakeAssist",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2TerrainP15BrakeAssistEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2TerrainP15BrakeAssistPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Terrain-P15",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2TerrainP15EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2TerrainP15PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Perception-Terrain-P0",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerPerceptionTerrainP0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PerceptionP0RecurrentPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Wave-Adaptation-PPO",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerPerceptionTerrainP0EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:WaveAdaptationPPORunnerCfg",
     },
 )
 

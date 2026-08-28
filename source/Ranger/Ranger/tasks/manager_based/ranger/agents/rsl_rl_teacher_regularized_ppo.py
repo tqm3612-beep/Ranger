@@ -13,6 +13,91 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.utils import unpad_trajectories
 
 
+def ranger_wheel_raw_to_semantic(wheel_actions: torch.Tensor) -> torch.Tensor:
+    """Convert Ranger wheel actions ``[lr, lf, rf, rr]`` to forward-positive semantics."""
+
+    if wheel_actions.shape[-1] != 4:
+        raise ValueError(f"Expected four Ranger wheel actions, got shape={tuple(wheel_actions.shape)}")
+    signs = wheel_actions.new_tensor((-1.0, -1.0, 1.0, 1.0))
+    return wheel_actions * signs
+
+
+def ranger_wheel_semantic_modes(wheel_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return forward common-mode and signed turn-mode from raw Ranger wheel actions."""
+
+    semantic_wheel = ranger_wheel_raw_to_semantic(wheel_actions)
+    left = semantic_wheel[..., :2].mean(dim=-1)
+    right = semantic_wheel[..., 2:].mean(dim=-1)
+    return 0.5 * (left + right), 0.5 * (right - left)
+
+
+def teacher_wheel_sample_weights(
+    stop_phase_mask: torch.Tensor,
+    near_goal_mask: torch.Tensor,
+    *,
+    stop_phase_weight: float,
+    near_goal_weight: float,
+) -> torch.Tensor:
+    """Return teacher wheel-loss weights with stop-phase priority over near-goal gating."""
+
+    if stop_phase_mask.shape != near_goal_mask.shape:
+        raise ValueError(
+            "stop_phase_mask and near_goal_mask must have the same shape, got "
+            f"{tuple(stop_phase_mask.shape)} and {tuple(near_goal_mask.shape)}."
+        )
+    weights = torch.ones_like(stop_phase_mask, dtype=torch.float32)
+    weights = torch.where(near_goal_mask, torch.full_like(weights, float(near_goal_weight)), weights)
+    return torch.where(stop_phase_mask, torch.full_like(weights, float(stop_phase_weight)), weights)
+
+
+def near_goal_brake_common_loss(
+    student_mean: torch.Tensor,
+    teacher_mean: torch.Tensor,
+    goal_distance: torch.Tensor,
+    stop_phase_mask: torch.Tensor,
+    *,
+    stop_distance: float,
+    full_distance: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce only the teacher's forward wheel mode near the goal.
+
+    Differential steering and front/rear wheel differences remain unconstrained. This gives the
+    recurrent student an explicit braking target without teaching it to stop correcting heading.
+    """
+
+    if student_mean.shape != teacher_mean.shape or student_mean.shape[-1] != 8:
+        raise ValueError(
+            "near_goal_brake_common_loss expects matching [..., 8] actions, got "
+            f"{tuple(student_mean.shape)} and {tuple(teacher_mean.shape)}."
+        )
+    if goal_distance.shape != stop_phase_mask.shape or goal_distance.shape != student_mean.shape[:-1]:
+        raise ValueError("Goal distance and stop mask must match the action batch shape.")
+    if stop_distance < 0.0 or full_distance <= stop_distance:
+        raise ValueError("Require 0 <= stop_distance < full_distance for near-goal braking.")
+
+    student_common, _ = ranger_wheel_semantic_modes(student_mean[..., 4:8])
+    teacher_common, _ = ranger_wheel_semantic_modes(teacher_mean[..., 4:8])
+    brake_scale = torch.clamp(
+        (goal_distance - float(stop_distance)) / float(full_distance - stop_distance),
+        min=0.0,
+        max=1.0,
+    ).to(student_mean.dtype)
+    brake_scale = torch.where(stop_phase_mask, torch.zeros_like(brake_scale), brake_scale)
+    target_common = teacher_common.detach() * brake_scale
+    active = (stop_phase_mask | (goal_distance <= float(full_distance))).to(student_mean.dtype)
+    active_sum = active.sum()
+    if float(active_sum.detach().item()) <= 1.0e-8:
+        zero = student_mean.sum() * 0.0
+        return zero, zero.detach(), zero.detach(), zero.detach()
+
+    common_error = student_common - target_common
+    loss = torch.sum(active * common_error.square()) / active_sum
+    active_fraction = active.mean()
+    error_abs = torch.sum(active * common_error.abs()) / active_sum
+    target_abs = torch.sum(active * target_common.abs()) / active_sum
+    return loss, active_fraction.detach(), error_abs.detach(), target_abs.detach()
+
+
 class RangerTeacherRegularizedPPO(PPO):
     """PPO with an optional frozen feedforward Ranger teacher action regularizer.
 
@@ -27,9 +112,18 @@ class RangerTeacherRegularizedPPO(PPO):
         *args,
         teacher_loss_coef: float = 0.0,
         teacher_checkpoint: str | None = None,
+        latent_loss_coef: float = 0.0,
+        residual_loss_coef: float = 1.0,
+        anchor_loss_coef: float = 1.0,
         teacher_suspension_loss_weight: float = 1.0,
         teacher_wheel_loss_weight: float = 1.0,
         teacher_stop_phase_wheel_weight: float = 0.0,
+        teacher_near_goal_distance: float | None = None,
+        teacher_near_goal_wheel_weight: float = 1.0,
+        teacher_goal_distance_unit: float = 1.0,
+        brake_common_loss_coef: float = 0.0,
+        brake_common_stop_distance: float = 0.5,
+        brake_common_full_distance: float = 1.8,
         actor_loss_scale: float = 1.0,
         ppo_surrogate_scale: float = 1.0,
         actor_learning_rate: float | None = None,
@@ -38,7 +132,17 @@ class RangerTeacherRegularizedPPO(PPO):
         large_heading_action_prior_start: float = 0.70,
         large_heading_action_prior_full: float = 1.05,
         large_heading_action_prior_common_target: float = 0.45,
+        large_heading_action_prior_taper_common: bool = False,
+        large_heading_action_prior_common_stop_distance: float = 0.45,
+        large_heading_action_prior_common_full_distance: float = 2.0,
         large_heading_action_prior_turn_gain: float = 0.55,
+        large_heading_action_prior_yaw_damping: float = 0.0,
+        large_heading_action_prior_yaw_rate_reference: float = 0.35,
+        large_heading_action_prior_heading_deadband: float = 0.0,
+        large_heading_action_prior_heading_scale: float = 0.40,
+        large_heading_action_prior_use_heading_rate_feedback: bool = False,
+        large_heading_action_prior_heading_rate_gain: float = 0.60,
+        large_heading_action_prior_balance_turn_targets: bool = False,
         critic_only: bool = False,
         diagnostic_only: bool = False,
         critic_relearning: bool = False,
@@ -58,6 +162,12 @@ class RangerTeacherRegularizedPPO(PPO):
             raise TypeError("RangerTeacherRegularizedPPO requires a recurrent student policy.")
         if teacher_loss_coef < 0.0:
             raise ValueError(f"teacher_loss_coef must be non-negative, got {teacher_loss_coef}.")
+        if latent_loss_coef < 0.0:
+            raise ValueError(f"latent_loss_coef must be non-negative, got {latent_loss_coef}.")
+        if residual_loss_coef < 0.0:
+            raise ValueError(f"residual_loss_coef must be non-negative, got {residual_loss_coef}.")
+        if anchor_loss_coef < 0.0:
+            raise ValueError(f"anchor_loss_coef must be non-negative, got {anchor_loss_coef}.")
         if teacher_suspension_loss_weight < 0.0 or teacher_wheel_loss_weight < 0.0:
             raise ValueError("Teacher action loss weights must be non-negative.")
         if not 0.0 <= teacher_stop_phase_wheel_weight <= 1.0:
@@ -65,12 +175,36 @@ class RangerTeacherRegularizedPPO(PPO):
                 "teacher_stop_phase_wheel_weight must be in [0, 1], got "
                 f"{teacher_stop_phase_wheel_weight}."
             )
+        if teacher_near_goal_distance is not None and teacher_near_goal_distance <= 0.0:
+            raise ValueError("teacher_near_goal_distance must be positive when provided.")
+        if not 0.0 <= teacher_near_goal_wheel_weight <= 1.0:
+            raise ValueError(
+                "teacher_near_goal_wheel_weight must be in [0, 1], got "
+                f"{teacher_near_goal_wheel_weight}."
+            )
+        if teacher_goal_distance_unit <= 0.0:
+            raise ValueError("teacher_goal_distance_unit must be positive.")
+        if brake_common_loss_coef < 0.0:
+            raise ValueError("brake_common_loss_coef must be non-negative.")
+        if brake_common_stop_distance < 0.0 or brake_common_full_distance <= brake_common_stop_distance:
+            raise ValueError("Require 0 <= brake_common_stop_distance < brake_common_full_distance.")
 
         self.teacher_loss_coef = float(teacher_loss_coef)
         self.teacher_checkpoint = None if teacher_checkpoint is None else str(teacher_checkpoint)
+        self.latent_loss_coef = float(latent_loss_coef)
+        self.residual_loss_coef = float(residual_loss_coef)
+        self.anchor_loss_coef = float(anchor_loss_coef)
         self.teacher_suspension_loss_weight = float(teacher_suspension_loss_weight)
         self.teacher_wheel_loss_weight = float(teacher_wheel_loss_weight)
         self.teacher_stop_phase_wheel_weight = float(teacher_stop_phase_wheel_weight)
+        self.teacher_near_goal_distance = (
+            None if teacher_near_goal_distance is None else float(teacher_near_goal_distance)
+        )
+        self.teacher_near_goal_wheel_weight = float(teacher_near_goal_wheel_weight)
+        self.teacher_goal_distance_unit = float(teacher_goal_distance_unit)
+        self.brake_common_loss_coef = float(brake_common_loss_coef)
+        self.brake_common_stop_distance = float(brake_common_stop_distance)
+        self.brake_common_full_distance = float(brake_common_full_distance)
         if actor_loss_scale <= 0.0:
             raise ValueError(f"actor_loss_scale must be positive, got {actor_loss_scale}.")
         self.actor_loss_scale = float(actor_loss_scale)
@@ -81,10 +215,16 @@ class RangerTeacherRegularizedPPO(PPO):
             raise ValueError(f"actor_learning_rate must be positive when provided, got {actor_learning_rate}.")
         self.actor_learning_rate = None if actor_learning_rate is None else float(actor_learning_rate)
         self.actor_train_scope = str(actor_train_scope)
-        if self.actor_train_scope not in {"all", "wheel_head", "wheel_residual"}:
+        if self.actor_train_scope not in {
+            "all",
+            "wheel_head",
+            "wheel_residual",
+            "wheel_control",
+            "wheel_control_residual",
+        }:
             raise ValueError(
                 f"Unsupported actor_train_scope={self.actor_train_scope!r}; "
-                "expected 'all', 'wheel_head', or 'wheel_residual'."
+                "expected 'all', 'wheel_head', 'wheel_residual', 'wheel_control', or 'wheel_control_residual'."
             )
         if self.actor_train_scope != "all" and self.actor_learning_rate is None:
             raise ValueError("A restricted actor_train_scope requires actor_learning_rate / split optimizer mode.")
@@ -97,7 +237,13 @@ class RangerTeacherRegularizedPPO(PPO):
                     if self.actor_train_scope == "wheel_head":
                         train_actor_parameter = name.startswith("actor.wheel_head.")
                     elif self.actor_train_scope == "wheel_residual":
-                        train_actor_parameter = name.startswith("actor.wheel_goal_residual.")
+                        train_actor_parameter = name.startswith("actor.wheel_control_residual.")
+                    elif self.actor_train_scope == "wheel_control":
+                        train_actor_parameter = name.startswith("actor.wheel_head.") or name.startswith(
+                            "actor.wheel_control_residual."
+                        )
+                    elif self.actor_train_scope == "wheel_control_residual":
+                        train_actor_parameter = name.startswith("actor.wheel_control_residual.")
                     parameter.requires_grad_(train_actor_parameter)
                     if train_actor_parameter:
                         actor_params.append(parameter)
@@ -118,11 +264,45 @@ class RangerTeacherRegularizedPPO(PPO):
             raise ValueError("large_heading_action_prior_coef must be non-negative.")
         if large_heading_action_prior_full <= large_heading_action_prior_start:
             raise ValueError("large_heading_action_prior_full must be greater than large_heading_action_prior_start.")
+        if (
+            large_heading_action_prior_common_stop_distance < 0.0
+            or large_heading_action_prior_common_full_distance <= large_heading_action_prior_common_stop_distance
+        ):
+            raise ValueError(
+                "Require 0 <= large_heading_action_prior_common_stop_distance "
+                "< large_heading_action_prior_common_full_distance."
+            )
+        if large_heading_action_prior_yaw_damping < 0.0:
+            raise ValueError("large_heading_action_prior_yaw_damping must be non-negative.")
+        if large_heading_action_prior_yaw_rate_reference <= 0.0:
+            raise ValueError("large_heading_action_prior_yaw_rate_reference must be positive.")
+        if large_heading_action_prior_heading_deadband < 0.0:
+            raise ValueError("large_heading_action_prior_heading_deadband must be non-negative.")
+        if large_heading_action_prior_heading_scale <= 0.0:
+            raise ValueError("large_heading_action_prior_heading_scale must be positive.")
+        if large_heading_action_prior_heading_rate_gain < 0.0:
+            raise ValueError("large_heading_action_prior_heading_rate_gain must be non-negative.")
         self.large_heading_action_prior_coef = float(large_heading_action_prior_coef)
         self.large_heading_action_prior_start = float(large_heading_action_prior_start)
         self.large_heading_action_prior_full = float(large_heading_action_prior_full)
         self.large_heading_action_prior_common_target = float(large_heading_action_prior_common_target)
+        self.large_heading_action_prior_taper_common = bool(large_heading_action_prior_taper_common)
+        self.large_heading_action_prior_common_stop_distance = float(
+            large_heading_action_prior_common_stop_distance
+        )
+        self.large_heading_action_prior_common_full_distance = float(
+            large_heading_action_prior_common_full_distance
+        )
         self.large_heading_action_prior_turn_gain = float(large_heading_action_prior_turn_gain)
+        self.large_heading_action_prior_yaw_damping = float(large_heading_action_prior_yaw_damping)
+        self.large_heading_action_prior_yaw_rate_reference = float(large_heading_action_prior_yaw_rate_reference)
+        self.large_heading_action_prior_heading_deadband = float(large_heading_action_prior_heading_deadband)
+        self.large_heading_action_prior_heading_scale = float(large_heading_action_prior_heading_scale)
+        self.large_heading_action_prior_use_heading_rate_feedback = bool(
+            large_heading_action_prior_use_heading_rate_feedback
+        )
+        self.large_heading_action_prior_heading_rate_gain = float(large_heading_action_prior_heading_rate_gain)
+        self.large_heading_action_prior_balance_turn_targets = bool(large_heading_action_prior_balance_turn_targets)
         self.critic_only = bool(critic_only)
         self.diagnostic_only = bool(diagnostic_only)
         self.critic_relearning = bool(critic_relearning)
@@ -148,6 +328,7 @@ class RangerTeacherRegularizedPPO(PPO):
         self._critic_relearning_common_actions = 0
         self._critic_relearning_turn_actions = 0
         self.teacher = None
+        self.latent_teacher = None
 
     def act(self, obs):
         """Use the frozen recurrent actor, with local wheel perturbations only for critic coverage."""
@@ -176,7 +357,7 @@ class RangerTeacherRegularizedPPO(PPO):
             return actions
 
         perturbed = actions.clone()
-        wheel = perturbed[:, 4:8]
+        wheel = ranger_wheel_raw_to_semantic(perturbed[:, 4:8])
         left = wheel[:, :2].mean(dim=-1)
         right = wheel[:, 2:].mean(dim=-1)
         common = 0.5 * (left + right)
@@ -206,7 +387,7 @@ class RangerTeacherRegularizedPPO(PPO):
         right_shift = new_right - right
         wheel[selected, :2] = wheel[selected, :2] + left_shift[selected, None]
         wheel[selected, 2:] = wheel[selected, 2:] + right_shift[selected, None]
-        perturbed[:, 4:8] = torch.clamp(wheel, min=-0.999, max=0.999)
+        perturbed[:, 4:8] = torch.clamp(ranger_wheel_raw_to_semantic(wheel), min=-0.999, max=0.999)
 
         # Critic-only mode never uses action log-probabilities for optimization. Store the
         # actually executed perturbed command so diagnostics reflect the expanded dataset.
@@ -235,6 +416,44 @@ class RangerTeacherRegularizedPPO(PPO):
         for parameter in teacher.parameters():
             parameter.requires_grad_(False)
         self.teacher = teacher
+
+    def configure_latent_teacher(self, teacher: nn.Module) -> None:
+        """Attach a frozen V10 teacher used only for state-encoder feature extraction."""
+
+        teacher.eval()
+        for parameter in teacher.parameters():
+            parameter.requires_grad_(False)
+        if not hasattr(teacher, "actor") or not hasattr(teacher.actor, "state_encoder"):
+            raise AttributeError("Latent teacher must expose actor.state_encoder.")
+        self.latent_teacher = teacher
+
+    def _teacher_state_latent(self, obs_batch, masks_batch: torch.Tensor) -> torch.Tensor:
+        if self.latent_teacher is None:
+            raise RuntimeError("latent_loss_coef > 0 requires a configured latent teacher.")
+        state_group = getattr(self.policy, "state_obs_group", "policy_state")
+        state_padded = obs_batch[state_group]
+        state_unpadded = unpad_trajectories(state_padded, masks_batch)
+        with torch.inference_mode():
+            latent = self.latent_teacher.actor.state_encoder(state_unpadded)
+        return latent.detach().clone()
+
+    def _student_alignment_latent(self, obs_batch, masks_batch: torch.Tensor) -> torch.Tensor:
+        if not hasattr(self.policy, "alignment_latent"):
+            raise AttributeError("Student policy must expose alignment_latent(obs).")
+        student_padded = self.policy.alignment_latent(obs_batch)
+        return unpad_trajectories(student_padded, masks_batch)
+
+    def _latent_alignment_loss(self, obs_batch, masks_batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        student_latent = self._student_alignment_latent(obs_batch, masks_batch)
+        teacher_latent = self._teacher_state_latent(obs_batch, masks_batch)
+        if student_latent.shape != teacher_latent.shape:
+            raise ValueError(
+                "Student/teacher latent shape mismatch: "
+                f"{tuple(student_latent.shape)} vs {tuple(teacher_latent.shape)}."
+            )
+        loss = F.mse_loss(student_latent, teacher_latent)
+        cosine = F.cosine_similarity(student_latent, teacher_latent, dim=-1, eps=1.0e-8).mean()
+        return loss, cosine.detach()
 
     @staticmethod
     def _grad_pair_stats(
@@ -266,24 +485,36 @@ class RangerTeacherRegularizedPPO(PPO):
         cosine = dot / torch.clamp(first_norm * second_norm, min=1.0e-12)
         return first_norm, second_norm, cosine
 
-    @staticmethod
+    def _physical_yaw_rate_from_policy_state(self, normalized_yaw_rate: torch.Tensor) -> torch.Tensor:
+        """Convert normalized policy-state yaw rate back to physical rad/s."""
+
+        network_spec = getattr(self.policy, "network_spec", None)
+        scale = float(getattr(network_spec, "base_ang_vel_observation_scale", 3.0))
+        return normalized_yaw_rate * scale
+
+    def _prior_heading_targets(self, heading: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return deadbanded heading and desired yaw rate used by the wheel-control prior."""
+
+        heading_deadband = float(getattr(self, "large_heading_action_prior_heading_deadband", 0.0))
+        heading_scale = float(getattr(self, "large_heading_action_prior_heading_scale", 0.40))
+        yaw_rate_reference = float(getattr(self, "large_heading_action_prior_yaw_rate_reference", 0.35))
+        effective_heading = torch.sign(heading) * torch.relu(heading.abs() - heading_deadband)
+        desired_yaw_rate = yaw_rate_reference * torch.tanh(effective_heading / heading_scale)
+        return effective_heading, desired_yaw_rate
+
     def _turn_direction_masks(
+        self,
         heading: torch.Tensor,
         turn: torch.Tensor,
         actual_yaw_rate: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Split geometric counter-turns by their current yaw dynamics.
-
-        The desired-yaw expression mirrors the current ShortGoal yaw-rate reward
-        parameters (yaw_rate_max=0.45, heading_deadband=0.04, heading_scale=0.30).
-        """
+        """Split geometric counter-turns using the same yaw target as the action prior."""
 
         turning = heading.abs() >= (torch.pi / 12.0)
         meaningful_turn = turn.abs() >= 0.05
         wrong_turn = turning & meaningful_turn & ((heading * turn) < 0.0)
         yaw_same_direction = (heading * actual_yaw_rate) > 0.0
-        effective_heading = torch.sign(heading) * torch.relu(heading.abs() - 0.04)
-        desired_yaw_rate = 0.45 * torch.tanh(effective_heading / 0.30)
+        _, desired_yaw_rate = self._prior_heading_targets(heading)
         yaw_braking = (
             wrong_turn
             & yaw_same_direction
@@ -311,13 +542,19 @@ class RangerTeacherRegularizedPPO(PPO):
         goal_start = int(self.policy.network_spec.goal_state_range[0])
         state_unpadded = unpad_trajectories(obs_batch[state_group], masks_batch)
         heading = torch.atan2(state_unpadded[..., goal_start + 4], state_unpadded[..., goal_start + 3])
-        actual_yaw_rate = state_unpadded[..., 2]
-        advantage = torch.squeeze(advantages_batch).detach()
-        wheel = actions_batch[..., 4:8].detach()
-        left = wheel[..., :2].mean(dim=-1)
-        right = wheel[..., 2:].mean(dim=-1)
-        common = 0.5 * (left + right)
-        turn = 0.5 * (right - left)
+        actual_yaw_rate = self._physical_yaw_rate_from_policy_state(state_unpadded[..., 2])
+        advantage = advantages_batch.detach()
+        if advantage.numel() != heading.numel():
+            raise ValueError(
+                "Advantage diagnostics received incompatible rollout shapes: "
+                f"advantage={tuple(advantage.shape)} heading={tuple(heading.shape)}."
+            )
+        # Keep singleton mini-batch dimensions. A global squeeze turns [T, 1, 1]
+        # into [T], while recurrent masks and action modes remain [T, 1].
+        advantage = advantage.reshape_as(heading)
+        common, turn = ranger_wheel_semantic_modes(actions_batch[..., 4:8].detach())
+        common = common.reshape_as(heading)
+        turn = turn.reshape_as(heading)
 
         deg15 = torch.tensor(torch.pi / 12.0, device=heading.device, dtype=heading.dtype)
         deg45 = torch.tensor(torch.pi / 4.0, device=heading.device, dtype=heading.dtype)
@@ -368,11 +605,7 @@ class RangerTeacherRegularizedPPO(PPO):
         goal_start = int(self.policy.network_spec.goal_state_range[0])
         heading = torch.atan2(states[..., goal_start + 4], states[..., goal_start + 3])
 
-        wheel = actions[..., 4:8]
-        left = wheel[..., :2].mean(dim=-1)
-        right = wheel[..., 2:].mean(dim=-1)
-        common = 0.5 * (left + right)
-        turn = 0.5 * (right - left)
+        full_common, full_turn = ranger_wheel_semantic_modes(actions[..., 4:8])
 
         # The final rollout step has no stored V(s_{t+1}); exclude it from the one-step TD diagnostic.
         reward = rewards[:-1]
@@ -382,9 +615,9 @@ class RangerTeacherRegularizedPPO(PPO):
         raw_advantage = (returns - values)[:-1]
         td_error = reward + self.gamma * (~done).to(value.dtype) * next_value - value
         heading = heading[:-1]
-        common = common[:-1]
-        turn = turn[:-1]
-        actual_yaw_rate = states[..., 2][:-1]
+        common = full_common[:-1]
+        turn = full_turn[:-1]
+        actual_yaw_rate = self._physical_yaw_rate_from_policy_state(states[..., 2][:-1])
 
         deg15 = torch.tensor(torch.pi / 12.0, device=heading.device, dtype=heading.dtype)
         deg45 = torch.tensor(torch.pi / 4.0, device=heading.device, dtype=heading.dtype)
@@ -437,7 +670,7 @@ class RangerTeacherRegularizedPPO(PPO):
         global_log_distance = states[..., goal_start + 6]
         full_distance = torch.pow(torch.tensor(2.0, device=states.device, dtype=states.dtype), global_log_distance) - 1.0
         full_velocity_toward = states[..., goal_start + 7]
-        full_actual_yaw = states[..., 2]
+        full_actual_yaw = self._physical_yaw_rate_from_policy_state(states[..., 2])
         heading_sign = torch.sign(full_heading)
         full_correct_yaw_component = heading_sign * full_actual_yaw
         full_value = values
@@ -483,8 +716,7 @@ class RangerTeacherRegularizedPPO(PPO):
         # of the learned value function. Only starting points with the full requested
         # horizon inside the rollout are included.
         full_heading = torch.atan2(states[..., goal_start + 4], states[..., goal_start + 3])
-        full_abs_common = (0.5 * (left + right)).abs()
-        full_turn = 0.5 * (right - left)
+        full_abs_common = full_common.abs()
         full_abs_turn = full_turn.abs()
         for horizon in (30, 60, 120, 180):
             if rewards.shape[0] < horizon:
@@ -564,17 +796,32 @@ class RangerTeacherRegularizedPPO(PPO):
                         result[f"rtg120_{distance_name}_{heading_name}"] = float(mean_rtg.item())
         return result
 
-    def _teacher_targets(self, obs_batch, masks_batch: torch.Tensor) -> torch.Tensor:
-        """Evaluate the feedforward teacher on padded observations and unpad identically to the student."""
+    def _teacher_targets(
+        self,
+        obs_batch,
+        masks_batch: torch.Tensor,
+        actor_hidden_state=None,
+    ) -> torch.Tensor:
+        """Evaluate the teacher with the same recurrent sequence state as the student."""
 
         if self.teacher is None:
             raise RuntimeError("Teacher regularization is enabled, but no teacher has been configured.")
         if masks_batch is None or masks_batch.ndim != 2:
             raise ValueError("Teacher regularization expects recurrent masks with shape [time, trajectories].")
 
-        time_steps, num_trajectories = masks_batch.shape
-        flat_obs = obs_batch.reshape(-1)
         with torch.inference_mode():
+            if getattr(self.teacher, "is_recurrent", False):
+                actor_obs = self.teacher.actor_obs_normalizer(self.teacher.get_actor_obs(obs_batch))
+                raw_mean = self.teacher._apply_action_output_mask(
+                    self.teacher.actor(actor_obs, masks_batch, actor_hidden_state)
+                )
+                latent_mean = self.teacher._bound_latent_mean(raw_mean)
+                return torch.tanh(latent_mean).detach().clone()
+
+            time_steps, num_trajectories = masks_batch.shape
+            flat_obs = obs_batch.reshape(-1)
+            if hasattr(self.teacher, "reset_memory"):
+                self.teacher.reset_memory()
             teacher_flat = self.teacher.act_inference(flat_obs)
         teacher_padded = teacher_flat.reshape(time_steps, num_trajectories, -1)
         teacher_unpadded = unpad_trajectories(teacher_padded, masks_batch)
@@ -602,6 +849,32 @@ class RangerTeacherRegularizedPPO(PPO):
         stop_unpadded = unpad_trajectories(stop_padded, masks_batch).squeeze(-1)
         return stop_unpadded > 0.5
 
+    def _goal_distance(self, obs_batch, masks_batch: torch.Tensor) -> torch.Tensor:
+        """Decode distance from the recurrent policy's long-term goal observation."""
+
+        state_group = getattr(self.policy, "state_obs_group", "policy_state")
+        network_spec = getattr(self.policy, "network_spec", None)
+        if network_spec is None or not hasattr(network_spec, "goal_state_range"):
+            raise AttributeError("Recurrent Ranger policy must expose network_spec.goal_state_range.")
+        goal_start = int(network_spec.goal_state_range[0])
+        # Long-term command encoding slot 6 stores log2(1 + distance / unit).
+        log_distance_index = goal_start + 6
+        state_padded = obs_batch[state_group]
+        if state_padded.shape[-1] <= log_distance_index:
+            raise ValueError(
+                f"policy_state has dim {state_padded.shape[-1]}, "
+                f"cannot read goal log-distance index {log_distance_index}."
+            )
+        log_distance_padded = state_padded[..., log_distance_index : log_distance_index + 1]
+        distance_padded = self.teacher_goal_distance_unit * (torch.pow(2.0, log_distance_padded) - 1.0)
+        return unpad_trajectories(distance_padded, masks_batch).squeeze(-1)
+
+    def _near_goal_mask(self, obs_batch, masks_batch: torch.Tensor) -> torch.Tensor:
+        stop_mask = self._stop_phase_mask(obs_batch, masks_batch)
+        if self.teacher_near_goal_distance is None:
+            return torch.zeros_like(stop_mask)
+        return self._goal_distance(obs_batch, masks_batch) <= self.teacher_near_goal_distance
+
     def _large_heading_action_prior_loss(
         self,
         student_mean: torch.Tensor,
@@ -627,31 +900,113 @@ class RangerTeacherRegularizedPPO(PPO):
         heading_xy_padded = state_padded[..., goal_start + 3 : goal_start + 5]
         heading_xy = unpad_trajectories(heading_xy_padded, masks_batch)
         heading = torch.atan2(heading_xy[..., 1], heading_xy[..., 0])
+        yaw_rate = self._physical_yaw_rate_from_policy_state(
+            unpad_trajectories(state_padded[..., 2:3], masks_batch).squeeze(-1)
+        )
         heading_abs = heading.abs()
-        gate = torch.clamp(
+        heading_gate = torch.clamp(
             (heading_abs - self.large_heading_action_prior_start)
             / max(self.large_heading_action_prior_full - self.large_heading_action_prior_start, 1.0e-6),
             min=0.0,
             max=1.0,
         )
+        effective_heading, desired_yaw_rate = self._prior_heading_targets(heading)
+        yaw_rate_error = desired_yaw_rate - yaw_rate
+        if self.large_heading_action_prior_use_heading_rate_feedback:
+            heading_rate_slot = int(getattr(network_spec, "goal_heading_rate_slot", 1))
+            heading_rate_scale = float(getattr(network_spec, "goal_heading_rate_observation_scale", 2.0))
+            heading_error_rate = unpad_trajectories(
+                state_padded[
+                    ..., goal_start + heading_rate_slot : goal_start + heading_rate_slot + 1
+                ],
+                masks_batch,
+            ).squeeze(-1) * heading_rate_scale
+            feedback_gate = torch.clamp(
+                heading_error_rate.abs() / self.large_heading_action_prior_yaw_rate_reference,
+                min=0.0,
+                max=1.0,
+            )
+        else:
+            heading_error_rate = None
+            feedback_gate = torch.clamp(
+                yaw_rate_error.abs() / self.large_heading_action_prior_yaw_rate_reference,
+                min=0.0,
+                max=1.0,
+            )
+        gate = (
+            torch.maximum(heading_gate, feedback_gate)
+            if (
+                self.large_heading_action_prior_yaw_damping > 0.0
+                or self.large_heading_action_prior_use_heading_rate_feedback
+            )
+            else heading_gate
+        )
         non_stop = (~self._stop_phase_mask(obs_batch, masks_batch)).to(student_mean.dtype)
         gate = gate.to(student_mean.dtype) * non_stop
 
-        wheel_action = student_mean[..., 4:8]
-        left_mean = wheel_action[..., :2].mean(dim=-1)
-        right_mean = wheel_action[..., 2:].mean(dim=-1)
-        common_mode = 0.5 * (left_mean + right_mean)
-        turn_mode = 0.5 * (right_mean - left_mean)
-        desired_turn = self.large_heading_action_prior_turn_gain * torch.sin(heading).to(student_mean.dtype)
+        common_mode, turn_mode = ranger_wheel_semantic_modes(student_mean[..., 4:8])
+        if self.large_heading_action_prior_use_heading_rate_feedback:
+            desired_turn = (
+                self.large_heading_action_prior_turn_gain * torch.sin(effective_heading)
+                + self.large_heading_action_prior_heading_rate_gain * heading_error_rate
+            ).to(student_mean.dtype)
+        else:
+            desired_turn = (
+                self.large_heading_action_prior_turn_gain * torch.sin(effective_heading)
+                + self.large_heading_action_prior_yaw_damping * yaw_rate_error
+            ).to(student_mean.dtype)
+        desired_turn = torch.clamp(desired_turn, min=-1.0, max=1.0)
 
         desired_common = student_mean.new_full(common_mode.shape, self.large_heading_action_prior_common_target)
+        if self.large_heading_action_prior_taper_common:
+            # Exit-V2 uses the long-term ShortGoal encoding, where command slot 6 is
+            # log2(1 + goal_distance). Slow the supervised forward arc as the point
+            # target approaches, and suppress forward drive while the vehicle is
+            # strongly misaligned so turn closeout can happen without passing the goal.
+            log_distance = unpad_trajectories(
+                state_padded[..., goal_start + 6 : goal_start + 7], masks_batch
+            ).squeeze(-1)
+            goal_distance = torch.pow(log_distance.new_tensor(2.0), log_distance) - 1.0
+            distance_scale = torch.clamp(
+                (goal_distance - self.large_heading_action_prior_common_stop_distance)
+                / (
+                    self.large_heading_action_prior_common_full_distance
+                    - self.large_heading_action_prior_common_stop_distance
+                ),
+                min=0.0,
+                max=1.0,
+            )
+            heading_alignment_scale = torch.clamp(torch.cos(heading), min=0.0, max=1.0)
+            desired_common = desired_common * distance_scale * heading_alignment_scale
         common_sq = torch.square(common_mode - desired_common)
         turn_sq = torch.square(turn_mode - desired_turn)
         gate_sum = gate.sum()
         if float(gate_sum.detach().item()) <= 1.0e-8:
             zero = student_mean.sum() * 0.0
             return zero, zero.detach(), zero.detach(), zero.detach()
-        loss = torch.sum(gate * (common_sq + turn_sq)) / gate_sum
+
+        common_loss = torch.sum(gate * common_sq) / gate_sum
+        if getattr(self, "large_heading_action_prior_balance_turn_targets", False):
+            # On-policy rollout distributions can collapse to one side after overshoot.  Prevent
+            # that state imbalance from turning a symmetric control prior into a one-sided
+            # supervised target by averaging positive-turn, closeout, and negative-turn regimes
+            # independently before combining them.
+            target_eps = 0.05
+            turn_groups = (
+                desired_turn > target_eps,
+                desired_turn.abs() <= target_eps,
+                desired_turn < -target_eps,
+            )
+            group_losses: list[torch.Tensor] = []
+            for group_mask in turn_groups:
+                group_gate = gate * group_mask.to(gate.dtype)
+                group_gate_sum = group_gate.sum()
+                if float(group_gate_sum.detach().item()) > 1.0e-8:
+                    group_losses.append(torch.sum(group_gate * turn_sq) / group_gate_sum)
+            turn_loss = torch.stack(group_losses).mean() if group_losses else torch.sum(gate * turn_sq) / gate_sum
+        else:
+            turn_loss = torch.sum(gate * turn_sq) / gate_sum
+        loss = common_loss + turn_loss
         fraction = (gate > 0.0).to(student_mean.dtype).mean()
         common_abs = torch.sum(gate * (common_mode - desired_common).abs()) / gate_sum
         turn_error_abs = torch.sum(gate * (turn_mode - desired_turn).abs()) / gate_sum
@@ -662,6 +1017,7 @@ class RangerTeacherRegularizedPPO(PPO):
         student_mean: torch.Tensor,
         teacher_mean: torch.Tensor,
         stop_phase_mask: torch.Tensor,
+        near_goal_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if student_mean.shape != teacher_mean.shape:
             raise ValueError(
@@ -673,11 +1029,12 @@ class RangerTeacherRegularizedPPO(PPO):
         squared_error = (student_mean - teacher_mean).square()
         suspension_loss = squared_error[..., :4].mean()
         wheel_mse_per_sample = squared_error[..., 4:].mean(dim=-1)
-        wheel_weights = torch.where(
+        wheel_weights = teacher_wheel_sample_weights(
             stop_phase_mask,
-            torch.full_like(wheel_mse_per_sample, self.teacher_stop_phase_wheel_weight),
-            torch.ones_like(wheel_mse_per_sample),
-        )
+            near_goal_mask,
+            stop_phase_weight=self.teacher_stop_phase_wheel_weight,
+            near_goal_weight=self.teacher_near_goal_wheel_weight,
+        ).to(dtype=wheel_mse_per_sample.dtype)
         wheel_loss = (wheel_mse_per_sample * wheel_weights).mean()
         total = (
             self.teacher_suspension_loss_weight * suspension_loss
@@ -695,6 +1052,17 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_teacher_wheel_loss = 0.0
         mean_teacher_weighted_loss = 0.0
         mean_teacher_action_cosine = 0.0
+        mean_brake_common_loss = 0.0
+        mean_brake_common_weighted_loss = 0.0
+        mean_brake_common_active_fraction = 0.0
+        mean_brake_common_error_abs = 0.0
+        mean_brake_common_target_abs = 0.0
+        mean_latent_alignment_loss = 0.0
+        mean_latent_weighted_loss = 0.0
+        mean_latent_alignment_cosine = 0.0
+        mean_residual_norm_loss = 0.0
+        mean_action_anchor_loss = 0.0
+        mean_delta_action_abs = 0.0
         mean_teacher_non_stop_fraction = 0.0
         mean_ppo_actor_grad_norm = 0.0
         mean_teacher_actor_grad_norm = 0.0
@@ -714,6 +1082,7 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_action_prior_actor_grad_norm = 0.0
         mean_surrogate_action_prior_grad_cosine = 0.0
         minibatch_grad_cosines: list[float] = []
+        large_heading_action_prior_turn_error_updates: list[float] = []
         advantage_sums: dict[str, float] = {}
 
         if self.diagnostic_only:
@@ -840,6 +1209,18 @@ class RangerTeacherRegularizedPPO(PPO):
             large_heading_action_prior_turn_error_abs = torch.zeros_like(value_loss)
             action_prior_actor_grad_norm = torch.zeros_like(value_loss)
             surrogate_action_prior_grad_cosine = torch.zeros_like(value_loss)
+            latent_alignment_loss = torch.zeros_like(value_loss)
+            weighted_latent_loss = torch.zeros_like(value_loss)
+            latent_alignment_cosine = torch.zeros_like(value_loss)
+            residual_norm_loss = torch.zeros_like(value_loss)
+            action_anchor_loss = torch.zeros_like(value_loss)
+            delta_action_abs_mean = torch.zeros_like(value_loss)
+            weighted_residual_loss = torch.zeros_like(value_loss)
+            weighted_anchor_loss = torch.zeros_like(value_loss)
+            brake_common_loss = torch.zeros_like(value_loss)
+            brake_common_active_fraction = torch.zeros_like(value_loss)
+            brake_common_error_abs = torch.zeros_like(value_loss)
+            brake_common_target_abs = torch.zeros_like(value_loss)
 
             if self.critic_only:
                 teacher_action_loss = torch.zeros_like(value_loss)
@@ -848,6 +1229,7 @@ class RangerTeacherRegularizedPPO(PPO):
                 teacher_action_cosine = torch.zeros_like(value_loss)
                 non_stop_fraction = torch.zeros_like(value_loss)
                 weighted_teacher_loss = torch.zeros_like(value_loss)
+                weighted_brake_common_loss = torch.zeros_like(value_loss)
                 ppo_actor_grad_norm = torch.zeros_like(value_loss)
                 teacher_actor_grad_norm = torch.zeros_like(value_loss)
                 ppo_teacher_grad_cosine = torch.zeros_like(value_loss)
@@ -859,16 +1241,47 @@ class RangerTeacherRegularizedPPO(PPO):
                 teacher_action_cosine = torch.zeros_like(value_loss)
                 non_stop_fraction = torch.zeros_like(value_loss)
 
+                if self.latent_loss_coef > 0.0:
+                    latent_alignment_loss, latent_alignment_cosine = self._latent_alignment_loss(
+                        obs_batch,
+                        masks_batch,
+                    )
+
                 if self.teacher_loss_coef > 0.0:
-                    teacher_mean = self._teacher_targets(obs_batch, masks_batch)
+                    teacher_mean = self._teacher_targets(
+                        obs_batch,
+                        masks_batch,
+                        actor_hidden_state=hidden_states_batch[0],
+                    )
                     stop_phase_mask = self._stop_phase_mask(obs_batch, masks_batch)
+                    near_goal_mask = self._near_goal_mask(obs_batch, masks_batch)
                     (
                         teacher_action_loss,
                         teacher_suspension_loss,
                         teacher_wheel_loss,
                         teacher_action_cosine,
-                    ) = self._teacher_action_loss(bounded_mu_batch, teacher_mean, stop_phase_mask)
+                    ) = self._teacher_action_loss(
+                        bounded_mu_batch,
+                        teacher_mean,
+                        stop_phase_mask,
+                        near_goal_mask,
+                    )
                     non_stop_fraction = (~stop_phase_mask).to(bounded_mu_batch.dtype).mean()
+
+                    if self.brake_common_loss_coef > 0.0:
+                        (
+                            brake_common_loss,
+                            brake_common_active_fraction,
+                            brake_common_error_abs,
+                            brake_common_target_abs,
+                        ) = near_goal_brake_common_loss(
+                            bounded_mu_batch,
+                            teacher_mean,
+                            self._goal_distance(obs_batch, masks_batch),
+                            stop_phase_mask,
+                            stop_distance=self.brake_common_stop_distance,
+                            full_distance=self.brake_common_full_distance,
+                        )
 
                 if self.large_heading_action_prior_coef > 0.0:
                     (
@@ -878,7 +1291,23 @@ class RangerTeacherRegularizedPPO(PPO):
                         large_heading_action_prior_turn_error_abs,
                     ) = self._large_heading_action_prior_loss(bounded_mu_batch, obs_batch, masks_batch)
 
+                if bool(getattr(self.policy, "use_gru_residual", False)):
+                    actor_obs = self.policy.actor_obs_normalizer(self.policy.get_actor_obs(obs_batch))
+                    delta_action = self.policy.actor.residual_delta(
+                        actor_obs,
+                        masks=masks_batch,
+                        hidden_state=hidden_states_batch[0],
+                    )
+                    residual_scale = float(getattr(self.policy.actor, "residual_action_scale", 1.0))
+                    residual_norm_loss = delta_action.square().mean()
+                    action_anchor_loss = (residual_scale * delta_action).square().mean()
+                    delta_action_abs_mean = delta_action.detach().abs().mean()
+
                 weighted_teacher_loss = self.teacher_loss_coef * teacher_action_loss
+                weighted_brake_common_loss = self.brake_common_loss_coef * brake_common_loss
+                weighted_latent_loss = self.latent_loss_coef * latent_alignment_loss
+                weighted_residual_loss = self.residual_loss_coef * residual_norm_loss
+                weighted_anchor_loss = self.anchor_loss_coef * action_anchor_loss
                 if self.teacher_loss_coef > 0.0:
                     (
                         ppo_actor_grad_norm,
@@ -922,7 +1351,11 @@ class RangerTeacherRegularizedPPO(PPO):
                     self.ppo_surrogate_scale * surrogate_loss
                     + entropy_objective
                     + weighted_teacher_loss
+                    + weighted_brake_common_loss
+                    + weighted_latent_loss
                     + weighted_action_prior_loss
+                    + weighted_residual_loss
+                    + weighted_anchor_loss
                 )
                 loss = self.actor_loss_scale * actor_side_loss + self.value_loss_coef * value_loss
 
@@ -952,6 +1385,17 @@ class RangerTeacherRegularizedPPO(PPO):
             mean_teacher_wheel_loss += float(teacher_wheel_loss.item())
             mean_teacher_weighted_loss += float(weighted_teacher_loss.item())
             mean_teacher_action_cosine += float(teacher_action_cosine.item())
+            mean_brake_common_loss += float(brake_common_loss.item())
+            mean_brake_common_weighted_loss += float(weighted_brake_common_loss.item())
+            mean_brake_common_active_fraction += float(brake_common_active_fraction.item())
+            mean_brake_common_error_abs += float(brake_common_error_abs.item())
+            mean_brake_common_target_abs += float(brake_common_target_abs.item())
+            mean_latent_alignment_loss += float(latent_alignment_loss.item())
+            mean_latent_weighted_loss += float(weighted_latent_loss.item())
+            mean_latent_alignment_cosine += float(latent_alignment_cosine.item())
+            mean_residual_norm_loss += float(residual_norm_loss.item())
+            mean_action_anchor_loss += float(action_anchor_loss.item())
+            mean_delta_action_abs += float(delta_action_abs_mean.item())
             mean_teacher_non_stop_fraction += float(non_stop_fraction.item())
             mean_ppo_actor_grad_norm += float(ppo_actor_grad_norm.item())
             mean_teacher_actor_grad_norm += float(teacher_actor_grad_norm.item())
@@ -965,7 +1409,9 @@ class RangerTeacherRegularizedPPO(PPO):
             mean_large_heading_action_prior_loss += float(large_heading_action_prior_loss.item())
             mean_large_heading_action_prior_fraction += float(large_heading_action_prior_fraction.item())
             mean_large_heading_action_prior_common_abs += float(large_heading_action_prior_common_abs.item())
-            mean_large_heading_action_prior_turn_error_abs += float(large_heading_action_prior_turn_error_abs.item())
+            turn_error_value = float(large_heading_action_prior_turn_error_abs.item())
+            mean_large_heading_action_prior_turn_error_abs += turn_error_value
+            large_heading_action_prior_turn_error_updates.append(turn_error_value)
             mean_action_prior_actor_grad_norm += float(action_prior_actor_grad_norm.item())
             mean_surrogate_action_prior_grad_cosine += float(surrogate_action_prior_grad_cosine.item())
             minibatch_grad_cosines.append(float(ppo_teacher_grad_cosine.item()))
@@ -979,6 +1425,17 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_teacher_wheel_loss /= num_updates
         mean_teacher_weighted_loss /= num_updates
         mean_teacher_action_cosine /= num_updates
+        mean_brake_common_loss /= num_updates
+        mean_brake_common_weighted_loss /= num_updates
+        mean_brake_common_active_fraction /= num_updates
+        mean_brake_common_error_abs /= num_updates
+        mean_brake_common_target_abs /= num_updates
+        mean_latent_alignment_loss /= num_updates
+        mean_latent_weighted_loss /= num_updates
+        mean_latent_alignment_cosine /= num_updates
+        mean_residual_norm_loss /= num_updates
+        mean_action_anchor_loss /= num_updates
+        mean_delta_action_abs /= num_updates
         mean_teacher_non_stop_fraction /= num_updates
         mean_ppo_actor_grad_norm /= num_updates
         mean_teacher_actor_grad_norm /= num_updates
@@ -999,6 +1456,17 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_surrogate_action_prior_grad_cosine /= num_updates
         mean_teacher_to_ppo_grad_ratio = mean_teacher_actor_grad_norm / max(mean_ppo_actor_grad_norm, 1.0e-12)
         advantage_means = {key: value / num_updates for key, value in advantage_sums.items()}
+        epoch_width = max(int(self.num_mini_batches), 1)
+        if large_heading_action_prior_turn_error_updates:
+            first_epoch_turn_error = sum(large_heading_action_prior_turn_error_updates[:epoch_width]) / min(
+                epoch_width, len(large_heading_action_prior_turn_error_updates)
+            )
+            last_epoch_turn_error = sum(large_heading_action_prior_turn_error_updates[-epoch_width:]) / min(
+                epoch_width, len(large_heading_action_prior_turn_error_updates)
+            )
+        else:
+            first_epoch_turn_error = 0.0
+            last_epoch_turn_error = 0.0
 
         self.storage.clear()
 
@@ -1011,6 +1479,21 @@ class RangerTeacherRegularizedPPO(PPO):
             "teacher_wheel": mean_teacher_wheel_loss,
             "teacher_weighted": mean_teacher_weighted_loss,
             "teacher_action_cosine": mean_teacher_action_cosine,
+            "brake_common_loss_coef": self.brake_common_loss_coef,
+            "brake_common": mean_brake_common_loss,
+            "brake_common_weighted": mean_brake_common_weighted_loss,
+            "brake_common_active_fraction": mean_brake_common_active_fraction,
+            "brake_common_error_abs": mean_brake_common_error_abs,
+            "brake_common_target_abs": mean_brake_common_target_abs,
+            "latent_loss_coef": self.latent_loss_coef,
+            "latent_alignment": mean_latent_alignment_loss,
+            "latent_weighted": mean_latent_weighted_loss,
+            "latent_alignment_cosine": mean_latent_alignment_cosine,
+            "residual_loss_coef": self.residual_loss_coef,
+            "anchor_loss_coef": self.anchor_loss_coef,
+            "residual_norm": mean_residual_norm_loss,
+            "action_anchor": mean_action_anchor_loss,
+            "Stats/delta_action_abs_mean": mean_delta_action_abs,
             "teacher_non_stop_fraction": mean_teacher_non_stop_fraction,
             "ppo_actor_grad_norm": mean_ppo_actor_grad_norm,
             "teacher_actor_grad_norm": mean_teacher_actor_grad_norm,
@@ -1034,6 +1517,8 @@ class RangerTeacherRegularizedPPO(PPO):
             "large_heading_action_prior_fraction": mean_large_heading_action_prior_fraction,
             "large_heading_action_prior_common_abs": mean_large_heading_action_prior_common_abs,
             "large_heading_action_prior_turn_error_abs": mean_large_heading_action_prior_turn_error_abs,
+            "large_heading_action_prior_turn_error_abs_first_epoch": first_epoch_turn_error,
+            "large_heading_action_prior_turn_error_abs_last_epoch": last_epoch_turn_error,
             "action_prior_actor_grad_norm": mean_action_prior_actor_grad_norm,
             "surrogate_action_prior_grad_cosine": mean_surrogate_action_prior_grad_cosine,
         }

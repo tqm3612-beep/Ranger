@@ -3,9 +3,11 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
 import os
+
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -14,13 +16,26 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, RayCasterCameraCfg, patterns
+from isaaclab.sensors import (
+    ContactSensorCfg,
+    MultiMeshRayCasterCameraCfg,
+    MultiMeshRayCasterCfg,
+    RayCasterCfg,
+    RayCasterCameraCfg,
+    patterns,
+)
+from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from Ranger.assets.ranger import RANGER_CFG
 
 from . import mdp
+from .terrain_cfg import (
+    RANGER_STAGE2_TERRAIN_P0_CFG,
+    RANGER_STAGE2_TERRAIN_P1_CFG,
+    RANGER_WAVE_TERRAIN_CFG,
+)
 
 COMMAND_OBS_PARAMS = {
     "command_mode": "zero",
@@ -142,10 +157,10 @@ class RangerSceneCfg(InteractiveSceneCfg):
     )
 
     d435i_camera = RayCasterCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot",
+        prim_path="{ENV_REGEX_NS}/Robot/d435i_link",
         offset=RayCasterCameraCfg.OffsetCfg(
-            pos=(0.46259, 0.0, -0.21177),
-            rot=(0.241845, -0.664463, 0.664463, -0.241845),
+            pos=(0.0, 0.0, 0.0),
+            rot=(0.5, -0.5, 0.5, -0.5),
             convention="ros",
         ),
         pattern_cfg=patterns.PinholeCameraPatternCfg(
@@ -183,6 +198,195 @@ class RangerSceneCfg(InteractiveSceneCfg):
     dome_light = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+    )
+
+
+@configclass
+class RangerWaveTerrainSceneCfg(RangerSceneCfg):
+    """Wave terrain scene for perception-driven terrain adaptation."""
+
+    ground = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=RANGER_WAVE_TERRAIN_CFG,
+        max_init_terrain_level=0,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="average",
+            restitution_combine_mode="average",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+        debug_vis=False,
+    )
+
+
+@configclass
+class RangerStage2TerrainP0SceneCfg(RangerSceneCfg):
+    """Flat and gentle-slope terrain mix for conservative Stage2 adaptation."""
+
+    ground = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=RANGER_STAGE2_TERRAIN_P0_CFG,
+        max_init_terrain_level=3,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="average",
+            restitution_combine_mode="average",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+        debug_vis=False,
+    )
+
+
+@configclass
+class RangerStage2TerrainP1SceneCfg(RangerSceneCfg):
+    """Moderate slopes and stairs for the second terrain adaptation stage."""
+
+    ground = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="generator",
+        terrain_generator=RANGER_STAGE2_TERRAIN_P1_CFG,
+        max_init_terrain_level=3,
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="average",
+            restitution_combine_mode="average",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.35, 0.35, 0.35)),
+        debug_vis=False,
+    )
+
+
+def _obstacle_raycast_targets() -> list[str | MultiMeshRayCasterCfg.RaycastTargetCfg]:
+    """Return independent raycast target configs for one replicated obstacle per environment."""
+
+    return [
+        "/World/ground",
+        MultiMeshRayCasterCfg.RaycastTargetCfg(
+            prim_expr="{ENV_REGEX_NS}/Obstacle",
+            is_shared=True,
+            track_mesh_transforms=True,
+        ),
+    ]
+
+
+@configclass
+class RangerStage2ObstacleP0SceneCfg(RangerSceneCfg):
+    """Flat scene with one visible, non-traversable obstacle on the nominal goal path."""
+
+    obstacle = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Obstacle",
+        collision_group=0,
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(3.5, 0.0, 0.60)),
+        spawn=sim_utils.MeshCuboidCfg(
+            size=(0.60, 1.00, 1.20),
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=True),
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                friction_combine_mode="average",
+                restitution_combine_mode="average",
+                static_friction=1.0,
+                dynamic_friction=1.0,
+                restitution=0.0,
+            ),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.75, 0.18, 0.08)),
+        ),
+    )
+
+    # The original single-mesh ray casters only saw /World/ground. Obstacle P0
+    # uses the multi-mesh variants so the unchanged 8-channel map includes the box.
+    mid360_lidar = MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/mid360_link",
+        ray_alignment="base",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=16,
+            vertical_fov_range=(-7.0, 52.0),
+            horizontal_fov_range=(-180.0, 180.0),
+            horizontal_res=10.0,
+        ),
+        max_distance=40.0,
+        mesh_prim_paths=_obstacle_raycast_targets(),
+        debug_vis=True,
+    )
+
+    avia_lidar = MultiMeshRayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/avia_link",
+        ray_alignment="base",
+        pattern_cfg=patterns.LidarPatternCfg(
+            channels=16,
+            vertical_fov_range=(-38.6, 38.6),
+            horizontal_fov_range=(-35.2, 35.2),
+            horizontal_res=2.0,
+        ),
+        max_distance=50.0,
+        mesh_prim_paths=_obstacle_raycast_targets(),
+        debug_vis=True,
+    )
+
+    d435i_camera = MultiMeshRayCasterCameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/d435i_link",
+        offset=MultiMeshRayCasterCameraCfg.OffsetCfg(
+            pos=(0.0, 0.0, 0.0),
+            rot=(0.5, -0.5, 0.5, -0.5),
+            convention="ros",
+        ),
+        pattern_cfg=patterns.PinholeCameraPatternCfg(
+            focal_length=1.93,
+            horizontal_aperture=3.80,
+            width=12,
+            height=10,
+        ),
+        max_distance=10.0,
+        mesh_prim_paths=_obstacle_raycast_targets(),
+        debug_vis=True,
+    )
+
+    # Filtered sensors make collision labels obstacle-specific instead of
+    # confusing normal wheel-ground support with a crash.
+    obstacle_base_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base_link",
+        update_period=0.0,
+        history_length=2,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        debug_vis=False,
+    )
+    obstacle_lf_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/w_lf",
+        update_period=0.0,
+        history_length=2,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        debug_vis=False,
+    )
+    obstacle_lb_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/w_lb",
+        update_period=0.0,
+        history_length=2,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        debug_vis=False,
+    )
+    obstacle_rf_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/w_rf",
+        update_period=0.0,
+        history_length=2,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        debug_vis=False,
+    )
+    obstacle_rb_contact = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/w_rb",
+        update_period=0.0,
+        history_length=2,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
+        debug_vis=False,
     )
 
 
@@ -318,10 +522,24 @@ class ObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
+    @configclass
+    class TeacherCommandCfg(ObsGroup):
+        """Unmasked command group used only to label memory-training rollouts."""
+
+        command_state = ObsTerm(
+            func=mdp.command_observation,
+            params={**COMMAND_OBS_PARAMS, "observation_cache_key": "teacher"},
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
     # observation groups
     policy_state: PolicyStateCfg = PolicyStateCfg()
     policy_map: PolicyMapCfg = PolicyMapCfg()
     critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
+    teacher_command: TeacherCommandCfg | None = None
 
 
 @configclass
@@ -411,6 +629,7 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
     stop_phase_suspension_action: float | None = None
     stop_phase_suspension_mode: str = "legacy"
     stop_phase_wheel_override_enabled: bool = True
+    terrain_type_names: tuple[str, ...] | None = None
 
     # Post initialization
     def __post_init__(self) -> None:
@@ -1589,6 +1808,549 @@ class RangerShortGoalFlatCRecurrentEnvCfg(RangerShortGoalFlatV10EnvCfg):
                     "heading_weights": (0.50, 0.50),
                 }
             )
+
+
+@configclass
+class RangerShortGoalMemoryV1EnvCfg(RangerShortGoalFlatCRecurrentEnvCfg):
+    """Memory validation task: hide goal observation while preserving prop/map/recurrent inputs."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params.update(
+            {
+                "goal_visibility_mode": "random_hidden",
+                "goal_visible_steps": 5,
+                "goal_hidden_steps": 25,
+            }
+        )
+
+
+@configclass
+class RangerShortGoalMemoryV2EnvCfg(RangerShortGoalFlatCRecurrentEnvCfg):
+    """Memory curriculum task: long visible phase followed by short goal occlusion."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params.update(
+            {
+                "goal_visibility_mode": "random_hidden",
+                "goal_visible_steps": 50,
+                "goal_hidden_steps": 5,
+            }
+        )
+
+
+@configclass
+class RangerPerceptionP0EnvCfg(RangerShortGoalFlatV10EnvCfg):
+    """Clean P0 perception smoke-test task using the original V10 objective and a real local map."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # P0 changes exactly one policy input relative to the J4/V10 behavior baseline:
+        # replace the fixed neutral map with the live 8-channel local navigation map.
+        # No K/L/M recurrent repair rewards are inherited because this task branches
+        # directly from RangerShortGoalFlatV10EnvCfg.
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = False
+
+
+@configclass
+class RangerPerceptionP0NeutralEnvCfg(RangerPerceptionP0EnvCfg):
+    """Control arm for P0: identical clean V10 task but with the historical neutral map."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = True
+
+
+@configclass
+class RangerStage2ControlTransferEnvCfg(RangerPerceptionP0EnvCfg):
+    """Flat, always-visible control-transfer task with the live local perception map."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params["goal_visibility_mode"] = "always"
+        self.observations.policy_map.local_navigation_map.params["use_neutral_map"] = False
+
+
+@configclass
+class RangerStage2ObstacleP0EnvCfg(RangerStage2ControlTransferEnvCfg):
+    """Flat, visible-goal curriculum with one unavoidable obstacle and live perception."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene = RangerStage2ObstacleP0SceneCfg(num_envs=64, env_spacing=12.0)
+        self.scene.mid360_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.d435i_camera.update_period = self.decimation * self.sim.dt
+        self.scene.wheel_contact_forces.update_period = self.sim.dt
+        self.scene.all_body_contact_forces.update_period = self.sim.dt
+        obstacle_sensor_names = (
+            "obstacle_base_contact",
+            "obstacle_lf_contact",
+            "obstacle_lb_contact",
+            "obstacle_rf_contact",
+            "obstacle_rb_contact",
+        )
+        for sensor_name in obstacle_sensor_names:
+            getattr(self.scene, sensor_name).update_period = self.sim.dt
+
+        # Preserve 21 x 13 map cells for checkpoint compatibility while doubling
+        # the metric look-ahead and lateral coverage used by the obstacle lesson.
+        self.observations.policy_map.local_navigation_map.params.update(
+            {
+                "x_range": (0.0, 4.0),
+                "y_range": (-1.2, 1.2),
+                "resolution": 0.2,
+                "height_reference_x_range": (0.0, 0.6),
+                "height_reference_y_range": (-0.4, 0.4),
+                "apply_noise": False,
+                "use_neutral_map": False,
+            }
+        )
+        self.episode_length_s = 30.0
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_behind_random_obstacle,
+            mode="reset",
+            params={
+                "obstacle_x_range": (3.2, 3.8),
+                "obstacle_abs_y_range": (0.15, 0.40),
+                "route_lateral_offset": 1.10,
+                "distance_beyond_obstacle_range": (3.5, 6.0),
+                "lateral_offset_range": (-0.30, 0.30),
+                "asset_cfg": SceneEntityCfg("robot"),
+                "obstacle_cfg": SceneEntityCfg("obstacle"),
+            },
+        )
+
+        self.rewards.obstacle_proximity = RewTerm(
+            func=mdp.fixed_obstacle_proximity_penalty,
+            weight=-1.0,
+            params={
+                "safety_radius": 1.25,
+                "transition_width": 0.5,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.obstacle_route_progress = RewTerm(
+            func=mdp.obstacle_route_progress,
+            weight=12.0,
+            params={
+                "side_clearance_radius": 1.15,
+                "exit_fade_distance": 1.0,
+                "max_progress_per_step": 0.08,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.obstacle_route_heading = RewTerm(
+            func=mdp.obstacle_route_heading_error,
+            weight=-2.0,
+            params={
+                "side_clearance_radius": 1.15,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.obstacle_collision = RewTerm(
+            func=mdp.obstacle_contact_penalty,
+            weight=-8.0,
+            params={"sensor_names": obstacle_sensor_names, "force_threshold": 5.0},
+        )
+        self.terminations.obstacle_collision = DoneTerm(
+            func=mdp.obstacle_collision,
+            params={"sensor_names": obstacle_sensor_names, "force_threshold": 20.0},
+        )
+
+        # Before the obstacle, a temporary route waypoint must be allowed to
+        # override the old direct-to-goal turning priors.
+        self.rewards.progress_to_goal.weight = 2.0
+        self.rewards.heading_error_reduction.weight = 2.0
+        self.rewards.heading_error_persistent.weight = -0.05
+        self.rewards.yaw_rate_tracking.weight = -0.03
+        self.rewards.short_goal_wheel_diff_prior.weight = -0.01
+
+
+@configclass
+class RangerStage2ObstacleP05EnvCfg(RangerStage2ObstacleP0EnvCfg):
+    """P0.5 repair for smooth post-obstacle alignment and near-goal braking."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Leave enough room to finish the obstacle turn before braking. The
+        # direct path still intersects the randomized obstacle in every reset.
+        self.events.reset_short_goal_target.params["distance_beyond_obstacle_range"] = (5.5, 8.0)
+
+        # Guide through a side waypoint and an exit waypoint. The route term
+        # fades before the exit plane, so it never pulls toward a point behind.
+        self.rewards.obstacle_route_progress.params.update(
+            {"side_clearance_radius": 1.15, "exit_fade_distance": 1.0}
+        )
+        self.rewards.obstacle_route_heading.params.update(
+            {"side_clearance_radius": 1.15, "exit_fade_distance": 1.0}
+        )
+
+        # Restore the P1.5 terminal-control lesson that Obstacle P0 did not
+        # inherit from the terrain branch.
+        self.stop_phase_wheel_override_enabled = False
+        self.rewards.short_goal_speed_profile.weight = -3.0
+        self.rewards.short_goal_speed_profile.params.update(
+            {
+                "stop_distance": self.short_goal_stop_phase_enter_distance,
+                "braking_acceleration": 0.35,
+                "reaction_time": 0.30,
+                "braking_margin": 0.18,
+                "near_distance": 1.80,
+            }
+        )
+        self.rewards.pre_stop_xy_speed_envelope = RewTerm(
+            func=mdp.short_goal_pre_stop_xy_speed_envelope_penalty,
+            weight=-2.5,
+            params={
+                "enter_distance": self.short_goal_stop_phase_enter_distance,
+                "full_speed_distance": 2.0,
+                "allowed_speed_at_enter": 0.15,
+                "allowed_speed_at_full": 0.80,
+                "excess_speed_reference": 0.40,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.near_goal_lateral_velocity = RewTerm(
+            func=mdp.short_goal_near_lateral_velocity_penalty,
+            weight=-1.0,
+            params={
+                "stop_distance": self.short_goal_stop_phase_enter_distance,
+                "active_distance": 2.50,
+                "lateral_speed_reference": 0.40,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.cruise_underspeed.weight = -0.15
+        self.rewards.cruise_underspeed.params.update(
+            {
+                "capture_distance": self.short_goal_stop_phase_enter_distance,
+                "approach_full_distance": 0.90,
+                "cruise_full_distance": 1.80,
+                "approach_speed": 0.15,
+            }
+        )
+        self.rewards.near_goal_away_speed.weight = -0.50
+        self.rewards.near_goal_away_speed.params.update(
+            {
+                "stop_distance": self.short_goal_stop_phase_enter_distance,
+                "active_distance": 1.50,
+            }
+        )
+        self.rewards.stopped_goal_success.weight = 10.0
+        self.rewards.stop_phase_base_xy_speed.weight = -4.0
+        self.rewards.stop_phase_wheel_target.weight = -2.0
+        self.rewards.stop_phase_distance_drift.weight = -4.0
+        self.rewards.loaded_wheel_longitudinal_slip.weight = -0.075
+        self.rewards.wheel_target_rate.weight = -0.03
+        self.rewards.precision_reach_bonus.weight = 0.5
+
+
+@configclass
+class RangerStage2ObstacleP05ExitEnvCfg(RangerStage2ObstacleP05EnvCfg):
+    """Dense obstacle-exit lesson for reacquiring the final goal heading."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params={"scenario_weights": (0.0, 1.0, 0.0), **obstacle_params},
+        )
+        self.episode_length_s = 14.0
+
+
+@configclass
+class RangerStage2ObstacleP05ExitV2EnvCfg(RangerStage2ObstacleP05EnvCfg):
+    """Dynamic post-obstacle recovery with broad heading and velocity coverage."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        obstacle_params.update(
+            {
+                "exit_x_after_obstacle_range": (0.75, 1.60),
+                "exit_lateral_jitter": 0.20,
+                "exit_heading_error_range_deg": (-70.0, 70.0),
+                "exit_stratify_heading_sign": True,
+                "exit_forward_speed_range": (0.25, 1.20),
+                "distance_beyond_obstacle_range": (5.0, 9.0),
+                "lateral_offset_range": (-0.60, 0.60),
+            }
+        )
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params={"scenario_weights": (0.0, 1.0, 0.0), **obstacle_params},
+        )
+
+        # Exit-only resets no longer need the weak direct-goal signal used to
+        # protect the pre-obstacle waypoint lesson.
+        self.rewards.heading_error_reduction.weight = 6.0
+        self.rewards.heading_error_persistent.weight = -0.15
+        self.rewards.yaw_rate_tracking.weight = -0.08
+        self.episode_length_s = 18.0
+
+
+@configclass
+class RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg(RangerStage2ObstacleP05ExitV2EnvCfg):
+    """Exit-V2 variant exposing normalized point-goal heading-error rate in command slot 1."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params["short_goal_heading_rate_reference"] = 2.0
+
+
+@configclass
+class RangerStage2ObstacleP05StopEnvCfg(RangerStage2ObstacleP05EnvCfg):
+    """Dense terminal lesson starting shortly before the final goal."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params={"scenario_weights": (0.0, 0.0, 1.0), **obstacle_params},
+        )
+        self.episode_length_s = 10.0
+
+
+@configclass
+class RangerStage2ObstacleP05FullEnvCfg(RangerStage2ObstacleP05EnvCfg):
+    """Consolidation lesson mixing complete routes, exits, and terminal states."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params={"scenario_weights": (0.50, 0.25, 0.25), **obstacle_params},
+        )
+
+
+@configclass
+class RangerStage2MemoryM0EnvCfg(RangerStage2ControlTransferEnvCfg):
+    """Flat Stage2 memory probe with privileged unmasked teacher goal labels."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params.update(
+            {
+                "goal_visibility_mode": "staggered_hidden",
+                "goal_visible_steps": 100,
+                "goal_hidden_steps": 5,
+                # Slot zero was always zero in Stage2. It becomes one only while
+                # the goal descriptor is hidden, preserving visible observations.
+                "goal_hidden_indicator_index": 0,
+                "observation_cache_key": "student",
+            }
+        )
+        self.observations.teacher_command = ObservationsCfg.TeacherCommandCfg()
+        self.observations.teacher_command.command_state.params = {
+            **self.observations.policy_state.command_state.params,
+            "goal_visibility_mode": "always",
+            "goal_hidden_indicator_index": None,
+            "observation_cache_key": "teacher",
+        }
+
+
+@configclass
+class RangerStage2MemoryM1EnvCfg(RangerStage2MemoryM0EnvCfg):
+    """One-second goal occlusion probe after a visible Stage2 prefix."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params["goal_hidden_steps"] = 60
+
+
+@configclass
+class RangerStage2TerrainP0EnvCfg(RangerStage2ControlTransferEnvCfg):
+    """Visible-goal adaptation on flat ground and gentle bidirectional slopes."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene = RangerStage2TerrainP0SceneCfg(num_envs=64, env_spacing=4.0)
+        self.scene.mid360_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.d435i_camera.update_period = self.decimation * self.sim.dt
+        self.scene.wheel_contact_forces.update_period = self.sim.dt
+        self.scene.all_body_contact_forces.update_period = self.sim.dt
+        self.terrain_type_names = ("flat", "flat", "gentle_up_slope", "gentle_down_slope")
+        self.episode_length_s = 28.0
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_stratified_target,
+            mode="reset",
+            params={
+                "distance_bands": ((4.0, 7.0), (7.0, 10.0), (10.0, 12.0)),
+                "distance_weights": (0.25, 0.45, 0.30),
+                "heading_bands_deg": (
+                    (-80.0, -50.0),
+                    (-50.0, -15.0),
+                    (-15.0, 15.0),
+                    (15.0, 50.0),
+                    (50.0, 80.0),
+                ),
+                "heading_weights": (0.15, 0.20, 0.30, 0.20, 0.15),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        # Reaching a target on a slope must not require the flat-task 2-degree
+        # absolute attitude gate. The existing attitude rewards remain strict
+        # and continue to train active chassis leveling.
+        self.short_goal_stop_max_roll = math.radians(8.0)
+        self.short_goal_stop_max_pitch = math.radians(8.0)
+        terrain_success_posture = {
+            "max_roll": self.short_goal_stop_max_roll,
+            "max_pitch": self.short_goal_stop_max_pitch,
+        }
+        self.terminations.stopped_goal_reached.params.update(terrain_success_posture)
+        self.rewards.stopped_goal_success.params.update(terrain_success_posture)
+        # Flat-task absolute world-height terms are invalid when terrain patches
+        # have different vertical origins. Orientation/contact terms remain active.
+        self.terminations.root_height_low = None
+        self.rewards.base_height_low = None
+        self.rewards.base_height_high = None
+
+
+@configclass
+class RangerStage2TerrainP1EnvCfg(RangerStage2TerrainP0EnvCfg):
+    """Visible-goal adaptation on moderate slopes and low bidirectional stairs."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene = RangerStage2TerrainP1SceneCfg(num_envs=64, env_spacing=4.0)
+        self.scene.mid360_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.avia_lidar.update_period = self.decimation * self.sim.dt
+        self.scene.d435i_camera.update_period = self.decimation * self.sim.dt
+        self.scene.wheel_contact_forces.update_period = self.sim.dt
+        self.scene.all_body_contact_forces.update_period = self.sim.dt
+        self.terrain_type_names = (
+            "flat",
+            "moderate_up_slope",
+            "moderate_down_slope",
+            "ascending_stairs",
+            "descending_stairs",
+        )
+        self.episode_length_s = 34.0
+        self.events.reset_short_goal_target.params.update(
+            {
+                "distance_bands": ((5.0, 8.0), (8.0, 11.0), (11.0, 14.0)),
+                "distance_weights": (0.20, 0.45, 0.35),
+                "heading_bands_deg": (
+                    (-90.0, -55.0),
+                    (-55.0, -20.0),
+                    (-20.0, 20.0),
+                    (20.0, 55.0),
+                    (55.0, 90.0),
+                ),
+                "heading_weights": (0.15, 0.20, 0.30, 0.20, 0.15),
+            }
+        )
+        self.short_goal_stop_max_roll = math.radians(15.0)
+        self.short_goal_stop_max_pitch = math.radians(15.0)
+        terrain_success_posture = {
+            "max_roll": self.short_goal_stop_max_roll,
+            "max_pitch": self.short_goal_stop_max_pitch,
+        }
+        self.terminations.stopped_goal_reached.params.update(terrain_success_posture)
+        self.rewards.stopped_goal_success.params.update(terrain_success_posture)
+
+
+@configclass
+class RangerStage2TerrainP15BrakeAssistEnvCfg(RangerStage2TerrainP1EnvCfg):
+    """Near-goal braking repair with the historical stop-phase wheel override retained."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # Increase near-goal exposure without discarding the long-range P1 task.
+        self.events.reset_short_goal_target.params.update(
+            {
+                "distance_bands": ((1.0, 3.0), (3.0, 5.0), (5.0, 8.0), (8.0, 11.0), (11.0, 14.0)),
+                "distance_weights": (0.20, 0.10, 0.20, 0.25, 0.25),
+            }
+        )
+
+        # P1 inherited the V10 requirement to keep moving at 0.35 m/s until 0.30 m,
+        # although its stop phase starts at 0.50 m. Remove that conflict and ask
+        # for an earlier, terrain-tolerant braking approach.
+        self.rewards.short_goal_speed_profile.weight = -3.0
+        self.rewards.short_goal_speed_profile.params.update(
+            {
+                "stop_distance": 0.50,
+                "braking_acceleration": 0.35,
+                "reaction_time": 0.30,
+                "braking_margin": 0.18,
+                "near_distance": 1.8,
+            }
+        )
+        self.rewards.pre_stop_xy_speed_envelope = RewTerm(
+            func=mdp.short_goal_pre_stop_xy_speed_envelope_penalty,
+            weight=-2.5,
+            params={
+                "enter_distance": self.short_goal_stop_phase_enter_distance,
+                "full_speed_distance": 2.0,
+                "allowed_speed_at_enter": 0.15,
+                "allowed_speed_at_full": 0.80,
+                "excess_speed_reference": 0.40,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.cruise_underspeed.weight = -0.15
+        self.rewards.cruise_underspeed.params.update(
+            {
+                "capture_distance": self.short_goal_stop_phase_enter_distance,
+                "approach_full_distance": 0.90,
+                "cruise_full_distance": 1.80,
+                "approach_speed": 0.15,
+            }
+        )
+        self.rewards.near_goal_away_speed.weight = -0.50
+        self.rewards.near_goal_away_speed.params.update(
+            {
+                "stop_distance": self.short_goal_stop_phase_enter_distance,
+                "active_distance": 1.50,
+            }
+        )
+
+        self.rewards.stopped_goal_success.weight = 8.0
+        self.rewards.stop_phase_base_xy_speed.weight = -3.0
+        self.rewards.stop_phase_wheel_target.weight = -1.0
+        self.rewards.stop_phase_distance_drift.weight = -3.0
+        self.rewards.loaded_wheel_longitudinal_slip.weight = -0.075
+        self.rewards.wheel_target_rate.weight = -0.03
+        self.rewards.precision_reach_bonus.weight = 0.5
+
+
+@configclass
+class RangerStage2TerrainP15EnvCfg(RangerStage2TerrainP15BrakeAssistEnvCfg):
+    """Final P1.5 task in which the policy must perform stopping without a wheel override."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.stop_phase_wheel_override_enabled = False
+        self.rewards.stopped_goal_success.weight = 10.0
+        self.rewards.stop_phase_base_xy_speed.weight = -4.0
+        self.rewards.stop_phase_wheel_target.weight = -2.0
+        self.rewards.stop_phase_distance_drift.weight = -4.0
+
+
+@configclass
+class RangerPerceptionTerrainP0EnvCfg(RangerPerceptionP0EnvCfg):
+    """P0 wave-terrain adaptation task with unchanged rewards and observations."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene = RangerWaveTerrainSceneCfg(num_envs=64, env_spacing=4.0)
+        self.events.reset_short_goal_target.func = mdp.reset_wave_terrain_short_goal_target
+        self.events.reset_short_goal_target.params = {
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
 
 
 @configclass

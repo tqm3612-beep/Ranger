@@ -32,13 +32,27 @@ parser.add_argument(
 parser.add_argument(
     "--camera_mode",
     type=str,
-    choices=("fixed", "follow", "overview", "overview_fixed"),
+    choices=("fixed", "follow", "goal_follow", "overview", "overview_fixed", "manual_fixed"),
     default="follow",
     help=(
         "Recording camera mode. 'follow' tracks environment zero from behind; "
+        "'goal_follow' frames one robot together with its current goal; "
         "'overview' dynamically reframes all robots; 'overview_fixed' computes one overview pose "
-        "from the initial robots and goals, then keeps it fixed."
+        "from the initial robots and goals, then keeps it fixed; "
+        "'manual_fixed' uses --camera_eye and --camera_target world coordinates."
     ),
+)
+parser.add_argument(
+    "--camera_env_id",
+    type=int,
+    default=0,
+    help="Environment index tracked by follow and goal_follow camera modes.",
+)
+parser.add_argument(
+    "--goal_follow_padding",
+    type=float,
+    default=3.0,
+    help="Extra framing margin in meters around the tracked robot-to-goal segment.",
 )
 parser.add_argument(
     "--overview_fixed_scale",
@@ -51,6 +65,22 @@ parser.add_argument(
     type=float,
     default=2.0,
     help="Extra XY padding in meters when inferring the fixed overview framing.",
+)
+parser.add_argument(
+    "--camera_eye",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("X", "Y", "Z"),
+    help="World-space recording camera position for --camera_mode manual_fixed.",
+)
+parser.add_argument(
+    "--camera_target",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("X", "Y", "Z"),
+    help="World-space point looked at by the recording camera for --camera_mode manual_fixed.",
 )
 parser.add_argument(
     "--fixed_suspension_action",
@@ -87,6 +117,21 @@ parser.add_argument(
     type=str,
     default=None,
     help="Optional CSV path for episode-weighted full debug metrics collected during deterministic play.",
+)
+parser.add_argument(
+    "--evaluation_summary_csv",
+    type=str,
+    default=None,
+    help="Optional two-column CSV path for the compact deterministic-play evaluation summary.",
+)
+parser.add_argument(
+    "--recurrent_ablation",
+    choices=("none", "reset_hidden_each_step", "reset_every_step"),
+    default="none",
+    help=(
+        "Memory evaluation control: reset recurrent state during every hidden-goal step, "
+        "or before every policy step."
+    ),
 )
 parser.add_argument(
     "--success_gate_trace_csv",
@@ -150,6 +195,8 @@ if args_cli.suspension_action_scale is not None:
     os.environ["RANGER_SUSPENSION_ACTION_SCALE"] = str(float(args_cli.suspension_action_scale))
 if args_cli.max_steps is not None and int(args_cli.max_steps) <= 0:
     raise ValueError("--max_steps must be positive when provided.")
+if args_cli.camera_mode == "manual_fixed" and (args_cli.camera_eye is None or args_cli.camera_target is None):
+    raise ValueError("--camera_mode manual_fixed requires both --camera_eye X Y Z and --camera_target X Y Z.")
 # Always enable cameras to record video and pass the requested viewport resolution
 # through to SimulationApp before AppLauncher is constructed.
 if args_cli.video:
@@ -199,9 +246,13 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 import Ranger.tasks  # noqa: F401
 from Ranger.tasks.manager_based.ranger import mdp as ranger_mdp
 from Ranger.tasks.manager_based.ranger.agents import RangerTerrainActorCritic, RangerTerrainActorCriticRecurrent
+from Ranger.tasks.manager_based.ranger.agents.rsl_rl_teacher_regularized_ppo import (
+    RangerTeacherRegularizedPPO,
+)
 
 rsl_on_policy_runner.RangerTerrainActorCritic = RangerTerrainActorCritic
 rsl_on_policy_runner.RangerTerrainActorCriticRecurrent = RangerTerrainActorCriticRecurrent
+rsl_on_policy_runner.RangerTeacherRegularizedPPO = RangerTeacherRegularizedPPO
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -328,6 +379,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         (env.unwrapped.num_envs,), -1, dtype=torch.long, device=env.unwrapped.device
     )
     episode_ids = torch.zeros(env.unwrapped.num_envs, dtype=torch.long, device=env.unwrapped.device)
+    recurrent_ablation_reset_count = 0
+    goal_hidden_env_steps = 0
+    total_env_steps = 0
+    configured_terrain_names = tuple(getattr(env.unwrapped.cfg, "terrain_type_names", ()) or ())
+    terrain_importer = getattr(env.unwrapped.scene, "terrain", None)
+    terrain_type_ids = getattr(terrain_importer, "terrain_types", None)
+    if not isinstance(terrain_type_ids, torch.Tensor) or terrain_type_ids.shape != (env.unwrapped.num_envs,):
+        terrain_type_ids = None
+        configured_terrain_names = ()
+    terrain_completed_counts = {name: 0 for name in dict.fromkeys(configured_terrain_names)}
+    terrain_success_counts = {name: 0 for name in dict.fromkeys(configured_terrain_names)}
+    camera_env_id = int(args_cli.camera_env_id)
+    if not 0 <= camera_env_id < env.unwrapped.num_envs:
+        raise ValueError(
+            f"--camera_env_id must be in [0, {env.unwrapped.num_envs - 1}], got {camera_env_id}."
+        )
+    if args_cli.video and args_cli.camera_mode in {"follow", "goal_follow"}:
+        camera_terrain = "unknown"
+        if terrain_type_ids is not None:
+            terrain_index = int(terrain_type_ids[camera_env_id].item())
+            if 0 <= terrain_index < len(configured_terrain_names):
+                camera_terrain = configured_terrain_names[terrain_index]
+        print(
+            f"[Camera] mode={args_cli.camera_mode} env_id={camera_env_id} "
+            f"terrain={camera_terrain}"
+        )
+    if args_cli.video and args_cli.camera_mode == "manual_fixed":
+        print(
+            "[Camera] mode=manual_fixed "
+            f"eye=({args_cli.camera_eye[0]:.3f}, {args_cli.camera_eye[1]:.3f}, {args_cli.camera_eye[2]:.3f}) "
+            f"target=({args_cli.camera_target[0]:.3f}, {args_cli.camera_target[1]:.3f}, "
+            f"{args_cli.camera_target[2]:.3f})"
+        )
+
+    def current_goal_hidden_mask() -> torch.Tensor:
+        if "teacher_command" in obs.keys():
+            student_command = obs["policy_state"][..., 26:34]
+            teacher_command = obs["teacher_command"]
+            return torch.any((student_command[..., 3:8] - teacher_command[..., 3:8]).abs() > 1.0e-6, dim=-1)
+        return torch.zeros(env.unwrapped.num_envs, dtype=torch.bool, device=env.unwrapped.device)
 
     trajectory_trace_file = None
     trajectory_trace_writer = None
@@ -457,17 +548,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     camera_eye_state: torch.Tensor | None = None
     camera_target_state: torch.Tensor | None = None
 
+    def print_camera_reference_positions() -> None:
+        """Print world-space positions useful for choosing a manual fixed camera."""
+
+        if not args_cli.video:
+            return
+        robot = env.unwrapped.scene["robot"]
+        root_positions = robot.data.root_pos_w.detach().cpu()
+        goal_positions = getattr(env.unwrapped, "_ranger_short_goal_pos_w", None)
+        if isinstance(goal_positions, torch.Tensor) and goal_positions.shape[0] == root_positions.shape[0]:
+            goal_positions_cpu = goal_positions.detach().cpu()
+        else:
+            goal_positions_cpu = None
+        env_origins = getattr(env.unwrapped.scene, "env_origins", None)
+        if isinstance(env_origins, torch.Tensor) and env_origins.shape[0] == root_positions.shape[0]:
+            env_origins_cpu = env_origins.detach().cpu()
+        else:
+            env_origins_cpu = None
+
+        print("[CameraReference] world-space env positions:")
+        for env_id in range(env.unwrapped.num_envs):
+            terrain_name = "unknown"
+            if terrain_type_ids is not None:
+                terrain_index = int(terrain_type_ids[env_id].item())
+                if 0 <= terrain_index < len(configured_terrain_names):
+                    terrain_name = configured_terrain_names[terrain_index]
+            origin = env_origins_cpu[env_id] if env_origins_cpu is not None else root_positions[env_id]
+            goal = goal_positions_cpu[env_id] if goal_positions_cpu is not None else torch.full((3,), float("nan"))
+            root = root_positions[env_id]
+            print(
+                f"[CameraReference] env={env_id} terrain={terrain_name} "
+                f"origin=({float(origin[0]):.3f}, {float(origin[1]):.3f}, {float(origin[2]):.3f}) "
+                f"root=({float(root[0]):.3f}, {float(root[1]):.3f}, {float(root[2]):.3f}) "
+                f"goal=({float(goal[0]):.3f}, {float(goal[1]):.3f}, {float(goal[2]):.3f})"
+            )
+
     def update_recording_camera() -> None:
-        """Track environment zero during video recording without affecting policy observations."""
+        """Update the recording-only camera without affecting policy observations."""
 
         nonlocal camera_eye_state, camera_target_state
         if not args_cli.video or args_cli.camera_mode == "fixed":
+            return
+        if args_cli.camera_mode == "manual_fixed":
+            if camera_eye_state is None:
+                camera_eye_state = torch.tensor(args_cli.camera_eye, dtype=torch.float32)
+                camera_target_state = torch.tensor(args_cli.camera_target, dtype=torch.float32)
+                env.unwrapped.sim.set_camera_view(camera_eye_state.tolist(), camera_target_state.tolist())
             return
         if args_cli.camera_mode == "overview_fixed" and camera_eye_state is not None:
             return
         robot = env.unwrapped.scene["robot"]
         root_positions = robot.data.root_pos_w.detach().cpu()
-        root_pos = root_positions[0]
+        root_pos = root_positions[camera_env_id]
         if args_cli.camera_mode in {"overview", "overview_fixed"}:
             framing_positions = root_positions
             if args_cli.camera_mode == "overview_fixed":
@@ -494,8 +626,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             desired_eye = desired_target + torch.tensor(
                 [0.55 * camera_scale, -0.80 * camera_scale, 0.65 * camera_scale]
             )
+        elif args_cli.camera_mode == "goal_follow":
+            goal_positions = getattr(env.unwrapped, "_ranger_short_goal_pos_w", None)
+            if isinstance(goal_positions, torch.Tensor) and goal_positions.shape[0] == root_positions.shape[0]:
+                goal_pos = goal_positions[camera_env_id].detach().cpu()
+            else:
+                goal_pos = root_pos + torch.tensor([4.0, 0.0, 0.0])
+            goal_delta_xy = goal_pos[:2] - root_pos[:2]
+            goal_distance = float(torch.linalg.vector_norm(goal_delta_xy).item())
+            if goal_distance > 1.0e-6:
+                forward_xy = goal_delta_xy / goal_distance
+            else:
+                forward_xy = torch.tensor([1.0, 0.0])
+            lateral_xy = torch.stack((-forward_xy[1], forward_xy[0]))
+            padding = max(float(args_cli.goal_follow_padding), 0.0)
+            # The robot-goal segment lies mostly across the wide image axis, so scaling the
+            # camera one-to-one with goal distance leaves excessive empty vertical space.
+            camera_scale = max(6.0, 0.90 * goal_distance + padding + 1.0)
+            center_xy = 0.5 * (root_pos[:2] + goal_pos[:2])
+            desired_target = torch.tensor(
+                [
+                    float(center_xy[0]),
+                    float(center_xy[1]),
+                    0.5 * float(root_pos[2] + goal_pos[2]) + 0.2,
+                ]
+            )
+            desired_eye = desired_target + torch.tensor(
+                [
+                    float(0.72 * camera_scale * lateral_xy[0] - 0.18 * camera_scale * forward_xy[0]),
+                    float(0.72 * camera_scale * lateral_xy[1] - 0.18 * camera_scale * forward_xy[1]),
+                    0.46 * camera_scale,
+                ]
+            )
         else:
-            _, _, yaw_tensor = euler_xyz_from_quat(robot.data.root_quat_w[0:1])
+            _, _, yaw_tensor = euler_xyz_from_quat(
+                robot.data.root_quat_w[camera_env_id : camera_env_id + 1]
+            )
             yaw = float(yaw_tensor[0].item())
             cos_yaw = math.cos(yaw)
             sin_yaw = math.sin(yaw)
@@ -703,13 +869,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
         wheel_actions = actions[:, 4:8]
-        semantic_left_action = wheel_actions[:, :2].mean(dim=1)
-        semantic_right_action = wheel_actions[:, 2:].mean(dim=1)
+        semantic_wheel_actions = ranger_mdp.wheel_raw_to_semantic_lr_lf_rf_rr(wheel_actions)
+        semantic_left_action = semantic_wheel_actions[:, :2].mean(dim=1)
+        semantic_right_action = semantic_wheel_actions[:, 2:].mean(dim=1)
         wheel_common_mode = 0.5 * (semantic_left_action + semantic_right_action)
         wheel_turn_mode = 0.5 * (semantic_right_action - semantic_left_action)
         wheel_actions_clamped = torch.clamp(wheel_actions, min=-1.0, max=1.0)
-        clamped_left_action = wheel_actions_clamped[:, :2].mean(dim=1)
-        clamped_right_action = wheel_actions_clamped[:, 2:].mean(dim=1)
+        semantic_wheel_actions_clamped = ranger_mdp.wheel_raw_to_semantic_lr_lf_rf_rr(wheel_actions_clamped)
+        clamped_left_action = semantic_wheel_actions_clamped[:, :2].mean(dim=1)
+        clamped_right_action = semantic_wheel_actions_clamped[:, 2:].mean(dim=1)
         wheel_common_mode_clamped = 0.5 * (clamped_left_action + clamped_right_action)
         wheel_turn_mode_clamped = 0.5 * (clamped_right_action - clamped_left_action)
         wheel_action_saturation_fraction = (torch.abs(wheel_actions) > 1.0).to(torch.float32).mean(dim=1)
@@ -765,6 +933,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             rows.append(row)
         return rows
 
+    print_camera_reference_positions()
     update_recording_camera()
 
     # simulate environment
@@ -792,6 +961,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 stop_entry_age_steps[newly_entered_stop] = episode_age_steps[newly_entered_stop]
 
             # agent stepping
+            hidden_goal_mask = current_goal_hidden_mask()
+            goal_hidden_env_steps += int(hidden_goal_mask.sum().item())
+            total_env_steps += env.unwrapped.num_envs
+            if getattr(policy_nn, "is_recurrent", False) and args_cli.recurrent_ablation != "none":
+                if args_cli.recurrent_ablation == "reset_every_step":
+                    ablation_reset_mask = torch.ones(
+                        env.unwrapped.num_envs,
+                        dtype=torch.bool,
+                        device=env.unwrapped.device,
+                    )
+                else:
+                    ablation_reset_mask = hidden_goal_mask
+                if torch.any(ablation_reset_mask):
+                    policy_nn.reset(ablation_reset_mask)
+                    recurrent_ablation_reset_count += int(ablation_reset_mask.sum().item())
             actions = policy(obs)
             success_gate_rows = None
             trajectory_rows = None
@@ -873,6 +1057,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     success_with_stop_entry_count += int(valid_success_stop.sum().item())
                     completed_this_step = int(term_any.sum().item())
                     completed_episodes += completed_this_step
+                    if terrain_type_ids is not None:
+                        for terrain_index, terrain_name in enumerate(configured_terrain_names):
+                            terrain_mask = terrain_type_ids == terrain_index
+                            terrain_completed_counts[terrain_name] += int((term_any & terrain_mask).sum().item())
+                            terrain_success_counts[terrain_name] += int((success_mask & terrain_mask).sum().item())
                     if completed_this_step > 0:
                         full_log = step_info.get("full_log", {}) if isinstance(step_info, dict) else {}
                         if not full_log:
@@ -939,6 +1128,56 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"  mean_steps_to_stop_phase: {mean_stop_entry_steps:.3f}")
         print(f"  mean_steps_stop_phase_to_success: {mean_stop_phase_steps:.3f}")
         print(f"  termination_counts: {termination_counts}")
+        print(f"  recurrent_ablation: {args_cli.recurrent_ablation}")
+        print(f"  recurrent_ablation_reset_count: {recurrent_ablation_reset_count}")
+        goal_hidden_rate = goal_hidden_env_steps / max(total_env_steps, 1)
+        print(f"  goal_hidden_rate: {goal_hidden_rate:.6f}")
+        for terrain_name, terrain_completed in terrain_completed_counts.items():
+            terrain_success = terrain_success_counts[terrain_name]
+            terrain_success_rate = terrain_success / max(terrain_completed, 1)
+            print(
+                f"  terrain/{terrain_name}: completed={terrain_completed} "
+                f"success={terrain_success} rate={terrain_success_rate:.6f}"
+            )
+
+        if args_cli.evaluation_summary_csv is not None:
+            summary_csv_path = os.path.abspath(os.path.expanduser(args_cli.evaluation_summary_csv))
+            summary_csv_dir = os.path.dirname(summary_csv_path)
+            if summary_csv_dir:
+                os.makedirs(summary_csv_dir, exist_ok=True)
+            summary_values = [
+                ("policy_steps", timestep),
+                ("completed_episodes", completed_episodes),
+                ("stopped_goal_reached", success_count),
+                ("time_out", timeout_count),
+                ("other_failures", other_failure_count),
+                ("stopped_goal_success_rate", f"{success_rate:.10g}"),
+                ("mean_completed_episode_steps", f"{mean_completed_steps:.10g}"),
+                ("mean_success_episode_steps", f"{mean_success_steps:.10g}"),
+                ("success_with_stop_entry_count", success_with_stop_entry_count),
+                ("mean_steps_to_stop_phase", f"{mean_stop_entry_steps:.10g}"),
+                ("mean_steps_stop_phase_to_success", f"{mean_stop_phase_steps:.10g}"),
+                ("recurrent_ablation", args_cli.recurrent_ablation),
+                ("recurrent_ablation_reset_count", recurrent_ablation_reset_count),
+                ("goal_hidden_rate", f"{goal_hidden_rate:.10g}"),
+            ]
+            for terrain_name, terrain_completed in terrain_completed_counts.items():
+                terrain_success = terrain_success_counts[terrain_name]
+                summary_values.extend(
+                    (
+                        (f"terrain/{terrain_name}/completed_episodes", terrain_completed),
+                        (f"terrain/{terrain_name}/stopped_goal_reached", terrain_success),
+                        (
+                            f"terrain/{terrain_name}/stopped_goal_success_rate",
+                            f"{terrain_success / max(terrain_completed, 1):.10g}",
+                        ),
+                    )
+                )
+            with open(summary_csv_path, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(("metric", "value"))
+                writer.writerows(summary_values)
+            print(f"[EvaluationSummary] CSV written to: {summary_csv_path}")
 
         evaluation_metric_means = {
             name: evaluation_metric_weighted_sums[name] / max(evaluation_metric_weights[name], 1)

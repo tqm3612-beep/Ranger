@@ -4,6 +4,7 @@ import os
 import sys
 import types
 import importlib.util
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -54,6 +55,12 @@ RangerTerrainActorCritic = feedforward_policy_module.RangerTerrainActorCritic
 recurrent_policy_module = _load_agent_module("rsl_rl_recurrent_policy", "rsl_rl_recurrent_policy.py")
 RangerTerrainActorCriticRecurrent = recurrent_policy_module.RangerTerrainActorCriticRecurrent
 NETWORK_SPEC = recurrent_policy_module._RANGER_RECURRENT_NETWORK_SPEC
+teacher_ppo_module = _load_agent_module("rsl_rl_teacher_regularized_ppo", "rsl_rl_teacher_regularized_ppo.py")
+RangerTeacherRegularizedPPO = teacher_ppo_module.RangerTeacherRegularizedPPO
+teacher_wheel_sample_weights = teacher_ppo_module.teacher_wheel_sample_weights
+near_goal_brake_common_loss = teacher_ppo_module.near_goal_brake_common_loss
+ranger_wheel_raw_to_semantic = teacher_ppo_module.ranger_wheel_raw_to_semantic
+ranger_wheel_semantic_modes = teacher_ppo_module.ranger_wheel_semantic_modes
 warm_start_path = os.path.join(REPO_ROOT, "scripts", "rsl_rl", "warm_start.py")
 warm_start_spec = importlib.util.spec_from_file_location("ranger_recurrent_warm_start", warm_start_path)
 warm_start_module = importlib.util.module_from_spec(warm_start_spec)
@@ -68,6 +75,12 @@ distill_module = importlib.util.module_from_spec(distill_spec)
 assert distill_spec.loader is not None
 distill_spec.loader.exec_module(distill_module)
 compute_distillation_losses = distill_module.compute_distillation_losses
+bound_teacher_actions = distill_module.bound_teacher_actions
+SequenceReplayAnchor = distill_module.SequenceReplayAnchor
+recurrent_sequence_actions = distill_module.recurrent_sequence_actions
+build_teacher_observations = distill_module.build_teacher_observations
+goal_hidden_mask = distill_module.goal_hidden_mask
+goal_hidden_sample_weights = distill_module.goal_hidden_sample_weights
 reset_recurrent_memory = distill_module.reset_recurrent_memory
 restore_distillation_optimizer = distill_module._restore_distillation_optimizer
 select_rollout_actions = distill_module._select_rollout_actions
@@ -140,14 +153,85 @@ def test_recurrent_policy_shapes() -> None:
     assert critic_hidden.shape == (1, num_envs, 256)
 
 
+def test_action_prior_heading_deadband_zeroes_closeout_yaw_target() -> None:
+    algorithm = object.__new__(RangerTeacherRegularizedPPO)
+    algorithm.large_heading_action_prior_heading_deadband = 0.04
+    algorithm.large_heading_action_prior_heading_scale = 0.40
+    algorithm.large_heading_action_prior_yaw_rate_reference = 0.35
+
+    heading = torch.tensor([-0.03, 0.0, 0.03, 0.20])
+    effective_heading, desired_yaw_rate = algorithm._prior_heading_targets(heading)
+
+    assert torch.equal(effective_heading[:3], torch.zeros(3))
+    assert torch.equal(desired_yaw_rate[:3], torch.zeros(3))
+    assert effective_heading[3] > 0.0
+    assert desired_yaw_rate[3] > 0.0
+
+
+def test_hidden_goal_residual_preserves_visible_actions_and_changes_only_hidden_wheels() -> None:
+    base = _make_policy(num_envs=2)
+    obs = _make_obs((2,))
+    residual = RangerTerrainActorCriticRecurrent(
+        obs=obs,
+        obs_groups=OBS_GROUPS,
+        num_actions=8,
+        init_noise_std=0.1,
+        initial_action_std=[0.01] * 8,
+        use_hidden_goal_residual=True,
+    )
+    residual.load_state_dict(base.state_dict(), strict=True)
+    with torch.no_grad():
+        residual.actor.residual_head.bias[4:] = 0.5
+    obs["policy_state"][:, 26] = torch.tensor([0.0, 1.0])
+
+    base_actions = base.act_inference(obs)
+    residual_actions = residual.act_inference(obs)
+
+    assert torch.equal(residual_actions[0], base_actions[0])
+    assert torch.equal(residual_actions[1, :4], base_actions[1, :4])
+    assert not torch.equal(residual_actions[1, 4:], base_actions[1, 4:])
+
+
+def test_recurrent_teacher_targets_use_matching_rollout_hidden_state() -> None:
+    teacher = _make_policy(num_envs=2)
+    with torch.no_grad():
+        teacher.actor.suspension_head[-1].weight.normal_(std=0.05)
+        teacher.actor.wheel_head[-1].weight.normal_(std=0.05)
+
+    obs = _make_obs((4, 2))
+    masks = torch.ones((4, 2), dtype=torch.bool)
+    hidden_state = torch.randn(1, 2, NETWORK_SPEC.rnn_hidden_dim)
+    actor_obs = teacher.actor_obs_normalizer(teacher.get_actor_obs(obs))
+    with torch.inference_mode():
+        raw_mean = teacher._apply_action_output_mask(teacher.actor(actor_obs, masks, hidden_state))
+        expected = torch.tanh(teacher._bound_latent_mean(raw_mean))
+
+    algorithm = types.SimpleNamespace(teacher=teacher)
+    targets = RangerTeacherRegularizedPPO._teacher_targets(
+        algorithm,
+        obs,
+        masks,
+        actor_hidden_state=hidden_state,
+    )
+    zero_state_targets = RangerTeacherRegularizedPPO._teacher_targets(
+        algorithm,
+        obs,
+        masks,
+        actor_hidden_state=torch.zeros_like(hidden_state),
+    )
+
+    assert torch.allclose(targets, expected)
+    assert not torch.allclose(targets, zero_state_targets)
+
+
 def test_network_structure_has_one_derived_dimension_source() -> None:
     policy = _make_policy(num_envs=2, privileged_dim=19)
 
     assert NETWORK_SPEC.prop_dim == 34
     assert NETWORK_SPEC.goal_dim == 8
     assert NETWORK_SPEC.map_dim == 2184
-    assert NETWORK_SPEC.actor_fusion_dim == 320
-    assert NETWORK_SPEC.critic_fusion_dim == 384
+    assert NETWORK_SPEC.actor_fusion_dim == 384
+    assert NETWORK_SPEC.critic_fusion_dim == 448
     assert NETWORK_SPEC.num_actions == 8
 
     assert policy.actor.fusion_norm.normalized_shape == (NETWORK_SPEC.actor_fusion_dim,)
@@ -157,6 +241,55 @@ def test_network_structure_has_one_derived_dimension_source() -> None:
     assert policy.actor.actor_trunk[-1].out_features == NETWORK_SPEC.actor_trunk_output_dim
     assert policy.actor.suspension_head[0].in_features == NETWORK_SPEC.actor_trunk_output_dim
     assert policy.actor.wheel_head[0].in_features == NETWORK_SPEC.actor_trunk_output_dim
+    assert policy.actor.wheel_control_residual[0].in_features == NETWORK_SPEC.goal_dim + 1
+
+
+def test_policy_yaw_rate_is_restored_to_physical_units_for_control_prior() -> None:
+    fake_algorithm = SimpleNamespace(policy=SimpleNamespace(network_spec=NETWORK_SPEC))
+    normalized_yaw_rate = torch.tensor([-0.20, 0.0, 0.20])
+
+    physical_yaw_rate = RangerTeacherRegularizedPPO._physical_yaw_rate_from_policy_state(
+        fake_algorithm, normalized_yaw_rate
+    )
+
+    assert NETWORK_SPEC.base_ang_vel_observation_scale == pytest.approx(3.0)
+    assert torch.allclose(physical_yaw_rate, torch.tensor([-0.60, 0.0, 0.60]))
+
+
+def test_legacy_goal_residual_migrates_into_unified_wheel_control_residual() -> None:
+    source = _make_policy(num_envs=2)
+    with torch.no_grad():
+        for parameter in source.actor.wheel_control_residual.parameters():
+            parameter.uniform_(-0.2, 0.2)
+        source.actor.wheel_control_residual[0].weight[:, -1].zero_()
+
+    source_state = source.state_dict()
+    legacy_state = {
+        key: value.clone()
+        for key, value in source_state.items()
+        if not key.startswith("actor.wheel_control_residual.")
+    }
+    legacy_prefix = "actor.wheel_goal_residual."
+    unified_prefix = "actor.wheel_control_residual."
+    for key, value in source_state.items():
+        if key.startswith(unified_prefix):
+            suffix = key[len(unified_prefix) :]
+            legacy_key = f"{legacy_prefix}{suffix}"
+            legacy_state[legacy_key] = value[:, :-1].clone() if suffix == "0.weight" else value.clone()
+
+    restored = _make_policy(num_envs=2)
+    restored.load_state_dict(legacy_state, strict=True)
+    restored_state = restored.state_dict()
+
+    restored_first = restored_state[f"{unified_prefix}0.weight"]
+    legacy_first = legacy_state[f"{legacy_prefix}0.weight"]
+    heading_rate_slot = NETWORK_SPEC.goal_heading_rate_slot
+    copied_columns = [index for index in range(NETWORK_SPEC.goal_dim) if index != heading_rate_slot]
+    assert torch.allclose(restored_first[:, copied_columns], legacy_first[:, copied_columns])
+    assert torch.count_nonzero(restored_first[:, heading_rate_slot]) == 0
+    assert torch.count_nonzero(restored_first[:, -1]) == 0
+    for suffix in ("0.bias", "2.weight", "2.bias"):
+        assert torch.allclose(restored_state[f"{unified_prefix}{suffix}"], legacy_state[f"{legacy_prefix}{suffix}"])
 
 
 def test_rsl_rl_hidden_dim_compatibility_fields_cannot_redefine_network() -> None:
@@ -201,6 +334,209 @@ def test_distillation_loss_masks_stop_phase_wheels_and_supports_feature_loss() -
     assert torch.isclose(losses["feature_mse"], torch.tensor(1.0))
     assert torch.isclose(losses["stop_phase_rate"], torch.tensor(0.5))
     assert torch.isclose(losses["loss"], torch.tensor(0.55))
+
+
+def test_teacher_wheel_weights_relax_near_goal_and_disable_in_stop_phase() -> None:
+    weights = teacher_wheel_sample_weights(
+        torch.tensor([False, False, True, True]),
+        torch.tensor([False, True, False, True]),
+        stop_phase_weight=0.0,
+        near_goal_weight=0.1,
+    )
+
+    assert torch.equal(weights, torch.tensor([1.0, 0.1, 0.0, 0.0]))
+
+
+def test_teacher_wheel_weights_require_matching_masks() -> None:
+    with pytest.raises(ValueError, match="same shape"):
+        teacher_wheel_sample_weights(
+            torch.tensor([False, True]),
+            torch.tensor([True]),
+            stop_phase_weight=0.0,
+            near_goal_weight=0.1,
+        )
+
+
+def test_near_goal_brake_common_loss_scales_only_forward_mode() -> None:
+    teacher = torch.zeros(3, 8)
+    teacher[:, 4:8] = torch.tensor([-0.4, -0.6, 0.8, 1.0])
+    student = teacher.clone().requires_grad_(True)
+    distance = torch.tensor([1.8, 1.15, 0.5])
+    stop_phase = torch.tensor([False, False, True])
+
+    loss, active_fraction, error_abs, target_abs = near_goal_brake_common_loss(
+        student,
+        teacher,
+        distance,
+        stop_phase,
+        stop_distance=0.5,
+        full_distance=1.8,
+    )
+
+    # Teacher common mode is 0.7; desired scales are 1, 0.5, and 0.
+    expected_error = torch.tensor([0.0, 0.35, 0.7])
+    assert torch.isclose(loss, expected_error.square().mean())
+    assert torch.isclose(active_fraction, torch.tensor(1.0))
+    assert torch.isclose(error_abs, expected_error.mean())
+    assert torch.isclose(target_abs, torch.tensor([0.7, 0.35, 0.0]).mean())
+    loss.backward()
+    assert student.grad is not None
+    assert torch.allclose(student.grad[:, :4], torch.zeros_like(student.grad[:, :4]))
+
+
+def test_ranger_wheel_semantic_modes_distinguish_forward_and_turn() -> None:
+    raw_wheel = torch.tensor(
+        [
+            [-0.6, -0.6, 0.6, 0.6],
+            [0.4, 0.4, 0.4, 0.4],
+        ]
+    )
+
+    semantic = ranger_wheel_raw_to_semantic(raw_wheel)
+    common, turn = ranger_wheel_semantic_modes(raw_wheel)
+
+    assert torch.equal(semantic[0], torch.full((4,), 0.6))
+    assert torch.equal(semantic[1], torch.tensor([-0.4, -0.4, 0.4, 0.4]))
+    assert torch.allclose(common, torch.tensor([0.6, 0.0]))
+    assert torch.allclose(turn, torch.tensor([0.0, 0.4]))
+
+
+def test_near_goal_brake_common_loss_ignores_far_samples() -> None:
+    actions = torch.ones(2, 8, requires_grad=True)
+    loss, active_fraction, _, _ = near_goal_brake_common_loss(
+        actions,
+        torch.zeros_like(actions),
+        torch.tensor([2.0, 3.0]),
+        torch.tensor([False, False]),
+        stop_distance=0.5,
+        full_distance=1.8,
+    )
+
+    assert loss.item() == 0.0
+    assert active_fraction.item() == 0.0
+
+
+def test_distillation_bounds_legacy_teacher_actions_and_reports_semantic_wheel_error() -> None:
+    bounded = bound_teacher_actions(torch.tensor([[-4.0, -1.0, 0.5, 3.0]]))
+    assert torch.equal(bounded, torch.tensor([[-1.0, -1.0, 0.5, 1.0]]))
+
+    teacher_actions = torch.zeros(1, 8)
+    teacher_actions[:, 6:8] = 1.0
+    student_actions = torch.zeros(1, 8)
+    student_actions[:, 4:6] = -1.0
+    losses = compute_distillation_losses(
+        student_actions,
+        teacher_actions,
+        torch.tensor([False]),
+        suspension_loss_weight=0.0,
+        wheel_loss_weight=0.0,
+        wheel_common_loss_weight=1.0,
+        wheel_turn_loss_weight=2.0,
+    )
+
+    assert torch.isclose(losses["wheel_common_mse"], torch.tensor(0.0))
+    assert torch.isclose(losses["wheel_turn_mse"], torch.tensor(1.0))
+    assert torch.isclose(losses["wrong_turn_sign_rate"], torch.tensor(1.0))
+    assert torch.isclose(losses["loss"], torch.tensor(2.0))
+
+
+def test_sequence_replay_anchor_samples_contiguous_time_major_batches() -> None:
+    replay = SequenceReplayAnchor(
+        num_envs=2,
+        sequence_length=3,
+        capacity_sequences=4,
+        observation_keys=("policy_state", "policy_map"),
+        seed=11,
+    )
+    for step in range(3):
+        replay.append_step(
+            {
+                "policy_state": torch.full((2, 42), float(step)),
+                "policy_map": torch.full((2, 8 * 21 * 13), float(step)),
+            },
+            torch.full((2, 8), float(step)),
+            torch.zeros(2, dtype=torch.bool),
+            torch.zeros(2, dtype=torch.bool),
+        )
+
+    assert len(replay) == 2
+    batch = replay.sample(batch_size=2, device="cpu")
+    assert batch["policy_state"].shape == (3, 2, 42)
+    assert batch["policy_map"].shape == (3, 2, 8 * 21 * 13)
+    assert batch["teacher_actions"].shape == (3, 2, 8)
+    assert batch["goal_hidden_mask"].shape == (3, 2)
+    assert torch.equal(batch["policy_state"][:, 0, 0], torch.tensor([0.0, 1.0, 2.0]))
+
+
+def test_asymmetric_teacher_observations_restore_hidden_goal_without_mutating_student() -> None:
+    obs = _make_obs((2,))
+    original_state = obs["policy_state"].clone()
+    teacher_command = original_state[:, 26:34].clone()
+    obs["teacher_command"] = teacher_command
+    obs["policy_state"][:, 26] = 1.0
+    obs["policy_state"][:, 29:34] = 0.0
+
+    hidden = goal_hidden_mask(obs)
+    teacher_obs = build_teacher_observations(obs)
+
+    assert torch.equal(hidden, torch.ones(2, dtype=torch.bool))
+    assert torch.equal(teacher_obs["policy_state"][:, 26:34], teacher_command)
+    assert torch.equal(obs["policy_state"][:, 29:34], torch.zeros(2, 5))
+    assert teacher_obs["policy_map"].data_ptr() == obs["policy_map"].data_ptr()
+
+
+def test_memory_replay_sampling_requires_visible_context_before_hidden_loss() -> None:
+    replay = SequenceReplayAnchor(
+        num_envs=1,
+        sequence_length=4,
+        capacity_sequences=4,
+        observation_keys=("policy_state", "policy_map"),
+        seed=5,
+    )
+    hidden_pattern = (False, False, True, True, True, True, True, True)
+    for step, hidden in enumerate(hidden_pattern):
+        replay.append_step(
+            {
+                "policy_state": torch.full((1, 42), float(step)),
+                "policy_map": torch.zeros(1, 8 * 21 * 13),
+            },
+            torch.zeros(1, 8),
+            torch.zeros(1, dtype=torch.bool),
+            torch.zeros(1, dtype=torch.bool),
+            goal_hidden_mask=torch.tensor([hidden]),
+        )
+
+    batch = replay.sample(
+        batch_size=3,
+        device="cpu",
+        require_goal_transition=True,
+        burn_in_steps=1,
+    )
+    assert torch.equal(batch["policy_state"][:, :, 0], torch.tensor([[0.0], [1.0], [2.0], [3.0]]).expand(-1, 3))
+
+
+def test_hidden_goal_sample_weights_emphasize_hidden_steps_with_stable_mean() -> None:
+    hidden = torch.tensor([[False, True], [False, False]])
+    weights = goal_hidden_sample_weights(hidden, hidden_weight=7.0)
+
+    assert weights.mean().item() == pytest.approx(1.0)
+    assert weights[0, 1] > weights[0, 0]
+
+
+def test_replay_sequence_forward_does_not_modify_online_hidden_state() -> None:
+    policy = _make_policy(num_envs=2)
+    replay_batch = {
+        "policy_state": torch.randn(4, 2, 42),
+        "policy_map": torch.randn(4, 2, 8 * 21 * 13),
+    }
+    actor_hidden_before, _ = policy.get_hidden_states()
+    actions = recurrent_sequence_actions(policy, replay_batch)
+    actor_hidden_after, _ = policy.get_hidden_states()
+
+    assert actor_hidden_before is None
+    assert actor_hidden_after is None
+    assert actions.shape == (4, 2, 8)
+    assert torch.all(actions >= -1.0) and torch.all(actions <= 1.0)
 
 
 def test_distillation_rollout_action_selection_supports_smooth_teacher_blend() -> None:
@@ -408,8 +744,29 @@ def test_sequence_and_step_outputs_match_with_native_layout() -> None:
 
     assert sequence_mean.shape == (time_steps, num_envs, 8)
     assert sequence_values.shape == (time_steps, num_envs, 1)
-    assert torch.allclose(sequence_mean, torch.stack(step_means), atol=1.0e-5, rtol=1.0e-5)
+    assert torch.allclose(torch.tanh(sequence_mean), torch.stack(step_means), atol=1.0e-5, rtol=1.0e-5)
     assert torch.allclose(sequence_values, torch.stack(step_values), atol=1.0e-5, rtol=1.0e-5)
+
+
+def test_advantage_diagnostics_preserve_singleton_recurrent_minibatch_axis() -> None:
+    time_steps = 6
+    state = torch.zeros(time_steps, 1, 42)
+    goal_start = int(NETWORK_SPEC.goal_state_range[0])
+    state[..., goal_start + 3] = 1.0
+    state[..., goal_start + 4] = 0.2
+    obs = TensorDict({"policy_state": state}, batch_size=(time_steps, 1))
+    actions = torch.zeros(time_steps, 1, 8)
+    actions[..., 4:6] = -0.2
+    actions[..., 6:8] = 0.2
+    advantages = torch.linspace(-1.0, 1.0, time_steps).reshape(time_steps, 1, 1)
+    masks = torch.ones(time_steps, 1, dtype=torch.bool)
+
+    algorithm = object.__new__(RangerTeacherRegularizedPPO)
+    algorithm.policy = SimpleNamespace(state_obs_group="policy_state", network_spec=NETWORK_SPEC)
+    result = algorithm._advantage_diagnostics(obs, actions, advantages, masks)
+
+    assert result["fraction_goal_left"] == pytest.approx(1.0)
+    assert result["advantage_goal_left"] == pytest.approx(float(advantages.mean()))
 
 
 def test_action_masks_match_feedforward_semantics() -> None:

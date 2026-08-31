@@ -42,17 +42,15 @@ from Ranger.tasks.manager_based.ranger import mdp
 
 
 PATTERNS = (
-    ("semantic_forward", (-1.0, -1.0, 1.0, 1.0)),
-    ("semantic_backward", (1.0, 1.0, -1.0, -1.0)),
-    ("all_positive", (1.0, 1.0, 1.0, 1.0)),
-    ("all_negative", (-1.0, -1.0, -1.0, -1.0)),
-    ("turn_left", (-0.5, -0.5, 1.0, 1.0)),
-    ("turn_right", (-1.0, -1.0, 0.5, 0.5)),
+    ("semantic_forward", (1.0, 1.0, 1.0, 1.0)),
+    ("semantic_backward", (-1.0, -1.0, -1.0, -1.0)),
+    ("turn_left", (-1.0, -1.0, 1.0, 1.0)),
+    ("turn_right", (1.0, 1.0, -1.0, -1.0)),
 )
 
 SWEEP_PATTERNS = (
-    ("semantic_forward", (-1.0, -1.0, 1.0, 1.0)),
-    ("semantic_backward", (1.0, 1.0, -1.0, -1.0)),
+    ("semantic_forward", (1.0, 1.0, 1.0, 1.0)),
+    ("semantic_backward", (-1.0, -1.0, -1.0, -1.0)),
 )
 
 SCALES = (20.0, 50.0, 100.0, 200.0, 400.0)

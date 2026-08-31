@@ -72,7 +72,7 @@ def _get_action_slice(unwrapped_env, term_name: str) -> slice:
 
 
 def _case_target_tensor(device: torch.device, case_targets: dict[str, float]) -> torch.Tensor:
-    """Return wheel targets in the wheel action term order: [lr, lf, rf, rr]."""
+    """Return requested physical wheel-joint targets in action-term order [lb, lf, rf, rb]."""
 
     return torch.tensor(
         [
@@ -100,8 +100,8 @@ def _build_actions(
     ).squeeze(0)
     actions = torch.zeros(env.action_space.shape, device=unwrapped.device)
     actions[:, leg_action_slice] = float(neutral_leg_action)
-    wheel_raw_actions = (wheel_targets_rad_s / wheel_velocity_limit) * wheel_forward_sign
-    actions[:, wheel_action_slice] = wheel_raw_actions.unsqueeze(0).repeat(actions.shape[0], 1)
+    semantic_wheel_actions = (wheel_targets_rad_s / wheel_velocity_limit) * wheel_forward_sign
+    actions[:, wheel_action_slice] = semantic_wheel_actions.unsqueeze(0).repeat(actions.shape[0], 1)
     return actions
 
 

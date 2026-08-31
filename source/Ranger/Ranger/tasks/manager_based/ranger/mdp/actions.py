@@ -18,6 +18,8 @@ from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.managers.manager_term_cfg import ActionTermCfg
 from isaaclab.utils import configclass
 
+from ..wheel_semantics import ranger_wheel_semantic_to_joint
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -58,11 +60,6 @@ class WheelMotorCSVAction(ActionTerm):
         self._processed_actions = torch.zeros_like(self._raw_actions)
         self._velocity_target = torch.zeros_like(self._raw_actions)
         self._previous_velocity_target = torch.zeros_like(self._raw_actions)
-        self._wheel_forward_sign = torch.tensor(
-            [-1.0, -1.0, 1.0, 1.0],
-            device=self._raw_actions.device,
-            dtype=self._raw_actions.dtype,
-        ).unsqueeze(0)
         self._torque_actual = torch.zeros_like(self._raw_actions)
 
         self._velocity_limit = float(self.cfg.velocity_limit)
@@ -145,11 +142,11 @@ class WheelMotorCSVAction(ActionTerm):
 
         self._previous_velocity_target[:] = self._velocity_target
 
-        # Preserve the policy's four independent wheel commands in raw joint order
-        # [w_lb, w_lf, w_rf, w_rb]. The sign tensor converts them to a common
-        # semantic forward convention before sending per-joint velocity targets.
-        raw_wheel_actions = torch.clamp(self._raw_actions, min=-1.0, max=1.0)
-        velocity_des = raw_wheel_actions * self._velocity_limit * self._wheel_forward_sign
+        # Policy wheel actions are semantic [lb, lf, rf, rb] commands: positive means
+        # that wheel should drive the vehicle forward. Convert to mirrored physical
+        # Isaac-Sim joint coordinates only at this simulator boundary.
+        semantic_wheel_actions = torch.clamp(self._raw_actions, min=-1.0, max=1.0)
+        velocity_des = ranger_wheel_semantic_to_joint(semantic_wheel_actions) * self._velocity_limit
         if self._command_time_constant > 0.0:
             alpha = self._env.step_dt / (self._command_time_constant + self._env.step_dt)
             velocity_cmd = self._velocity_target + alpha * (velocity_des - self._velocity_target)

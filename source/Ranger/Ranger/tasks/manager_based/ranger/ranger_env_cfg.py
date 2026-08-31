@@ -457,8 +457,11 @@ class ObservationsCfg:
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
         wheel_joint_vel_rel = ObsTerm(
-            func=mdp.joint_vel_rel_normalized,
-            params={"scale": 20.0, "asset_cfg": SceneEntityCfg("robot", joint_names=["w_.*"])},
+            func=mdp.wheel_joint_vel_semantic_normalized,
+            params={
+                "scale": 20.0,
+                "asset_cfg": SceneEntityCfg("robot", joint_names=["w_lb", "w_lf", "w_rf", "w_rb"]),
+            },
             noise=Unoise(n_min=-0.02, n_max=0.02),
         )
         suspension_stroke = ObsTerm(
@@ -629,6 +632,7 @@ class RangerEnvCfg(ManagerBasedRLEnvCfg):
     stop_phase_suspension_action: float | None = None
     stop_phase_suspension_mode: str = "legacy"
     stop_phase_wheel_override_enabled: bool = True
+    short_goal_stop_requires_route_complete: bool = False
     terrain_type_names: tuple[str, ...] | None = None
 
     # Post initialization
@@ -2106,6 +2110,15 @@ class RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg(RangerStage2ObstacleP05Exit
 
 
 @configclass
+class RangerStage2ObstacleP05ExitV2OnsetEnvCfg(RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg):
+    """Exit-V2 diagnostic exposing a loss-only reset/onset indicator in ShortGoal slot 0."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params["short_goal_onset_steps"] = 120
+
+
+@configclass
 class RangerStage2ObstacleP05StopEnvCfg(RangerStage2ObstacleP05EnvCfg):
     """Dense terminal lesson starting shortly before the final goal."""
 
@@ -2121,6 +2134,33 @@ class RangerStage2ObstacleP05StopEnvCfg(RangerStage2ObstacleP05EnvCfg):
 
 
 @configclass
+class RangerStage2ObstacleP05SemanticStopOnsetEnvCfg(RangerStage2ObstacleP05ExitV2OnsetEnvCfg):
+    """Terminal-heavy semantic lesson retaining the Exit-V2 heading-rate/onset observation contract."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params={**obstacle_params, "scenario_weights": (0.0, 0.0, 1.0)},
+        )
+        self.episode_length_s = 10.0
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticStopCaptureEnvCfg(RangerStage2ObstacleP05SemanticStopOnsetEnvCfg):
+    """Terminal capture lesson concentrated on the 0.5 m stop-latch boundary."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.events.reset_short_goal_target.params["stop_distance_range"] = (0.30, 0.70)
+        self.events.reset_short_goal_target.params["stop_lateral_offset_range"] = (-0.10, 0.10)
+        self.events.reset_short_goal_target.params["stop_heading_error_range_deg"] = (-10.0, 10.0)
+        self.episode_length_s = 6.0
+
+
+@configclass
 class RangerStage2ObstacleP05FullEnvCfg(RangerStage2ObstacleP05EnvCfg):
     """Consolidation lesson mixing complete routes, exits, and terminal states."""
 
@@ -2131,6 +2171,479 @@ class RangerStage2ObstacleP05FullEnvCfg(RangerStage2ObstacleP05EnvCfg):
             func=mdp.reset_short_goal_obstacle_phase_mixture,
             mode="reset",
             params={"scenario_weights": (0.50, 0.25, 0.25), **obstacle_params},
+        )
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV1EnvCfg(RangerStage2ObstacleP05ExitV2OnsetEnvCfg):
+    """Semantic full-route integration with full-route, exit, and terminal rehearsal."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        obstacle_params.update(
+            {
+                "scenario_weights": (0.60, 0.20, 0.20),
+                "stop_distance_range": (0.30, 0.70),
+                "stop_lateral_offset_range": (-0.10, 0.10),
+                "stop_heading_error_range_deg": (-10.0, 10.0),
+            }
+        )
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_phase_mixture,
+            mode="reset",
+            params=obstacle_params,
+        )
+        self.episode_length_s = 30.0
+
+        # Full routes must allow the temporary side/exit waypoint rewards to dominate
+        # before the obstacle instead of pulling strongly toward the final point goal.
+        self.rewards.heading_error_reduction.weight = 2.0
+        self.rewards.heading_error_persistent.weight = -0.05
+        self.rewards.yaw_rate_tracking.weight = -0.03
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV4WaypointEnvCfg(RangerStage2ObstacleP05SemanticFullV1EnvCfg):
+    """Waypoint-conditioned full-route lesson using the existing fixed-size point-goal slots."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.policy_state.command_state.params["short_goal_target_mode"] = "active_route"
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV5RouteFrameEnvCfg(RangerStage2ObstacleP05SemanticFullV4WaypointEnvCfg):
+    """Generalized route-frame obstacle curriculum with partial waypoint teaching."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        obstacle_params = dict(self.events.reset_short_goal_target.params)
+        obstacle_params.update(
+            {
+                "scenario_weights": (0.70, 0.15, 0.15),
+                "route_heading_range_deg": (-45.0, 45.0),
+                "initial_heading_error_range_deg": (-15.0, 15.0),
+                "waypoint_teacher_fraction": 0.70,
+                "route_side_forward_offset": 0.0,
+                "stop_distance_range": (0.30, 0.70),
+                "stop_lateral_offset_range": (-0.10, 0.10),
+                "stop_heading_error_range_deg": (-10.0, 10.0),
+            }
+        )
+        self.events.reset_short_goal_target = EventTerm(
+            func=mdp.reset_short_goal_obstacle_route_frame_mixture,
+            mode="reset",
+            params=obstacle_params,
+        )
+        self.episode_length_s = 30.0
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV6PhaseGatedRewardEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV5RouteFrameEnvCfg
+):
+    """Route-frame navigation with obstacle-phase-gated final-goal shaping and milestone rewards."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # While an obstacle route is active (phase 0/1), do not reward the old direct-to-final-goal
+        # behavior. Once the route reaches phase 2 these terms automatically become active again.
+        # The gate is reversible, so a future planner can return phase 2 -> 0/1 for a new obstacle.
+        self.rewards.progress_to_goal.func = mdp.short_goal_progress_reward_alignment_route_gated
+        self.rewards.heading_error_reduction.func = mdp.short_goal_heading_error_reduction_route_gated
+        self.rewards.heading_error_persistent.func = mdp.short_goal_heading_error_cost_route_gated
+        self.rewards.yaw_rate_tracking.func = mdp.short_goal_continuous_yaw_rate_tracking_route_gated
+        self.rewards.cruise_underspeed.func = mdp.short_goal_cruise_underspeed_route_gated
+        self.rewards.short_goal_wheel_diff_prior.func = mdp.short_goal_wheel_turn_mode_prior_route_gated
+
+        # Dense route progress remains useful, but crossing a meaningful navigation boundary must be
+        # visibly better to PPO/critic than merely shaving a few centimetres from waypoint distance.
+        self.rewards.obstacle_route_milestone = RewTerm(
+            func=mdp.obstacle_route_milestone_reward,
+            weight=1.0,
+            params={
+                "side_bonus": 3.0,
+                "exit_bonus": 6.0,
+                "side_clearance_radius": 1.15,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV7SafetyFirstRouteEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV6PhaseGatedRewardEnvCfg
+):
+    """Safety-first full-route lesson with event-scale rewards and route-aware motion shaping."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # This stage is deliberately a full-route acquisition lesson rather than a mixed
+        # reset distribution.  Every episode must learn the same chain: bypass -> goal -> stop.
+        # Once this primitive is reliable, later curriculum stages can withdraw the waypoint
+        # teacher and re-introduce more varied reset states.
+        self.events.reset_short_goal_target.params["scenario_weights"] = (1.0, 0.0, 0.0)
+        self.events.reset_short_goal_target.params["waypoint_teacher_fraction"] = 1.0
+        self.short_goal_stop_requires_route_complete = True
+
+        # Complete the phase gating: all final-goal approach/braking terms are inactive while
+        # phase 0/1 is handling an obstacle.  They resume automatically in phase 2.
+        self.rewards.short_goal_speed_profile.func = mdp.short_goal_speed_profile_route_gated
+        self.rewards.near_goal_away_speed.func = mdp.short_goal_near_goal_away_speed_route_gated
+        self.rewards.pre_stop_xy_speed_envelope.func = mdp.short_goal_pre_stop_xy_speed_envelope_route_gated
+        self.rewards.near_goal_lateral_velocity.func = mdp.short_goal_near_lateral_velocity_route_gated
+        self.rewards.stopped_goal_success.func = mdp.short_goal_stopped_success_route_gated
+        self.rewards.precision_reach_bonus.func = mdp.short_goal_precision_reach_route_gated
+
+        # RewardManager integrates continuous reward densities with step_dt. Route progress is a
+        # per-step distance increment, so convert it to a rate before integration and choose the
+        # weight in metres rather than relying on an accidental extra dt factor.
+        self.rewards.obstacle_route_progress.func = mdp.obstacle_route_progress_rate
+        self.rewards.obstacle_route_progress.weight = 2.0
+
+        # Explicit route-speed shaping prevents the safe-but-useless solution of crawling or
+        # waiting for timeout. Large turns are allowed to be slower than aligned cruise motion.
+        self.rewards.obstacle_route_underspeed = RewTerm(
+            func=mdp.obstacle_route_underspeed_penalty,
+            weight=-0.5,
+            params={
+                "cruise_speed": 0.55,
+                "turn_speed": 0.15,
+                "heading_deadband": 0.20,
+                "heading_full": 1.00,
+                "side_clearance_radius": 1.15,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Safety and route milestones are instantaneous episode events, not continuous costs.
+        # Their functions divide by step_dt so these configured values are the actual bonuses.
+        self.rewards.obstacle_collision = RewTerm(
+            func=mdp.termination_term_event_reward,
+            weight=-30.0,
+            params={"term_name": "obstacle_collision"},
+        )
+        self.rewards.termination = RewTerm(
+            func=mdp.failure_termination_event_penalty,
+            weight=-10.0,
+            params={"excluded_terms": ("time_out", "stopped_goal_reached", "obstacle_collision")},
+        )
+        self.rewards.time_out_failure = RewTerm(
+            func=mdp.termination_term_event_reward,
+            weight=-5.0,
+            params={"term_name": "time_out"},
+        )
+        self.rewards.obstacle_route_milestone.params.update({"side_bonus": 5.0, "exit_bonus": 15.0})
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV8TurnAwareRouteEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV7SafetyFirstRouteEnvCfg
+):
+    """Full-route lesson with safer waypoint geometry and turn-aware motion shaping."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Move the side waypoint outward so the direct point-goal path has clear safety margin.
+        self.events.reset_short_goal_target.params["route_lateral_offset"] = 1.35
+
+        side_clearance = 1.30
+        self.rewards.obstacle_route_progress.params["side_clearance_radius"] = side_clearance
+        self.rewards.obstacle_route_heading.params["side_clearance_radius"] = side_clearance
+        self.rewards.obstacle_route_milestone.params["side_clearance_radius"] = side_clearance
+
+        # Replace V7's always-positive minimum route speed with a three-stage motion objective:
+        # turn in place when strongly misaligned, use a slow arc while closing heading error,
+        # and demand normal cruise only once the active waypoint is nearly aligned.
+        self.rewards.obstacle_route_underspeed.func = mdp.obstacle_route_turn_aware_underspeed_penalty
+        self.rewards.obstacle_route_underspeed.params = {
+            "cruise_speed": 0.55,
+            "slow_arc_speed": 0.30,
+            "aligned_heading": 0.26,
+            "turn_in_place_heading": 0.70,
+            "side_clearance_radius": side_clearance,
+            "exit_fade_distance": 1.0,
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+        self.rewards.obstacle_route_underspeed.weight = -0.5
+
+        # Dense steering credit makes a correct yaw decision valuable before the sparse side/exit
+        # milestones are reached. One radian of net heading-error reduction is worth about +1.
+        self.rewards.obstacle_route_heading_reduction = RewTerm(
+            func=mdp.obstacle_route_heading_reduction_rate,
+            weight=1.0,
+            params={
+                "side_clearance_radius": side_clearance,
+                "exit_fade_distance": 1.0,
+                "max_reduction_per_step": 0.12,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Penalize only genuine inactivity. Correct in-place yaw is explicitly not a stall.
+        self.rewards.obstacle_route_stall = RewTerm(
+            func=mdp.obstacle_route_stall_penalty,
+            weight=-0.6,
+            params={
+                "max_xy_speed": 0.07,
+                "max_yaw_rate": 0.08,
+                "grace_time_s": 0.75,
+                "side_clearance_radius": side_clearance,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Prevent the V7 escape mode where the actor solves underspeed mainly by increasing
+        # forward common-mode before it has turned toward the active waypoint.
+        self.rewards.obstacle_route_wrong_forward = RewTerm(
+            func=mdp.obstacle_route_wrong_forward_penalty,
+            weight=-1.0,
+            params={
+                "heading_threshold": 0.52,
+                "safe_forward_speed": 0.12,
+                "speed_reference": 0.45,
+                "side_clearance_radius": side_clearance,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV9FastRouteEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV8TurnAwareRouteEnvCfg
+):
+    """Turn-aware full-route lesson with point-goal-level cruise speed after alignment."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Restore route travel speed toward the historical point-goal operating range.
+        # Only large heading errors retain the option to turn in place.
+        self.rewards.obstacle_route_underspeed.func = mdp.obstacle_route_turn_aware_speed_penalty_v2
+        self.rewards.obstacle_route_underspeed.weight = -0.7
+        self.rewards.obstacle_route_underspeed.params = {
+            "cruise_speed": 0.80,
+            "arc_speed": 0.45,
+            "aligned_speed": 0.65,
+            "aligned_heading": 0.17,
+            "arc_heading": 0.44,
+            "turn_in_place_heading": 0.87,
+            "side_clearance_radius": 1.30,
+            "exit_fade_distance": 1.0,
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+
+        # Keep protection against straight-line charging, but make it consistent with the
+        # faster arc schedule: only clearly large heading errors trigger this penalty.
+        self.rewards.obstacle_route_wrong_forward.params.update(
+            {
+                "heading_threshold": 0.70,
+                "safe_forward_speed": 0.25,
+                "speed_reference": 0.55,
+            }
+        )
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV10CorridorRouteEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV9FastRouteEnvCfg
+):
+    """Entry-gate/corridor/exit-gate lesson with non-exploitable turn-aware speed shaping."""
+
+    obstacle_route_use_lateral_gate: bool = True
+    obstacle_route_entry_lateral_min: float = 1.50
+    obstacle_route_exit_lateral_min: float = 1.45
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # The teacher route is now a corridor rather than two points around the obstacle center:
+        # establish clearance before the obstacle, hold the same safe side, then exit behind it.
+        self.events.reset_short_goal_target.params.update(
+            {
+                "route_lateral_offset": 1.65,
+                "route_side_forward_offset": -1.10,
+                "route_exit_forward_offset": 1.30,
+                "route_exit_lateral_scale": 1.0,
+                "rotate_obstacle_with_route": True,
+            }
+        )
+
+        corridor_clearance = 1.50
+        common_route_params = {
+            "side_clearance_radius": corridor_clearance,
+            "exit_fade_distance": 1.0,
+            "asset_cfg": SceneEntityCfg("robot"),
+        }
+
+        # Dense progress is deliberately modest; completing the +5/+15 milestones should dominate
+        # merely accumulating a few metres of slow movement.
+        self.rewards.obstacle_route_progress.func = mdp.obstacle_corridor_progress_rate
+        self.rewards.obstacle_route_progress.weight = 1.0
+        self.rewards.obstacle_route_progress.params = {
+            "phase0_forward_weight": 0.60,
+            "phase0_lateral_weight": 0.40,
+            "max_speed": 1.5,
+            **common_route_params,
+        }
+
+        # Heading is a path/corridor tangent objective with a 10-degree deadband, not a requirement
+        # to point exactly at a marker at every instant.
+        self.rewards.obstacle_route_heading.func = mdp.obstacle_corridor_heading_deadband_penalty
+        self.rewards.obstacle_route_heading.weight = -0.8
+        self.rewards.obstacle_route_heading.params = {
+            "deadband": math.radians(10.0),
+            "error_reference": math.radians(45.0),
+            **common_route_params,
+        }
+        self.rewards.obstacle_route_heading_reduction.func = mdp.obstacle_corridor_heading_reduction_reward
+        self.rewards.obstacle_route_heading_reduction.weight = 0.5
+        self.rewards.obstacle_route_heading_reduction.params = {
+            "max_reduction_per_step": 0.12,
+            **common_route_params,
+        }
+
+        # Normal route speed no longer decreases merely because heading error is large. A zero-speed
+        # exemption exists only while yaw is demonstrably reducing a >30-degree error.
+        self.rewards.obstacle_route_underspeed.func = mdp.obstacle_corridor_speed_penalty
+        self.rewards.obstacle_route_underspeed.weight = -0.6
+        self.rewards.obstacle_route_underspeed.params = {
+            "phase0_speed": 0.65,
+            "phase1_speed": 0.80,
+            "speed_reference": 0.80,
+            "turn_heading_threshold": math.radians(30.0),
+            "min_turn_yaw_rate": 0.12,
+            "min_heading_reduction_rate": 0.05,
+            **common_route_params,
+        }
+
+        # Reuse the former wrong-forward slot for the actual V9 loophole: persistent large heading
+        # error without an effective corrective turn.
+        self.rewards.obstacle_route_wrong_forward.func = mdp.obstacle_corridor_turn_stagnation_penalty
+        self.rewards.obstacle_route_wrong_forward.weight = -0.5
+        self.rewards.obstacle_route_wrong_forward.params = {
+            "heading_threshold": math.radians(30.0),
+            "min_turn_yaw_rate": 0.12,
+            "min_heading_reduction_rate": 0.05,
+            "grace_time_s": 0.50,
+            **common_route_params,
+        }
+
+        # True inactivity remains separate from useful in-place turning.
+        self.rewards.obstacle_route_stall.weight = -0.5
+        self.rewards.obstacle_route_stall.params.update(
+            {
+                "side_clearance_radius": corridor_clearance,
+                "exit_fade_distance": 1.0,
+            }
+        )
+
+        self.rewards.obstacle_corridor_lateral = RewTerm(
+            func=mdp.obstacle_corridor_lateral_error_penalty,
+            weight=-0.8,
+            params={
+                "deadband": 0.20,
+                "error_reference": 0.50,
+                "phase0_approach_distance": 1.50,
+                **common_route_params,
+            },
+        )
+        self.rewards.obstacle_route_time = RewTerm(
+            func=mdp.obstacle_corridor_time_penalty,
+            weight=-0.10,
+            params=common_route_params,
+        )
+
+        self.rewards.obstacle_route_milestone.params.update(
+            {
+                "side_clearance_radius": corridor_clearance,
+                "exit_fade_distance": 1.0,
+                "side_bonus": 5.0,
+                "exit_bonus": 15.0,
+            }
+        )
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV10EntryRelaxedEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV10CorridorRouteEnvCfg
+):
+    """V10 corridor lesson with a relaxed entry transition and overshoot fallback."""
+
+    obstacle_route_entry_lateral_min: float = 1.40
+    obstacle_route_entry_longitudinal_margin: float = 0.25
+    obstacle_route_entry_overshoot_margin: float = 0.40
+    obstacle_route_entry_overshoot_lateral_min: float = 1.25
+
+
+@configclass
+class RangerStage2ObstacleP05SemanticFullV10SafeCorridorEnvCfg(
+    RangerStage2ObstacleP05SemanticFullV10EntryRelaxedEnvCfg
+):
+    """Safer V10 corridor with explicit entry attraction and exit-aligned phase-1 control semantics."""
+
+    obstacle_route_entry_lateral_min: float = 1.40
+    obstacle_route_entry_longitudinal_margin: float = 0.25
+    obstacle_route_entry_overshoot_margin: float = 0.40
+    obstacle_route_entry_overshoot_lateral_min: float = 1.40
+    obstacle_route_exit_lateral_min: float = 1.35
+    obstacle_corridor_phase1_target_exit: bool = True
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # Add modest geometric margin rather than optimizing the teacher path for minimum distance.
+        # The lateral offset is measured from the route centerline; the obstacle is itself displaced
+        # 0.15--0.40 m to the opposite side, so actual obstacle-center separation is larger.
+        self.events.reset_short_goal_target.params.update(
+            {
+                "route_lateral_offset": 1.80,
+                "route_side_forward_offset": -1.35,
+                "route_exit_forward_offset": 1.60,
+                "route_exit_lateral_scale": 1.0,
+            }
+        )
+
+        # Phase 0 is strongly attracted toward the entry point, but transition remains a broad
+        # capture region; this avoids both the old diagonal shortcut and exact-point recapture.
+        self.rewards.obstacle_route_progress.params.update(
+            {
+                "phase0_entry_weight": 0.80,
+                "phase0_forward_weight": 0.15,
+                "phase0_lateral_weight": 0.15,
+            }
+        )
+
+        # In phase 1 the policy already observes the exit point. Use the same target for speed and
+        # heading semantics, and never allow a useful corrective turn to collapse translation to zero.
+        self.rewards.obstacle_route_underspeed.params.update(
+            {
+                "phase1_turn_min_speed": 0.30,
+            }
+        )
+
+        # Vehicle-envelope-aware route-frame barrier around the obstacle prevents cutting between
+        # entry and exit with insufficient side clearance while preserving a soft gradient.
+        self.rewards.obstacle_corridor_clearance_barrier = RewTerm(
+            func=mdp.obstacle_corridor_clearance_barrier_penalty,
+            weight=-2.0,
+            params={
+                "safe_lateral": 1.55,
+                "transition_width": 0.35,
+                "obstacle_half_length": 0.30,
+                "longitudinal_margin": 0.85,
+                "side_clearance_radius": 1.50,
+                "exit_fade_distance": 1.0,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
 

@@ -59,8 +59,11 @@ teacher_ppo_module = _load_agent_module("rsl_rl_teacher_regularized_ppo", "rsl_r
 RangerTeacherRegularizedPPO = teacher_ppo_module.RangerTeacherRegularizedPPO
 teacher_wheel_sample_weights = teacher_ppo_module.teacher_wheel_sample_weights
 near_goal_brake_common_loss = teacher_ppo_module.near_goal_brake_common_loss
-ranger_wheel_raw_to_semantic = teacher_ppo_module.ranger_wheel_raw_to_semantic
+ranger_wheel_policy_to_semantic = teacher_ppo_module.ranger_wheel_policy_to_semantic
 ranger_wheel_semantic_modes = teacher_ppo_module.ranger_wheel_semantic_modes
+wheel_semantics_module = importlib.import_module("Ranger.tasks.manager_based.ranger.wheel_semantics")
+ranger_wheel_semantic_to_joint = wheel_semantics_module.ranger_wheel_semantic_to_joint
+ranger_wheel_joint_to_semantic = wheel_semantics_module.ranger_wheel_joint_to_semantic
 warm_start_path = os.path.join(REPO_ROOT, "scripts", "rsl_rl", "warm_start.py")
 warm_start_spec = importlib.util.spec_from_file_location("ranger_recurrent_warm_start", warm_start_path)
 warm_start_module = importlib.util.module_from_spec(warm_start_spec)
@@ -129,6 +132,29 @@ def _make_feedforward_policy(num_envs: int = 4, privileged_dim: int = 17) -> Ran
     )
     policy.eval()
     return policy
+
+
+def test_goal_onset_slot_is_loss_only_for_actor_and_critic() -> None:
+    num_envs = 4
+    policy = _make_policy(num_envs=num_envs, privileged_dim=17)
+    obs_zero = _make_obs((num_envs,), privileged_dim=17)
+    obs_one = obs_zero.clone()
+    goal_start = NETWORK_SPEC.goal_state_range[0]
+    onset_index = goal_start + NETWORK_SPEC.goal_onset_slot
+    obs_zero["policy_state"][..., onset_index] = 0.0
+    obs_one["policy_state"][..., onset_index] = 1.0
+
+    policy.reset()
+    action_zero = policy.act_inference(obs_zero).detach().clone()
+    policy.reset()
+    action_one = policy.act_inference(obs_one).detach().clone()
+    torch.testing.assert_close(action_zero, action_one, rtol=0.0, atol=0.0)
+
+    policy.reset()
+    value_zero = policy.evaluate(obs_zero).detach().clone()
+    policy.reset()
+    value_one = policy.evaluate(obs_one).detach().clone()
+    torch.testing.assert_close(value_zero, value_one, rtol=0.0, atol=0.0)
 
 
 def test_recurrent_policy_shapes() -> None:
@@ -359,7 +385,8 @@ def test_teacher_wheel_weights_require_matching_masks() -> None:
 
 def test_near_goal_brake_common_loss_scales_only_forward_mode() -> None:
     teacher = torch.zeros(3, 8)
-    teacher[:, 4:8] = torch.tensor([-0.4, -0.6, 0.8, 1.0])
+    # Semantic policy wheel action: common=0.7, turn=0.2.
+    teacher[:, 4:8] = torch.tensor([0.4, 0.6, 0.8, 1.0])
     student = teacher.clone().requires_grad_(True)
     distance = torch.tensor([1.8, 1.15, 0.5])
     stop_phase = torch.tensor([False, False, True])
@@ -384,19 +411,41 @@ def test_near_goal_brake_common_loss_scales_only_forward_mode() -> None:
     assert torch.allclose(student.grad[:, :4], torch.zeros_like(student.grad[:, :4]))
 
 
-def test_ranger_wheel_semantic_modes_distinguish_forward_and_turn() -> None:
-    raw_wheel = torch.tensor(
+def test_ranger_wheel_semantic_joint_boundary_contract() -> None:
+    semantic = torch.tensor(
         [
-            [-0.6, -0.6, 0.6, 0.6],
-            [0.4, 0.4, 0.4, 0.4],
+            [1.0, 1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0, 1.0],
+            [1.0, 1.0, -1.0, -1.0],
+            [-1.0, -1.0, -1.0, -1.0],
+        ]
+    )
+    physical_joint = ranger_wheel_semantic_to_joint(semantic)
+    expected_joint = torch.tensor(
+        [
+            [-1.0, -1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [-1.0, -1.0, -1.0, -1.0],
+            [1.0, 1.0, -1.0, -1.0],
         ]
     )
 
-    semantic = ranger_wheel_raw_to_semantic(raw_wheel)
-    common, turn = ranger_wheel_semantic_modes(raw_wheel)
+    assert torch.equal(physical_joint, expected_joint)
+    assert torch.equal(ranger_wheel_joint_to_semantic(physical_joint), semantic)
 
-    assert torch.equal(semantic[0], torch.full((4,), 0.6))
-    assert torch.equal(semantic[1], torch.tensor([-0.4, -0.4, 0.4, 0.4]))
+
+def test_ranger_wheel_semantic_modes_distinguish_forward_and_turn() -> None:
+    semantic_wheel = torch.tensor(
+        [
+            [0.6, 0.6, 0.6, 0.6],
+            [-0.4, -0.4, 0.4, 0.4],
+        ]
+    )
+
+    semantic = ranger_wheel_policy_to_semantic(semantic_wheel)
+    common, turn = ranger_wheel_semantic_modes(semantic_wheel)
+
+    assert torch.equal(semantic, semantic_wheel)
     assert torch.allclose(common, torch.tensor([0.6, 0.0]))
     assert torch.allclose(turn, torch.tensor([0.0, 0.4]))
 
@@ -421,9 +470,9 @@ def test_distillation_bounds_legacy_teacher_actions_and_reports_semantic_wheel_e
     assert torch.equal(bounded, torch.tensor([[-1.0, -1.0, 0.5, 1.0]]))
 
     teacher_actions = torch.zeros(1, 8)
-    teacher_actions[:, 6:8] = 1.0
+    teacher_actions[:, 4:8] = torch.tensor([-0.5, -0.5, 0.5, 0.5])
     student_actions = torch.zeros(1, 8)
-    student_actions[:, 4:6] = -1.0
+    student_actions[:, 4:8] = torch.tensor([0.5, 0.5, -0.5, -0.5])
     losses = compute_distillation_losses(
         student_actions,
         teacher_actions,

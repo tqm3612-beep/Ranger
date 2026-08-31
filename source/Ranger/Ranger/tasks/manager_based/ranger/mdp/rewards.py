@@ -14,6 +14,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, wrap_to_pi
 
+from ..wheel_semantics import ranger_wheel_joint_to_semantic
 from .observations import (
     GOAL_HEADING_PREV_HEADING_ERROR_ATTR,
     SHORT_GOAL_PREV_HEADING_ERROR_ATTR,
@@ -21,6 +22,8 @@ from .observations import (
     SHORT_GOAL_REACHED_ATTR,
     OBSTACLE_POSITION_ATTR,
     OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR,
+    OBSTACLE_ROUTE_FORWARD_ATTR,
+    OBSTACLE_ROUTE_LATERAL_ATTR,
     OBSTACLE_ROUTE_PHASE_ATTR,
     OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR,
     OBSTACLE_ROUTE_PREV_DISTANCE_ATTR,
@@ -63,18 +66,16 @@ def wheel_semantic_sign_lr_lf_rf_rr(device: torch.device, dtype: torch.dtype = t
     return _wheel_semantic_sign_from_names(["w_lb", "w_lf", "w_rf", "w_rb"], device=device, dtype=dtype)
 
 
-def wheel_raw_to_semantic_lf_lr_rf_rr(wheel_tensor: torch.Tensor) -> torch.Tensor:
-    """Convert raw wheel values in ``[lf, lr, rf, rr]`` order to semantic values."""
+def wheel_joint_to_semantic_lf_lb_rf_rb(wheel_tensor: torch.Tensor) -> torch.Tensor:
+    """Legacy alias: convert physical joint values in ``[lf, lb, rf, rb]`` order to semantics."""
 
-    sign = wheel_semantic_sign_lf_lr_rf_rr(device=wheel_tensor.device, dtype=wheel_tensor.dtype)
-    return wheel_tensor * sign
+    return ranger_wheel_joint_to_semantic(wheel_tensor)
 
 
-def wheel_raw_to_semantic_lr_lf_rf_rr(wheel_tensor: torch.Tensor) -> torch.Tensor:
-    """Convert raw wheel values in ``[lr, lf, rf, rr]`` order to semantic values."""
+def wheel_joint_to_semantic_lb_lf_rf_rb(wheel_tensor: torch.Tensor) -> torch.Tensor:
+    """Legacy alias: convert physical joint values in ``[lb, lf, rf, rb]`` order to semantics."""
 
-    sign = wheel_semantic_sign_lr_lf_rf_rr(device=wheel_tensor.device, dtype=wheel_tensor.dtype)
-    return wheel_tensor * sign
+    return ranger_wheel_joint_to_semantic(wheel_tensor)
 
 
 def forward_velocity_reward(
@@ -301,7 +302,7 @@ def wheel_command_error_l1(
         max_abs_speed=max_abs_speed,
         forward_sign=forward_sign,
     )
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     return torch.mean(torch.abs(semantic_target - expected), dim=1)
 
 
@@ -416,7 +417,7 @@ def goal_heading_wheel_prior_exp(
     right_semantic = forward_speed + turn_speed
     expected = torch.stack((left_semantic, left_semantic, right_semantic, right_semantic), dim=1)
     expected = torch.clamp(expected, min=-float(max_abs_speed), max=float(max_abs_speed))
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     error_sq = torch.mean(torch.square(semantic_target - expected), dim=1)
     return torch.exp(-error_sq / max(float(std_sq), 1.0e-6))
 
@@ -432,7 +433,7 @@ def goal_heading_front_wheel_diff_l1(
     wheel_action_term = env.action_manager.get_term(action_name)
     _, _, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
     front_mask = (torch.abs(heading_error) <= float(heading_deadband)).to(torch.float32)
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     left_mean = semantic_target[:, :2].mean(dim=1)
     right_mean = semantic_target[:, 2:].mean(dim=1)
     return front_mask * torch.abs(left_mean - right_mean)
@@ -449,7 +450,7 @@ def goal_heading_wheel_diff_l1(
 
     wheel_action_term = env.action_manager.get_term(action_name)
     _, _, heading_error = goal_heading_target_body(env, asset_cfg=asset_cfg)
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     left_mean = semantic_target[:, :2].mean(dim=1)
     right_mean = semantic_target[:, 2:].mean(dim=1)
     expected_diff = torch.clamp(-2.0 * float(turn_gain) * torch.sin(heading_error), -float(max_abs_diff), float(max_abs_diff))
@@ -478,7 +479,7 @@ def short_goal_large_heading_common_mode_penalty(
         min=0.0,
         max=1.0,
     )
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     common_mode = semantic_target.mean(dim=1)
     velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
     normalized_common = torch.abs(common_mode) / velocity_limit
@@ -497,7 +498,7 @@ def short_goal_large_heading_turn_mode_prior_l1(
     """Require strong, correctly signed wheel turn-mode while heading error is large."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     wheel_action_term = env.action_manager.get_term(action_name)
     velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
     left_mean = semantic_target[:, :2].mean(dim=1) / velocity_limit
@@ -889,6 +890,36 @@ def failure_termination_penalty(
     return failed.to(torch.float32)
 
 
+def termination_term_event_reward(
+    env: ManagerBasedRLEnv,
+    term_name: str,
+) -> torch.Tensor:
+    """Return a one-step termination event with unit episode-level magnitude.
+
+    Isaac Lab integrates every reward term as ``value * weight * step_dt``. A
+    termination is an instantaneous event rather than a continuous-time cost, so
+    divide by ``step_dt`` here to make the configured weight the actual event
+    magnitude independent of the environment control period.
+    """
+
+    active_terms = tuple(getattr(env.termination_manager, "active_terms", ()))
+    term_dones = getattr(env.termination_manager, "_term_dones", None)
+    if term_dones is None or term_name not in active_terms:
+        return torch.zeros((env.num_envs,), dtype=torch.float32, device=env.device)
+    term_idx = active_terms.index(term_name)
+    return term_dones[:, term_idx].to(torch.float32) / max(float(env.step_dt), 1.0e-6)
+
+
+def failure_termination_event_penalty(
+    env: ManagerBasedRLEnv,
+    excluded_terms: tuple[str, ...] = ("time_out", "stopped_goal_reached", "obstacle_collision"),
+) -> torch.Tensor:
+    """Return an episode-level event for non-task-specific failures."""
+
+    failed = failure_termination_penalty(env, excluded_terms=excluded_terms)
+    return failed / max(float(env.step_dt), 1.0e-6)
+
+
 def obstacle_contact_penalty(
     env: ManagerBasedRLEnv,
     sensor_names: tuple[str, ...],
@@ -953,18 +984,80 @@ def _obstacle_route_state(
 
     root_xy = asset.data.root_pos_w[:, :2]
     obstacle_clearance = torch.linalg.vector_norm(root_xy - obstacle_xy_w, dim=1)
-    side_complete = (
-        (route_phase == 0)
-        & (root_xy[:, 0] >= side_waypoint_xy_w[:, 0])
-        & (obstacle_clearance >= float(side_clearance_radius))
-    )
-    route_phase[side_complete] = 1
-    exit_complete = (
-        (route_phase == 1)
-        & (root_xy[:, 0] >= exit_waypoint_xy_w[:, 0])
-        & (obstacle_clearance >= float(side_clearance_radius))
-    )
-    route_phase[exit_complete] = 2
+    route_forward = getattr(env, OBSTACLE_ROUTE_FORWARD_ATTR, None)
+    if isinstance(route_forward, torch.Tensor) and route_forward.shape == (env.num_envs, 2):
+        root_progress = torch.sum((root_xy - obstacle_xy_w) * route_forward, dim=1)
+        side_progress = torch.sum((side_waypoint_xy_w - obstacle_xy_w) * route_forward, dim=1)
+        exit_progress = torch.sum((exit_waypoint_xy_w - obstacle_xy_w) * route_forward, dim=1)
+
+        cfg = getattr(env, "cfg", None)
+        use_lateral_gate = bool(
+            getattr(
+                env,
+                "_ranger_obstacle_route_use_lateral_gate",
+                getattr(cfg, "obstacle_route_use_lateral_gate", False),
+            )
+        )
+        route_lateral = getattr(env, OBSTACLE_ROUTE_LATERAL_ATTR, None)
+        if use_lateral_gate and isinstance(route_lateral, torch.Tensor) and route_lateral.shape == (env.num_envs, 2):
+            root_lateral = torch.sum((root_xy - obstacle_xy_w) * route_lateral, dim=1)
+            side_lateral = torch.sum((side_waypoint_xy_w - obstacle_xy_w) * route_lateral, dim=1)
+            bypass_sign = torch.where(side_lateral >= 0.0, torch.ones_like(side_lateral), -torch.ones_like(side_lateral))
+            signed_lateral = bypass_sign * root_lateral
+            entry_lateral_min = float(
+                getattr(
+                    env,
+                    "_ranger_obstacle_route_entry_lateral_min",
+                    getattr(cfg, "obstacle_route_entry_lateral_min", side_clearance_radius),
+                )
+            )
+            exit_lateral_min = float(
+                getattr(
+                    env,
+                    "_ranger_obstacle_route_exit_lateral_min",
+                    getattr(cfg, "obstacle_route_exit_lateral_min", side_clearance_radius),
+                )
+            )
+            side_clear_ok = signed_lateral >= entry_lateral_min
+            exit_clear_ok = signed_lateral >= exit_lateral_min
+        else:
+            side_clear_ok = obstacle_clearance >= float(side_clearance_radius)
+            exit_clear_ok = obstacle_clearance >= float(side_clearance_radius)
+
+        entry_longitudinal_margin = float(getattr(cfg, "obstacle_route_entry_longitudinal_margin", 0.0))
+        side_complete = (
+            (route_phase == 0)
+            & (root_progress >= side_progress - entry_longitudinal_margin)
+            & side_clear_ok
+        )
+        if use_lateral_gate:
+            overshoot_margin = getattr(cfg, "obstacle_route_entry_overshoot_margin", None)
+            overshoot_lateral_min = getattr(cfg, "obstacle_route_entry_overshoot_lateral_min", None)
+            if overshoot_margin is not None and overshoot_lateral_min is not None:
+                overshoot_complete = (
+                    (route_phase == 0)
+                    & (root_progress >= side_progress + float(overshoot_margin))
+                    & (signed_lateral >= float(overshoot_lateral_min))
+                )
+                side_complete = side_complete | overshoot_complete
+        route_phase[side_complete] = 1
+        exit_complete = (route_phase == 1) & (root_progress >= exit_progress) & exit_clear_ok
+        route_phase[exit_complete] = 2
+        exit_distance_forward = exit_progress - root_progress
+    else:
+        side_complete = (
+            (route_phase == 0)
+            & (root_xy[:, 0] >= side_waypoint_xy_w[:, 0])
+            & (obstacle_clearance >= float(side_clearance_radius))
+        )
+        route_phase[side_complete] = 1
+        exit_complete = (
+            (route_phase == 1)
+            & (root_xy[:, 0] >= exit_waypoint_xy_w[:, 0])
+            & (obstacle_clearance >= float(side_clearance_radius))
+        )
+        route_phase[exit_complete] = 2
+        exit_distance_forward = exit_waypoint_xy_w[:, 0] - root_xy[:, 0]
 
     active_waypoint = torch.where(
         (route_phase == 0).unsqueeze(1),
@@ -972,8 +1065,7 @@ def _obstacle_route_state(
         exit_waypoint_xy_w,
     )
     waypoint_delta_w = active_waypoint - root_xy
-    exit_distance_x = exit_waypoint_xy_w[:, 0] - root_xy[:, 0]
-    exit_gate = torch.clamp(exit_distance_x / float(exit_fade_distance), min=0.0, max=1.0)
+    exit_gate = torch.clamp(exit_distance_forward / float(exit_fade_distance), min=0.0, max=1.0)
     route_gate = torch.where(
         route_phase == 0,
         torch.ones_like(exit_gate),
@@ -1011,6 +1103,954 @@ def obstacle_route_progress(
     previous_distance.copy_(current_distance)
     progress_phase.copy_(route_phase)
     return route_gate.to(progress.dtype) * progress
+
+
+def obstacle_route_progress_rate(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float = 1.15,
+    exit_fade_distance: float = 1.0,
+    max_progress_per_step: float = 0.08,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return route-distance progress as a rate so RewardManager time integration is correct."""
+
+    progress = obstacle_route_progress(
+        env,
+        side_clearance_radius=side_clearance_radius,
+        exit_fade_distance=exit_fade_distance,
+        max_progress_per_step=max_progress_per_step,
+        asset_cfg=asset_cfg,
+    )
+    return progress / max(float(env.step_dt), 1.0e-6)
+
+
+def _final_goal_route_gate(env: ManagerBasedRLEnv, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Enable direct final-goal shaping only when no route obstacle is actively being bypassed."""
+
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR, None)
+    if route_phase is None or route_phase.shape != (env.num_envs,):
+        return torch.ones((env.num_envs,), dtype=dtype, device=env.device)
+    # This is intentionally reversible: if a future planner assigns a new obstacle and
+    # changes phase 2 back to 0/1, direct-goal shaping is disabled again automatically.
+    return (route_phase >= 2).to(dtype)
+
+
+def short_goal_progress_reward_alignment_route_gated(
+    env: ManagerBasedRLEnv,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.80,
+    alignment_floor: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = short_goal_progress_reward_alignment_gated(
+        env,
+        heading_deadband=heading_deadband,
+        heading_full=heading_full,
+        alignment_floor=alignment_floor,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=reward.dtype) * reward
+
+
+def short_goal_heading_error_reduction_route_gated(
+    env: ManagerBasedRLEnv,
+    min_progress: float = -0.5,
+    max_progress: float = 0.5,
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = short_goal_heading_error_reduction(
+        env,
+        min_progress=min_progress,
+        max_progress=max_progress,
+        use_turn_distance_gate=use_turn_distance_gate,
+        turn_gate_start_distance=turn_gate_start_distance,
+        turn_gate_full_distance=turn_gate_full_distance,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=reward.dtype) * reward
+
+
+def short_goal_heading_error_cost_route_gated(
+    env: ManagerBasedRLEnv,
+    fade_start_distance: float = 0.50,
+    full_distance: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    cost = short_goal_heading_error_cost(
+        env,
+        fade_start_distance=fade_start_distance,
+        full_distance=full_distance,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=cost.dtype) * cost
+
+
+def short_goal_continuous_yaw_rate_tracking_route_gated(
+    env: ManagerBasedRLEnv,
+    yaw_rate_max: float = 0.45,
+    heading_deadband: float = 0.04,
+    heading_scale: float = 0.30,
+    yaw_rate_reference: float = 0.35,
+    max_normalized_error: float = 2.0,
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.50,
+    turn_gate_full_distance: float = 0.80,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_continuous_yaw_rate_tracking_penalty(
+        env,
+        yaw_rate_max=yaw_rate_max,
+        heading_deadband=heading_deadband,
+        heading_scale=heading_scale,
+        yaw_rate_reference=yaw_rate_reference,
+        max_normalized_error=max_normalized_error,
+        use_turn_distance_gate=use_turn_distance_gate,
+        turn_gate_start_distance=turn_gate_start_distance,
+        turn_gate_full_distance=turn_gate_full_distance,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_cruise_underspeed_route_gated(
+    env: ManagerBasedRLEnv,
+    capture_distance: float = 0.30,
+    approach_full_distance: float = 0.60,
+    cruise_full_distance: float = 1.20,
+    approach_speed: float = 0.35,
+    cruise_speed: float = 0.80,
+    heading_deadband: float = 0.20,
+    heading_full: float = 0.80,
+    alignment_floor: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_cruise_underspeed_penalty(
+        env,
+        capture_distance=capture_distance,
+        approach_full_distance=approach_full_distance,
+        cruise_full_distance=cruise_full_distance,
+        approach_speed=approach_speed,
+        cruise_speed=cruise_speed,
+        heading_deadband=heading_deadband,
+        heading_full=heading_full,
+        alignment_floor=alignment_floor,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_speed_profile_route_gated(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.30,
+    braking_acceleration: float = 0.60,
+    reaction_time: float = 0.20,
+    braking_margin: float = 0.08,
+    near_distance: float = 1.0,
+    yaw_rate_ref: float = 0.80,
+    yaw_component_weight: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_speed_profile_penalty(
+        env,
+        stop_distance=stop_distance,
+        braking_acceleration=braking_acceleration,
+        reaction_time=reaction_time,
+        braking_margin=braking_margin,
+        near_distance=near_distance,
+        yaw_rate_ref=yaw_rate_ref,
+        yaw_component_weight=yaw_component_weight,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_near_goal_away_speed_route_gated(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.30,
+    active_distance: float = 1.0,
+    speed_reference: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_near_goal_away_speed_penalty(
+        env,
+        stop_distance=stop_distance,
+        active_distance=active_distance,
+        speed_reference=speed_reference,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_pre_stop_xy_speed_envelope_route_gated(
+    env: ManagerBasedRLEnv,
+    enter_distance: float = 0.50,
+    full_speed_distance: float = 2.0,
+    allowed_speed_at_enter: float = 0.15,
+    allowed_speed_at_full: float = 0.80,
+    excess_speed_reference: float = 0.40,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_pre_stop_xy_speed_envelope_penalty(
+        env,
+        enter_distance=enter_distance,
+        full_speed_distance=full_speed_distance,
+        allowed_speed_at_enter=allowed_speed_at_enter,
+        allowed_speed_at_full=allowed_speed_at_full,
+        excess_speed_reference=excess_speed_reference,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_near_lateral_velocity_route_gated(
+    env: ManagerBasedRLEnv,
+    stop_distance: float = 0.50,
+    active_distance: float = 2.50,
+    lateral_speed_reference: float = 0.40,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_near_lateral_velocity_penalty(
+        env,
+        stop_distance=stop_distance,
+        active_distance=active_distance,
+        lateral_speed_reference=lateral_speed_reference,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def short_goal_stopped_success_route_gated(
+    env: ManagerBasedRLEnv,
+    success_distance: float = 0.25,
+    max_xy_speed: float = 0.15,
+    max_yaw_rate: float = 0.20,
+    required_hold_steps: int = 24,
+    max_roll: float | None = None,
+    max_pitch: float | None = None,
+    max_stroke_range: float | None = None,
+    max_stroke_tracking_error: float | None = None,
+    action_name: str = "leg_hydraulic",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    reward = short_goal_stopped_success_reward(
+        env,
+        success_distance=success_distance,
+        max_xy_speed=max_xy_speed,
+        max_yaw_rate=max_yaw_rate,
+        required_hold_steps=required_hold_steps,
+        max_roll=max_roll,
+        max_pitch=max_pitch,
+        max_stroke_range=max_stroke_range,
+        max_stroke_tracking_error=max_stroke_tracking_error,
+        action_name=action_name,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=reward.dtype) * reward
+
+
+def short_goal_precision_reach_route_gated(
+    env: ManagerBasedRLEnv,
+    precision_distance: float = 0.30,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Give the one-time precision bonus only after the active obstacle route is complete."""
+
+    _, current_distance, _ = short_goal_target_body(env, asset_cfg=asset_cfg)
+    goal_reached = getattr(env, SHORT_GOAL_REACHED_ATTR, None)
+    if goal_reached is None or goal_reached.shape != (env.num_envs,):
+        goal_reached = torch.zeros((env.num_envs,), device=env.device, dtype=torch.bool)
+        setattr(env, SHORT_GOAL_REACHED_ATTR, goal_reached)
+    route_ready = _final_goal_route_gate(env, dtype=torch.float32) > 0.0
+    newly_reached = (current_distance < float(precision_distance)) & (~goal_reached) & route_ready
+    goal_reached |= newly_reached
+    return newly_reached.to(torch.float32) / max(float(env.step_dt), 1.0e-6)
+
+
+def short_goal_wheel_turn_mode_prior_route_gated(
+    env: ManagerBasedRLEnv,
+    turn_gain: float = 0.5,
+    action_name: str = "wheel_motor_csv",
+    use_turn_distance_gate: bool = False,
+    turn_gate_start_distance: float = 0.35,
+    turn_gate_full_distance: float = 0.60,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    penalty = short_goal_wheel_turn_mode_prior_l1(
+        env,
+        turn_gain=turn_gain,
+        action_name=action_name,
+        use_turn_distance_gate=use_turn_distance_gate,
+        turn_gate_start_distance=turn_gate_start_distance,
+        turn_gate_full_distance=turn_gate_full_distance,
+        asset_cfg=asset_cfg,
+    )
+    return _final_goal_route_gate(env, dtype=penalty.dtype) * penalty
+
+
+def _obstacle_corridor_state(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float,
+    exit_fade_distance: float,
+    asset_cfg: SceneEntityCfg,
+):
+    """Return route-frame corridor quantities after applying the current phase gates."""
+
+    asset, obstacle_xy_w, _, _, route_phase = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    route_forward = getattr(env, OBSTACLE_ROUTE_FORWARD_ATTR, None)
+    route_lateral = getattr(env, OBSTACLE_ROUTE_LATERAL_ATTR, None)
+    side_waypoint = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR, None)
+    exit_waypoint = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, None)
+    if (
+        not isinstance(route_forward, torch.Tensor)
+        or route_forward.shape != (env.num_envs, 2)
+        or not isinstance(route_lateral, torch.Tensor)
+        or route_lateral.shape != (env.num_envs, 2)
+        or not isinstance(side_waypoint, torch.Tensor)
+        or side_waypoint.shape != (env.num_envs, 2)
+        or not isinstance(exit_waypoint, torch.Tensor)
+        or exit_waypoint.shape != (env.num_envs, 2)
+    ):
+        raise RuntimeError("Corridor rewards require initialized route-forward/lateral waypoint state.")
+
+    root_xy = asset.data.root_pos_w[:, :2]
+    root_rel = root_xy - obstacle_xy_w
+    root_progress = torch.sum(root_rel * route_forward, dim=1)
+    side_progress = torch.sum((side_waypoint - obstacle_xy_w) * route_forward, dim=1)
+    exit_progress = torch.sum((exit_waypoint - obstacle_xy_w) * route_forward, dim=1)
+    root_lateral = torch.sum(root_rel * route_lateral, dim=1)
+    side_lateral = torch.sum((side_waypoint - obstacle_xy_w) * route_lateral, dim=1)
+    bypass_sign = torch.where(side_lateral >= 0.0, torch.ones_like(side_lateral), -torch.ones_like(side_lateral))
+    signed_lateral = bypass_sign * root_lateral
+    corridor_lateral = torch.abs(side_lateral)
+
+    side_delta = side_waypoint - root_xy
+    side_distance = torch.linalg.vector_norm(side_delta, dim=1)
+    side_dir = side_delta / torch.clamp(side_distance.unsqueeze(1), min=1.0e-6)
+    exit_delta = exit_waypoint - root_xy
+    exit_distance = torch.linalg.vector_norm(exit_delta, dim=1)
+    exit_dir = exit_delta / torch.clamp(exit_distance.unsqueeze(1), min=1.0e-6)
+    cfg = getattr(env, "cfg", None)
+    phase1_target_exit = bool(getattr(cfg, "obstacle_corridor_phase1_target_exit", False))
+    phase1_dir = exit_dir if phase1_target_exit else route_forward
+    motion_dir = torch.where((route_phase == 0).unsqueeze(1), side_dir, phase1_dir)
+    motion_dir_3d = torch.cat(
+        (motion_dir, torch.zeros((env.num_envs, 1), device=env.device, dtype=motion_dir.dtype)), dim=1
+    )
+    motion_dir_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1), motion_dir_3d
+    )
+    heading_error = torch.atan2(motion_dir_b[:, 1], motion_dir_b[:, 0])
+
+    velocity_w = asset.data.root_lin_vel_w[:, :2]
+    motion_speed = torch.sum(velocity_w * motion_dir, dim=1)
+    forward_speed = torch.sum(velocity_w * route_forward, dim=1)
+    outward_lateral_speed = bypass_sign * torch.sum(velocity_w * route_lateral, dim=1)
+    active = route_phase < 2
+    return (
+        asset,
+        route_phase,
+        active,
+        root_progress,
+        side_progress,
+        exit_progress,
+        signed_lateral,
+        corridor_lateral,
+        heading_error,
+        motion_speed,
+        forward_speed,
+        outward_lateral_speed,
+    )
+
+
+def obstacle_corridor_progress_rate(
+    env: ManagerBasedRLEnv,
+    phase0_entry_weight: float = 0.0,
+    phase0_forward_weight: float = 0.60,
+    phase0_lateral_weight: float = 0.40,
+    max_speed: float = 1.5,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward entry-target progress in phase 0 and active motion-target progress in phase 1."""
+
+    if float(max_speed) <= 0.0:
+        raise ValueError("max_speed must be positive.")
+    if (
+        float(phase0_entry_weight) < 0.0
+        or float(phase0_forward_weight) < 0.0
+        or float(phase0_lateral_weight) < 0.0
+    ):
+        raise ValueError("Corridor progress weights must be non-negative.")
+    (
+        _, route_phase, active, _, _, _, signed_lateral, corridor_lateral, _, motion_speed, forward_speed,
+        outward_lateral_speed
+    ) = _obstacle_corridor_state(env, side_clearance_radius, exit_fade_distance, asset_cfg)
+    lateral_needed = (signed_lateral < corridor_lateral).to(forward_speed.dtype)
+    phase0_progress = (
+        float(phase0_entry_weight) * motion_speed
+        + float(phase0_forward_weight) * forward_speed
+        + float(phase0_lateral_weight) * lateral_needed * outward_lateral_speed
+    )
+    progress = torch.where(route_phase == 0, phase0_progress, motion_speed)
+    return active.to(progress.dtype) * torch.clamp(progress, min=-float(max_speed), max=float(max_speed))
+
+
+def obstacle_corridor_clearance_barrier_penalty(
+    env: ManagerBasedRLEnv,
+    safe_lateral: float = 1.55,
+    transition_width: float = 0.35,
+    obstacle_half_length: float = 0.30,
+    longitudinal_margin: float = 0.85,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize unsafe lateral shortcuts while longitudinally beside the training obstacle."""
+
+    if float(safe_lateral) <= 0.0 or float(transition_width) <= 0.0:
+        raise ValueError("safe_lateral and transition_width must be positive.")
+    if float(obstacle_half_length) < 0.0 or float(longitudinal_margin) < 0.0:
+        raise ValueError("Obstacle longitudinal extents must be non-negative.")
+    _, _, active, root_progress, _, _, signed_lateral, _, _, _, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    half_band = float(obstacle_half_length) + float(longitudinal_margin)
+    beside_obstacle = torch.abs(root_progress) <= half_band
+    intrusion = torch.relu(float(safe_lateral) - signed_lateral)
+    penalty = torch.square(torch.clamp(intrusion / float(transition_width), max=1.0))
+    return active.to(penalty.dtype) * beside_obstacle.to(penalty.dtype) * penalty
+
+
+def obstacle_corridor_lateral_error_penalty(
+    env: ManagerBasedRLEnv,
+    deadband: float = 0.20,
+    error_reference: float = 0.50,
+    phase0_approach_distance: float = 1.50,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track the safe-side corridor, ramping the requirement before the entry gate."""
+
+    if float(deadband) < 0.0 or float(error_reference) <= 0.0 or float(phase0_approach_distance) <= 0.0:
+        raise ValueError("Invalid corridor lateral shaping parameters.")
+    (
+        _, route_phase, active, root_progress, side_progress, _, signed_lateral, corridor_lateral, _, _, _, _
+    ) = _obstacle_corridor_state(env, side_clearance_radius, exit_fade_distance, asset_cfg)
+    lateral_error = torch.relu(torch.abs(signed_lateral - corridor_lateral) - float(deadband))
+    phase0_gate = torch.clamp(
+        (root_progress - (side_progress - float(phase0_approach_distance))) / float(phase0_approach_distance),
+        min=0.0,
+        max=1.0,
+    )
+    gate = torch.where(route_phase == 0, phase0_gate, (route_phase == 1).to(phase0_gate.dtype))
+    return active.to(lateral_error.dtype) * gate * torch.square(lateral_error / float(error_reference))
+
+
+def obstacle_corridor_heading_deadband_penalty(
+    env: ManagerBasedRLEnv,
+    deadband: float = math.radians(10.0),
+    error_reference: float = math.radians(45.0),
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize only meaningful deviation from the entry-path/corridor tangent."""
+
+    if float(deadband) < 0.0 or float(error_reference) <= 0.0:
+        raise ValueError("Invalid corridor heading parameters.")
+    _, _, active, _, _, _, _, _, heading_error, _, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    excess = torch.relu(torch.abs(heading_error) - float(deadband))
+    return active.to(excess.dtype) * torch.square(excess / float(error_reference))
+
+
+def obstacle_corridor_heading_reduction_reward(
+    env: ManagerBasedRLEnv,
+    max_reduction_per_step: float = 0.12,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward only positive reduction of corridor/path heading error."""
+
+    _, route_phase, active, _, _, _, _, _, heading_error, _, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    heading_abs = torch.abs(heading_error)
+    prev_attr = "_ranger_obstacle_corridor_prev_heading_abs"
+    phase_attr = "_ranger_obstacle_corridor_prev_heading_phase"
+    previous = getattr(env, prev_attr, None)
+    previous_phase = getattr(env, phase_attr, None)
+    if previous is None or previous.shape != (env.num_envs,):
+        previous = heading_abs.detach().clone()
+        setattr(env, prev_attr, previous)
+    if previous_phase is None or previous_phase.shape != (env.num_envs,):
+        previous_phase = route_phase.detach().clone()
+        setattr(env, phase_attr, previous_phase)
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    reset_mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        reset_mask = episode_length_buf <= 1
+    phase_changed = previous_phase != route_phase
+    reduction = torch.clamp(previous - heading_abs, min=0.0, max=float(max_reduction_per_step))
+    reduction = torch.where(reset_mask | phase_changed, torch.zeros_like(reduction), reduction)
+    previous.copy_(heading_abs)
+    previous_phase.copy_(route_phase)
+    return active.to(reduction.dtype) * reduction / max(float(env.step_dt), 1.0e-6)
+
+
+def _obstacle_corridor_effective_turn_mask(
+    env: ManagerBasedRLEnv,
+    heading_error: torch.Tensor,
+    route_phase: torch.Tensor,
+    yaw_rate: torch.Tensor,
+    attr_prefix: str,
+    heading_threshold: float,
+    min_yaw_rate: float,
+    min_heading_reduction_rate: float,
+) -> torch.Tensor:
+    """Detect a genuinely useful large-angle turn rather than merely a large heading error."""
+
+    heading_abs = torch.abs(heading_error)
+    prev_attr = f"{attr_prefix}_heading_abs"
+    phase_attr = f"{attr_prefix}_phase"
+    previous = getattr(env, prev_attr, None)
+    previous_phase = getattr(env, phase_attr, None)
+    if previous is None or previous.shape != (env.num_envs,):
+        previous = heading_abs.detach().clone()
+        setattr(env, prev_attr, previous)
+    if previous_phase is None or previous_phase.shape != (env.num_envs,):
+        previous_phase = route_phase.detach().clone()
+        setattr(env, phase_attr, previous_phase)
+    dt = max(float(env.step_dt), 1.0e-6)
+    reduction_rate = (previous - heading_abs) / dt
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    reset_mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        reset_mask = episode_length_buf <= 1
+    phase_changed = previous_phase != route_phase
+    correct_yaw = heading_error * yaw_rate > 0.0
+    effective = (
+        (heading_abs > float(heading_threshold))
+        & correct_yaw
+        & (torch.abs(yaw_rate) >= float(min_yaw_rate))
+        & (reduction_rate >= float(min_heading_reduction_rate))
+        & (~reset_mask)
+        & (~phase_changed)
+    )
+    previous.copy_(heading_abs)
+    previous_phase.copy_(route_phase)
+    return effective
+
+
+def obstacle_corridor_speed_penalty(
+    env: ManagerBasedRLEnv,
+    phase0_speed: float = 0.65,
+    phase1_speed: float = 0.80,
+    speed_reference: float = 0.80,
+    turn_heading_threshold: float = math.radians(30.0),
+    min_turn_yaw_rate: float = 0.12,
+    min_heading_reduction_rate: float = 0.05,
+    phase1_turn_min_speed: float = 0.0,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Demand normal route speed while allowing only bounded slow-down during effective turns."""
+
+    if min(float(phase0_speed), float(phase1_speed), float(speed_reference)) <= 0.0:
+        raise ValueError("Corridor speed references must be positive.")
+    if not 0.0 <= float(phase1_turn_min_speed) <= float(phase1_speed):
+        raise ValueError("phase1_turn_min_speed must satisfy 0 <= value <= phase1_speed.")
+    asset, route_phase, active, _, _, _, _, _, heading_error, motion_speed, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    effective_turn = _obstacle_corridor_effective_turn_mask(
+        env,
+        heading_error,
+        route_phase,
+        asset.data.root_ang_vel_b[:, 2],
+        "_ranger_obstacle_corridor_speed_turn",
+        turn_heading_threshold,
+        min_turn_yaw_rate,
+        min_heading_reduction_rate,
+    )
+    normal_speed = torch.where(
+        route_phase == 0,
+        torch.full_like(motion_speed, float(phase0_speed)),
+        torch.full_like(motion_speed, float(phase1_speed)),
+    )
+    effective_turn_speed = torch.where(
+        route_phase == 0,
+        torch.zeros_like(normal_speed),
+        torch.full_like(normal_speed, float(phase1_turn_min_speed)),
+    )
+    desired_speed = torch.where(effective_turn, effective_turn_speed, normal_speed)
+    underspeed = torch.relu(desired_speed - motion_speed)
+    return active.to(underspeed.dtype) * torch.square(underspeed / float(speed_reference))
+
+
+def obstacle_corridor_turn_stagnation_penalty(
+    env: ManagerBasedRLEnv,
+    heading_threshold: float = math.radians(30.0),
+    min_turn_yaw_rate: float = 0.12,
+    min_heading_reduction_rate: float = 0.05,
+    grace_time_s: float = 0.50,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize staying at a large heading error without making an effective corrective turn."""
+
+    if float(grace_time_s) < 0.0:
+        raise ValueError("grace_time_s must be non-negative.")
+    asset, route_phase, active, _, _, _, _, _, heading_error, _, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    effective_turn = _obstacle_corridor_effective_turn_mask(
+        env,
+        heading_error,
+        route_phase,
+        asset.data.root_ang_vel_b[:, 2],
+        "_ranger_obstacle_corridor_stagnation_turn",
+        heading_threshold,
+        min_turn_yaw_rate,
+        min_heading_reduction_rate,
+    )
+    stagnant = active & (torch.abs(heading_error) > float(heading_threshold)) & (~effective_turn)
+    steps_attr = "_ranger_obstacle_corridor_turn_stagnation_steps"
+    steps = getattr(env, steps_attr, None)
+    if steps is None or steps.shape != (env.num_envs,):
+        steps = torch.zeros((env.num_envs,), dtype=torch.long, device=env.device)
+        setattr(env, steps_attr, steps)
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        steps[episode_length_buf <= 1] = 0
+    steps[:] = torch.where(stagnant, steps + 1, torch.zeros_like(steps))
+    grace_steps = max(int(round(float(grace_time_s) / max(float(env.step_dt), 1.0e-6))), 1)
+    return active.to(torch.float32) * (steps > grace_steps).to(torch.float32)
+
+
+def obstacle_corridor_time_penalty(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float = 1.50,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Apply a small unavoidable time cost until the obstacle corridor has been exited."""
+
+    _, _, active, _, _, _, _, _, _, _, _, _ = _obstacle_corridor_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    return active.to(torch.float32)
+
+
+def obstacle_route_milestone_reward(
+    env: ManagerBasedRLEnv,
+    side_bonus: float = 3.0,
+    exit_bonus: float = 6.0,
+    side_clearance_radius: float = 1.15,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward side-clearance and obstacle-exit transitions as reusable route milestones."""
+
+    if float(side_bonus) < 0.0 or float(exit_bonus) < 0.0:
+        raise ValueError("Obstacle route milestone bonuses must be non-negative.")
+    _, _, _, _, route_phase = _obstacle_route_state(
+        env,
+        side_clearance_radius=side_clearance_radius,
+        exit_fade_distance=exit_fade_distance,
+        asset_cfg=asset_cfg,
+    )
+    attr = "_ranger_obstacle_route_milestone_prev_phase"
+    previous_phase = getattr(env, attr, None)
+    if previous_phase is None or previous_phase.shape != (env.num_envs,):
+        previous_phase = route_phase.clone()
+        setattr(env, attr, previous_phase)
+
+    reset_mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        reset_mask = episode_length_buf <= 1
+
+    # A one-step 0->2 jump earns both milestones. A future 2->0/1 re-plan earns no
+    # bonus by itself, but arms the same milestone logic for the newly selected obstacle.
+    side_complete = (previous_phase <= 0) & (route_phase >= 1) & (~reset_mask)
+    exit_complete = (previous_phase <= 1) & (route_phase >= 2) & (~reset_mask)
+    reward = float(side_bonus) * side_complete.to(torch.float32) + float(exit_bonus) * exit_complete.to(torch.float32)
+    previous_phase.copy_(route_phase)
+    return reward / max(float(env.step_dt), 1.0e-6)
+
+
+def obstacle_route_underspeed_penalty(
+    env: ManagerBasedRLEnv,
+    cruise_speed: float = 0.55,
+    turn_speed: float = 0.15,
+    heading_deadband: float = 0.20,
+    heading_full: float = 1.00,
+    side_clearance_radius: float = 1.15,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize route-stage crawling while allowing slower motion during large turns."""
+
+    if float(cruise_speed) <= 0.0:
+        raise ValueError("cruise_speed must be positive.")
+    if float(turn_speed) < 0.0 or float(turn_speed) > float(cruise_speed):
+        raise ValueError("turn_speed must satisfy 0 <= turn_speed <= cruise_speed.")
+    if float(heading_full) <= float(heading_deadband):
+        raise ValueError("heading_full must be greater than heading_deadband.")
+
+    asset, _, waypoint_delta_w, route_gate, _ = _obstacle_route_state(
+        env,
+        side_clearance_radius=side_clearance_radius,
+        exit_fade_distance=exit_fade_distance,
+        asset_cfg=asset_cfg,
+    )
+    waypoint_distance = torch.linalg.vector_norm(waypoint_delta_w, dim=1)
+    waypoint_dir_w = waypoint_delta_w / torch.clamp(waypoint_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_waypoint = torch.sum(asset.data.root_lin_vel_w[:, :2] * waypoint_dir_w, dim=1)
+
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)),
+        dim=1,
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1),
+        waypoint_delta_3d,
+    )
+    heading_abs = torch.abs(torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0]))
+    alignment = torch.clamp(
+        (float(heading_full) - heading_abs) / max(float(heading_full) - float(heading_deadband), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    desired_speed = float(turn_speed) + alignment * (float(cruise_speed) - float(turn_speed))
+    underspeed = torch.relu(desired_speed - velocity_toward_waypoint)
+    penalty = torch.square(underspeed / float(cruise_speed))
+    return route_gate.to(penalty.dtype) * penalty
+
+
+def obstacle_route_turn_aware_underspeed_penalty(
+    env: ManagerBasedRLEnv,
+    cruise_speed: float = 0.55,
+    slow_arc_speed: float = 0.30,
+    aligned_heading: float = 0.26,
+    turn_in_place_heading: float = 0.70,
+    side_clearance_radius: float = 1.30,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize low route speed only after alignment to the active waypoint permits safe translation."""
+
+    if not (0.0 < float(slow_arc_speed) <= float(cruise_speed)):
+        raise ValueError("Require 0 < slow_arc_speed <= cruise_speed.")
+    if not (0.0 < float(aligned_heading) < float(turn_in_place_heading)):
+        raise ValueError("Require 0 < aligned_heading < turn_in_place_heading.")
+
+    asset, _, waypoint_delta_w, route_gate, _ = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    waypoint_distance = torch.linalg.vector_norm(waypoint_delta_w, dim=1)
+    waypoint_dir_w = waypoint_delta_w / torch.clamp(waypoint_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_waypoint = torch.sum(asset.data.root_lin_vel_w[:, :2] * waypoint_dir_w, dim=1)
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)), dim=1
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1), waypoint_delta_3d
+    )
+    heading_abs = torch.abs(torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0]))
+
+    transition = torch.clamp(
+        (float(turn_in_place_heading) - heading_abs)
+        / max(float(turn_in_place_heading) - float(aligned_heading), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    desired_speed = transition * float(slow_arc_speed)
+    aligned_scale = torch.clamp(
+        (float(aligned_heading) - heading_abs) / max(float(aligned_heading), 1.0e-6), min=0.0, max=1.0
+    )
+    desired_speed = desired_speed + aligned_scale * (float(cruise_speed) - float(slow_arc_speed))
+    underspeed = torch.relu(desired_speed - velocity_toward_waypoint)
+    penalty = torch.square(underspeed / float(cruise_speed))
+    return route_gate.to(penalty.dtype) * penalty
+
+
+def obstacle_route_turn_aware_speed_penalty_v2(
+    env: ManagerBasedRLEnv,
+    cruise_speed: float = 0.80,
+    arc_speed: float = 0.45,
+    aligned_speed: float = 0.65,
+    aligned_heading: float = 0.17,
+    arc_heading: float = 0.44,
+    turn_in_place_heading: float = 0.87,
+    side_clearance_radius: float = 1.30,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Use an aggressive three-stage route speed floor while preserving true in-place turns.
+
+    Desired route speed is zero only for large heading errors, then rises to ``arc_speed``
+    by ``arc_heading``, to ``aligned_speed`` by ``aligned_heading``, and finally to
+    ``cruise_speed`` as the active waypoint becomes fully aligned.
+    """
+
+    if not (0.0 < float(arc_speed) <= float(aligned_speed) <= float(cruise_speed)):
+        raise ValueError("Require 0 < arc_speed <= aligned_speed <= cruise_speed.")
+    if not (0.0 < float(aligned_heading) < float(arc_heading) < float(turn_in_place_heading)):
+        raise ValueError("Require 0 < aligned_heading < arc_heading < turn_in_place_heading.")
+
+    asset, _, waypoint_delta_w, route_gate, _ = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    waypoint_distance = torch.linalg.vector_norm(waypoint_delta_w, dim=1)
+    waypoint_dir_w = waypoint_delta_w / torch.clamp(waypoint_distance.unsqueeze(1), min=1.0e-6)
+    velocity_toward_waypoint = torch.sum(asset.data.root_lin_vel_w[:, :2] * waypoint_dir_w, dim=1)
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)), dim=1
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1), waypoint_delta_3d
+    )
+    heading_abs = torch.abs(torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0]))
+
+    turn_to_arc = torch.clamp(
+        (float(turn_in_place_heading) - heading_abs)
+        / max(float(turn_in_place_heading) - float(arc_heading), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    arc_to_aligned = torch.clamp(
+        (float(arc_heading) - heading_abs) / max(float(arc_heading) - float(aligned_heading), 1.0e-6),
+        min=0.0,
+        max=1.0,
+    )
+    aligned_to_cruise = torch.clamp(
+        (float(aligned_heading) - heading_abs) / max(float(aligned_heading), 1.0e-6), min=0.0, max=1.0
+    )
+    desired_speed = (
+        turn_to_arc * float(arc_speed)
+        + arc_to_aligned * (float(aligned_speed) - float(arc_speed))
+        + aligned_to_cruise * (float(cruise_speed) - float(aligned_speed))
+    )
+    underspeed = torch.relu(desired_speed - velocity_toward_waypoint)
+    penalty = torch.square(underspeed / float(cruise_speed))
+    return route_gate.to(penalty.dtype) * penalty
+
+
+def obstacle_route_heading_reduction_rate(
+    env: ManagerBasedRLEnv,
+    side_clearance_radius: float = 1.30,
+    exit_fade_distance: float = 1.0,
+    max_reduction_per_step: float = 0.12,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward immediate reduction of absolute heading error to the active route waypoint."""
+
+    asset, _, waypoint_delta_w, route_gate, route_phase = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)), dim=1
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1), waypoint_delta_3d
+    )
+    heading_abs = torch.abs(torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0]))
+
+    prev_attr = "_ranger_obstacle_route_prev_heading_abs"
+    phase_attr = "_ranger_obstacle_route_prev_heading_phase"
+    previous = getattr(env, prev_attr, None)
+    previous_phase = getattr(env, phase_attr, None)
+    if previous is None or previous.shape != (env.num_envs,):
+        previous = heading_abs.detach().clone()
+        setattr(env, prev_attr, previous)
+    if previous_phase is None or previous_phase.shape != (env.num_envs,):
+        previous_phase = route_phase.detach().clone()
+        setattr(env, phase_attr, previous_phase)
+
+    reset_mask = torch.zeros((env.num_envs,), dtype=torch.bool, device=env.device)
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        reset_mask = episode_length_buf <= 1
+    phase_changed = previous_phase != route_phase
+    reduction = torch.clamp(
+        previous - heading_abs, min=-float(max_reduction_per_step), max=float(max_reduction_per_step)
+    )
+    reduction = torch.where(reset_mask | phase_changed, torch.zeros_like(reduction), reduction)
+    previous.copy_(heading_abs)
+    previous_phase.copy_(route_phase)
+    return route_gate.to(reduction.dtype) * reduction / max(float(env.step_dt), 1.0e-6)
+
+
+def obstacle_route_stall_penalty(
+    env: ManagerBasedRLEnv,
+    max_xy_speed: float = 0.07,
+    max_yaw_rate: float = 0.08,
+    grace_time_s: float = 0.75,
+    side_clearance_radius: float = 1.30,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize persistent inactivity while allowing useful in-place route turning."""
+
+    if float(max_xy_speed) <= 0.0 or float(max_yaw_rate) <= 0.0 or float(grace_time_s) < 0.0:
+        raise ValueError("Stall thresholds must be positive and grace_time_s must be non-negative.")
+    asset, _, _, route_gate, _ = _obstacle_route_state(env, side_clearance_radius, exit_fade_distance, asset_cfg)
+    xy_speed = torch.linalg.vector_norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    yaw_rate_abs = torch.abs(asset.data.root_ang_vel_b[:, 2])
+    inactive = (route_gate > 0.0) & (xy_speed < float(max_xy_speed)) & (yaw_rate_abs < float(max_yaw_rate))
+
+    attr = "_ranger_obstacle_route_stall_steps"
+    stall_steps = getattr(env, attr, None)
+    if stall_steps is None or stall_steps.shape != (env.num_envs,):
+        stall_steps = torch.zeros((env.num_envs,), dtype=torch.long, device=env.device)
+        setattr(env, attr, stall_steps)
+    episode_length_buf = getattr(env, "episode_length_buf", None)
+    if isinstance(episode_length_buf, torch.Tensor) and episode_length_buf.shape == (env.num_envs,):
+        stall_steps[episode_length_buf <= 1] = 0
+    stall_steps[:] = torch.where(inactive, stall_steps + 1, torch.zeros_like(stall_steps))
+    grace_steps = max(int(round(float(grace_time_s) / max(float(env.step_dt), 1.0e-6))), 1)
+    return (stall_steps > grace_steps).to(torch.float32) * (route_gate > 0.0).to(torch.float32)
+
+
+def obstacle_route_wrong_forward_penalty(
+    env: ManagerBasedRLEnv,
+    heading_threshold: float = 0.52,
+    safe_forward_speed: float = 0.12,
+    speed_reference: float = 0.45,
+    side_clearance_radius: float = 1.30,
+    exit_fade_distance: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize forward translation while still substantially misaligned to the active route waypoint."""
+
+    if float(heading_threshold) <= 0.0 or float(speed_reference) <= 0.0:
+        raise ValueError("heading_threshold and speed_reference must be positive.")
+    asset, _, waypoint_delta_w, route_gate, _ = _obstacle_route_state(
+        env, side_clearance_radius, exit_fade_distance, asset_cfg
+    )
+    waypoint_delta_3d = torch.cat(
+        (waypoint_delta_w, torch.zeros((env.num_envs, 1), device=env.device, dtype=waypoint_delta_w.dtype)), dim=1
+    )
+    waypoint_delta_b = quat_apply(
+        torch.cat((asset.data.root_quat_w[:, :1], -asset.data.root_quat_w[:, 1:]), dim=1), waypoint_delta_3d
+    )
+    heading_abs = torch.abs(torch.atan2(waypoint_delta_b[:, 1], waypoint_delta_b[:, 0]))
+    forward_speed = torch.relu(asset.data.root_lin_vel_b[:, 0])
+    excess = torch.relu(forward_speed - float(safe_forward_speed)) / float(speed_reference)
+    return route_gate.to(excess.dtype) * (heading_abs > float(heading_threshold)).to(excess.dtype) * torch.square(excess)
 
 
 def obstacle_route_heading_error(
@@ -1325,7 +2365,7 @@ def short_goal_approach_wheel_target_excess_penalty(
         heading_full=heading_full,
     )
     action_term = env.action_manager.get_term(action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(action_term.velocity_target)
     velocity_limit = max(float(getattr(action_term, "_velocity_limit", 1.0)), 1.0e-6)
     allowed_wheel_speed = desired_speed / max(float(wheel_radius), 1.0e-6)
     target_excess = torch.relu(torch.abs(semantic_target) - allowed_wheel_speed.unsqueeze(1))
@@ -1483,7 +2523,7 @@ def short_goal_wheel_diff_prior_l1(
     """Penalize semantic left-right wheel target mismatch for the short-goal heading error."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     left_mean = semantic_target[:, :2].mean(dim=1)
     right_mean = semantic_target[:, 2:].mean(dim=1)
     _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
@@ -1514,7 +2554,7 @@ def short_goal_wheel_turn_mode_prior_l1(
     """Penalize normalized wheel turn-mode error implied by the target heading."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     wheel_action_term = env.action_manager.get_term(action_name)
     velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
     left_mean = semantic_target[:, :2].mean(dim=1) / velocity_limit
@@ -1540,7 +2580,7 @@ def wheel_same_side_target_consistency_l1(
     """Penalize excessive front/rear target disagreement while allowing a normalized deadband."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     wheel_action_term = env.action_manager.get_term(action_name)
     velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
     left_diff_norm = torch.abs(semantic_target[:, 0] - semantic_target[:, 1]) / velocity_limit
@@ -1558,7 +2598,7 @@ def wheel_same_side_opposite_sign_penalty(
     """Penalize the normalized same-side component that can only exist under sign opposition."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     wheel_action_term = env.action_manager.get_term(action_name)
     velocity_limit = max(float(getattr(wheel_action_term, "_velocity_limit", 1.0)), 1.0e-6)
     target_norm = semantic_target / velocity_limit
@@ -1602,7 +2642,7 @@ def loaded_wheel_longitudinal_slip_penalty(
         env,
         SceneEntityCfg("robot", joint_names=["w_lf", "w_lb", "w_rf", "w_rb"]),
     )
-    semantic_wheel_joint_vel = wheel_raw_to_semantic_lf_lr_rf_rr(wheel_joint_vel)
+    semantic_wheel_joint_vel = wheel_joint_to_semantic_lf_lb_rf_rb(wheel_joint_vel)
 
     wheel_body_ids, _ = asset.find_bodies(["w_lf", "w_lb", "w_rf", "w_rb"], preserve_order=True)
     wheel_hub_lin_vel_w = asset.data.body_lin_vel_w[:, wheel_body_ids, :]
@@ -1659,7 +2699,7 @@ def short_goal_forward_common_mode_penalty(
     """Penalize shared forward wheel target motion while the short-goal heading error is large."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     left_mean = semantic_target[:, :2].mean(dim=1)
     right_mean = semantic_target[:, 2:].mean(dim=1)
     _, goal_distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
@@ -1905,7 +2945,7 @@ def wheel_forward_mode_target_penalty(
     """Penalize semantic wheel forward-mode target magnitude."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
     semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
     semantic_forward_mode = 0.5 * (semantic_left_forward_target + semantic_right_forward_target)
@@ -1922,7 +2962,7 @@ def wheel_turn_mode_target_soft_limit_penalty(
     """Penalize excessive semantic differential turn mode target magnitude."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
     semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
     semantic_turn_mode = 0.5 * (semantic_right_forward_target - semantic_left_forward_target)
@@ -1980,7 +3020,7 @@ def wasted_turn_when_yaw_small_penalty(
     yaw_deficit = torch.relu(required_yaw - signed_yaw) / torch.clamp(required_yaw, min=1.0e-6)
     yaw_deficit = torch.clamp(yaw_deficit, min=0.0, max=2.0)
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     semantic_left_forward_target = semantic_target[:, :2].mean(dim=1)
     semantic_right_forward_target = semantic_target[:, 2:].mean(dim=1)
     semantic_turn_mode = 0.5 * (semantic_right_forward_target - semantic_left_forward_target)
@@ -2200,7 +3240,7 @@ def wheel_target_common_mode_penalty(
     """Penalize common-mode wheel target magnitude to discourage turn-only policies from using shared fore-aft motion."""
 
     raw_target = _wheel_target_vel_lf_lr_rf_rr(env, action_name=action_name)
-    semantic_target = wheel_raw_to_semantic_lf_lr_rf_rr(raw_target)
+    semantic_target = wheel_joint_to_semantic_lf_lb_rf_rb(raw_target)
     target_left_mean = semantic_target[:, :2].mean(dim=1)
     target_right_mean = semantic_target[:, 2:].mean(dim=1)
     target_common = 0.5 * (target_left_mean + target_right_mean)
@@ -2559,7 +3599,7 @@ def wheel_semantic_velocity_symmetry_l2(env: ManagerBasedRLEnv, action_name: str
     """Penalize left/right semantic wheel target mismatch."""
 
     wheel_action_term = env.action_manager.get_term(action_name)
-    semantic_target = wheel_raw_to_semantic_lr_lf_rf_rr(wheel_action_term.velocity_target)
+    semantic_target = wheel_joint_to_semantic_lb_lf_rf_rb(wheel_action_term.velocity_target)
     left_mean = semantic_target[:, :2].mean(dim=1)
     right_mean = semantic_target[:, 2:].mean(dim=1)
     return torch.square(left_mean - right_mean)

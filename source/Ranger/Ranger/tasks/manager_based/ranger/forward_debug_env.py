@@ -130,6 +130,8 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             self._is_short_goal_task and os.getenv("RANGER_VISUALIZE_GOAL", "0") == "1"
         )
         self._short_goal_goal_marker: VisualizationMarkers | None = None
+        self._short_goal_side_waypoint_marker: VisualizationMarkers | None = None
+        self._short_goal_exit_waypoint_marker: VisualizationMarkers | None = None
         self._stand_debug_metrics_enabled = os.getenv("RANGER_DEBUG_METRICS", "0") == "1"
         self._command_obs_start = 26
         self._command_obs_end = 34
@@ -298,6 +300,9 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         )
         self._short_goal_stop_count_only_after_phase = bool(
             getattr(self.cfg, "short_goal_stop_count_only_after_phase", False)
+        )
+        self._short_goal_stop_requires_route_complete = bool(
+            getattr(self.cfg, "short_goal_stop_requires_route_complete", False)
         )
         self._short_goal_stop_required_hold_steps = int(getattr(self.cfg, "short_goal_stop_required_hold_steps", 24))
         self._executed_hydraulic_action_prev = torch.zeros((self.num_envs, 4), dtype=torch.float32, device=self.device)
@@ -4777,6 +4782,16 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
         marker_cfg.prim_path = "/World/Visuals/RangerShortGoalTargets"
         self._short_goal_goal_marker = VisualizationMarkers(marker_cfg)
 
+        side_cfg = POSITION_GOAL_MARKER_CFG.copy()
+        side_cfg.prim_path = "/World/Visuals/RangerShortGoalSideWaypoints"
+        side_cfg.markers["target_far"].visual_material.diffuse_color = (1.0, 0.75, 0.0)
+        self._short_goal_side_waypoint_marker = VisualizationMarkers(side_cfg)
+
+        exit_cfg = POSITION_GOAL_MARKER_CFG.copy()
+        exit_cfg.prim_path = "/World/Visuals/RangerShortGoalExitWaypoints"
+        exit_cfg.markers["target_far"].visual_material.diffuse_color = (0.0, 0.9, 1.0)
+        self._short_goal_exit_waypoint_marker = VisualizationMarkers(exit_cfg)
+
     def _update_short_goal_stop_phase(self) -> None:
         """Latch the stop phase and count consecutive settled control steps."""
 
@@ -4784,8 +4799,19 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             return
         robot = self.scene["robot"]
         _, goal_distance, _ = mdp.short_goal_target_body(self)
+        route_ready = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+        if self._short_goal_stop_requires_route_complete:
+            route_phase = getattr(self, mdp.OBSTACLE_ROUTE_PHASE_ATTR, None)
+            if isinstance(route_phase, torch.Tensor) and route_phase.shape == (self.num_envs,):
+                route_ready = route_phase >= 2
+                # If a future planner assigns another obstacle (phase 2 -> 0/1), a
+                # previously armed stop phase must not keep terminal control active.
+                self._short_goal_stop_phase_active &= route_ready
+                self._short_goal_stop_phase_stable_steps[~route_ready] = 0
         was_active = self._short_goal_stop_phase_active.clone()
-        self._short_goal_stop_phase_active |= goal_distance < self._short_goal_stop_phase_enter_distance
+        self._short_goal_stop_phase_active |= route_ready & (
+            goal_distance < self._short_goal_stop_phase_enter_distance
+        )
         newly_active = self._short_goal_stop_phase_active & (~was_active)
         if torch.any(newly_active):
             leg_action_term = self.action_manager.get_term("leg_hydraulic")
@@ -4872,6 +4898,57 @@ class RangerForwardDebugEnv(ManagerBasedRLEnv):
             marker_indices=marker_indices,
             scales=scales,
         )
+
+        side_waypoint = getattr(self, mdp.OBSTACLE_ROUTE_WAYPOINT_ATTR, None)
+        exit_waypoint = getattr(self, mdp.OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, None)
+        if (
+            isinstance(side_waypoint, torch.Tensor)
+            and side_waypoint.shape == (self.num_envs, 2)
+            and self._short_goal_side_waypoint_marker is not None
+        ):
+            side_pos_w = torch.cat(
+                (
+                    side_waypoint,
+                    torch.full(
+                        (self.num_envs, 1),
+                        self._stand_trace_ground_height + 0.12,
+                        dtype=side_waypoint.dtype,
+                        device=self.device,
+                    ),
+                ),
+                dim=1,
+            )
+            waypoint_indices = torch.zeros((self.num_envs,), dtype=torch.int32, device=self.device)
+            waypoint_scales = torch.full((self.num_envs, 3), 4.5, dtype=torch.float32, device=self.device)
+            self._short_goal_side_waypoint_marker.visualize(
+                translations=side_pos_w,
+                marker_indices=waypoint_indices,
+                scales=waypoint_scales,
+            )
+        if (
+            isinstance(exit_waypoint, torch.Tensor)
+            and exit_waypoint.shape == (self.num_envs, 2)
+            and self._short_goal_exit_waypoint_marker is not None
+        ):
+            exit_pos_w = torch.cat(
+                (
+                    exit_waypoint,
+                    torch.full(
+                        (self.num_envs, 1),
+                        self._stand_trace_ground_height + 0.12,
+                        dtype=exit_waypoint.dtype,
+                        device=self.device,
+                    ),
+                ),
+                dim=1,
+            )
+            waypoint_indices = torch.zeros((self.num_envs,), dtype=torch.int32, device=self.device)
+            waypoint_scales = torch.full((self.num_envs, 3), 4.0, dtype=torch.float32, device=self.device)
+            self._short_goal_exit_waypoint_marker.visualize(
+                translations=exit_pos_w,
+                marker_indices=waypoint_indices,
+                scales=waypoint_scales,
+            )
 
     def step(self, action: torch.Tensor):
         # process actions

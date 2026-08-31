@@ -14,6 +14,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import TensorDict
 
+from Ranger.tasks.manager_based.ranger.wheel_semantics import ranger_wheel_semantic_modes as _canonical_wheel_semantic_modes
+
 
 POLICY_STATE_GROUP = "policy_state"
 TEACHER_COMMAND_GROUP = "teacher_command"
@@ -21,14 +23,9 @@ COMMAND_STATE_SLICE = slice(26, 34)
 
 
 def ranger_wheel_semantic_modes(wheel_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return forward common-mode and signed turn-mode from raw ``[lr, lf, rf, rr]`` actions."""
+    """Return common/turn directly from semantic ``[lb, lf, rf, rb]`` policy actions."""
 
-    if wheel_actions.shape[-1] != 4:
-        raise ValueError(f"Expected four Ranger wheel actions, got shape={tuple(wheel_actions.shape)}")
-    semantic_wheel = wheel_actions * wheel_actions.new_tensor((-1.0, -1.0, 1.0, 1.0))
-    left = semantic_wheel[..., :2].mean(dim=-1)
-    right = semantic_wheel[..., 2:].mean(dim=-1)
-    return 0.5 * (left + right), 0.5 * (right - left)
+    return _canonical_wheel_semantic_modes(wheel_actions)
 
 
 def bound_teacher_actions(teacher_actions: torch.Tensor) -> torch.Tensor:

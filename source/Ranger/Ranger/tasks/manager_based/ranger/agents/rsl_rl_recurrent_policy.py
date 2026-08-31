@@ -33,6 +33,7 @@ class _RangerRecurrentNetworkSpec:
 
     state_dim: int = 42
     base_ang_vel_observation_scale: float = 3.0
+    goal_onset_slot: int = 0
     goal_heading_rate_slot: int = 1
     goal_heading_rate_observation_scale: float = 2.0
     prop_state_ranges: tuple[tuple[int, int], ...] = ((0, 26), (34, 42))
@@ -215,6 +216,7 @@ class _RangerRecurrentActor(nn.Module):
         goal_start, goal_end = self.network_spec.goal_state_range
         goal_obs = state_obs[:, goal_start:goal_end]
         goal_encoder_obs = goal_obs.clone()
+        goal_encoder_obs[:, self.network_spec.goal_onset_slot] = 0.0
         goal_encoder_obs[:, self.network_spec.goal_heading_rate_slot] = 0.0
         map_obs = map_obs.view(
             flat_obs.shape[0],
@@ -315,7 +317,9 @@ class _RangerRecurrentActor(nn.Module):
             yaw_rate_obs = unpad_trajectories(yaw_rate_obs, masks)
         wheel_output = self.wheel_head(trunk)
         if self.use_recurrent:
-            wheel_feedback_obs = torch.cat((goal_obs, yaw_rate_obs), dim=-1)
+            residual_goal_obs = goal_obs.clone()
+            residual_goal_obs[..., self.network_spec.goal_onset_slot] = 0.0
+            wheel_feedback_obs = torch.cat((residual_goal_obs, yaw_rate_obs), dim=-1)
             wheel_output = wheel_output + self.wheel_control_residual(wheel_feedback_obs)
         action = torch.cat((self.suspension_head(trunk), wheel_output), dim=-1)
         if self.use_hidden_goal_residual:
@@ -412,6 +416,7 @@ class _RangerRecurrentCritic(nn.Module):
         goal_start, goal_end = self.network_spec.goal_state_range
         goal_obs = state_obs[:, goal_start:goal_end]
         goal_encoder_obs = goal_obs.clone()
+        goal_encoder_obs[:, self.network_spec.goal_onset_slot] = 0.0
         goal_encoder_obs[:, self.network_spec.goal_heading_rate_slot] = 0.0
         map_obs = map_obs.view(
             flat_obs.shape[0],

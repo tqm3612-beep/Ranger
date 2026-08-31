@@ -106,6 +106,12 @@ class RangerTeacherRegularizedPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     large_heading_action_prior_use_heading_rate_feedback: bool = False
     large_heading_action_prior_heading_rate_gain: float = 0.60
     large_heading_action_prior_balance_turn_targets: bool = False
+    large_heading_action_prior_same_side_coef: float = 0.0
+    large_heading_action_prior_onset_boost: float = 0.0
+    large_heading_action_prior_onset_heading_max: float = 0.60
+    large_heading_action_prior_onset_indicator_slot: int | None = None
+    large_heading_action_prior_use_full_wheel_targets: bool = False
+    large_heading_action_prior_stop_phase_zero_target_weight: float = 0.0
     critic_only: bool = False
     diagnostic_only: bool = False
     critic_relearning: bool = False
@@ -668,6 +674,367 @@ class Stage2ObstacleP05ExitV2FixedRolloutFastLRBootstrapPPORunnerCfg(
     def __post_init__(self) -> None:
         super().__post_init__()
         self.algorithm.actor_learning_rate = 1.0e-4
+
+
+@configclass
+class Stage2ObstacleP05ExitV2OnsetNullspaceBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2FixedRolloutFastLRBootstrapPPORunnerCfg
+):
+    """B15: cancel inherited steering bias early while closing the four-wheel prior nullspace."""
+
+    max_iterations = 6
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b15_onset_nullspace"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.large_heading_action_prior_same_side_coef = 0.50
+        self.algorithm.large_heading_action_prior_onset_boost = 2.0
+        self.algorithm.large_heading_action_prior_onset_heading_max = 0.60
+
+
+@configclass
+class Stage2ObstacleP05ExitV2ResetOnsetNullspaceBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2OnsetNullspaceBootstrapPPORunnerCfg
+):
+    """B17: prioritize the first two seconds after reset using a loss-only onset indicator."""
+
+    max_iterations = 6
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b17_reset_onset_nullspace"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.large_heading_action_prior_onset_indicator_slot = 0
+        self.algorithm.large_heading_action_prior_onset_boost = 8.0
+
+
+@configclass
+class Stage2ObstacleP05ExitV2FullWheelBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2ResetOnsetNullspaceBootstrapPPORunnerCfg
+):
+    """B18: supervise all four semantic wheel actions directly to eliminate the wheel nullspace."""
+
+    max_iterations = 8
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b18_full_wheel"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.large_heading_action_prior_use_full_wheel_targets = True
+        self.algorithm.large_heading_action_prior_same_side_coef = 0.0
+        self.algorithm.large_heading_action_prior_onset_boost = 2.0
+        self.algorithm.actor_learning_rate = 1.0e-5
+        self.algorithm.actor_train_scope = "wheel_control_residual"
+        self.algorithm.num_learning_epochs = 5
+        self.algorithm.num_mini_batches = 4
+
+
+@configclass
+class Stage2ObstacleP05ExitV2FullWheelHeadIntensiveBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2FullWheelBootstrapPPORunnerCfg
+):
+    """B20: intensively fit only the state-dependent wheel head to full-wheel targets on one rollout."""
+
+    max_iterations = 1
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b20_full_wheel_head_intensive"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_head"
+        self.algorithm.actor_learning_rate = 1.0e-4
+        self.algorithm.num_learning_epochs = 30
+        self.algorithm.num_mini_batches = 4
+
+
+@configclass
+class Stage2ObstacleP05ExitV2SemanticFullWheelHeadBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2FullWheelBootstrapPPORunnerCfg
+):
+    """B21: recalibrate model108 wheel-head control in the canonical semantic wheel space."""
+
+    max_iterations = 4
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_b21_semantic_full_wheel_head"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_head"
+        self.algorithm.actor_learning_rate = 2.0e-5
+        self.algorithm.num_learning_epochs = 10
+        self.algorithm.num_mini_batches = 4
+        self.algorithm.large_heading_action_prior_use_full_wheel_targets = True
+        self.algorithm.large_heading_action_prior_same_side_coef = 0.0
+        self.algorithm.large_heading_action_prior_onset_boost = 2.0
+
+
+@configclass
+class Stage2ObstacleP05ExitV2SemanticTerminalFullWheelHeadPPORunnerCfg(
+    Stage2ObstacleP05ExitV2SemanticFullWheelHeadBootstrapPPORunnerCfg
+):
+    """B22: keep semantic full-wheel navigation supervision active and learn zero-wheel terminal braking."""
+
+    max_iterations = 4
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_b22_semantic_terminal_full_wheel_head"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_learning_rate = 1.0e-5
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticStopFullWheelHeadPPORunnerCfg(
+    Stage2ObstacleP05ExitV2SemanticTerminalFullWheelHeadPPORunnerCfg
+):
+    """B23: terminal-heavy calibration for autonomous zero-wheel stopping and same-side consistency."""
+
+    max_iterations = 4
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_b23_semantic_stop_full_wheel_head"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_learning_rate = 1.0e-5
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticStopCaptureFullWheelHeadPPORunnerCfg(
+    Stage2ObstacleP05SemanticStopFullWheelHeadPPORunnerCfg
+):
+    """B24: concentrated stop-latch calibration around 0.30-0.70 m."""
+
+    max_iterations = 4
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_b24_semantic_stop_capture_full_wheel_head"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_learning_rate = 1.0e-5
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV1PPORunnerCfg(
+    Stage2ObstacleP05ExitV2SemanticTerminalFullWheelHeadPPORunnerCfg
+):
+    """Full-route V1 with weak navigation supervision and protected autonomous stopping."""
+
+    max_iterations = 24
+    save_interval = 2
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v1"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_control"
+        self.algorithm.actor_learning_rate = 2.0e-6
+        self.algorithm.learning_rate = 1.5e-6
+        self.algorithm.num_learning_epochs = 5
+        self.algorithm.num_mini_batches = 4
+        self.algorithm.ppo_surrogate_scale = 0.05
+        self.algorithm.entropy_coef = 0.0
+        self.algorithm.teacher_loss_coef = 0.0
+
+        # Effective navigation prior coefficient is 0.10 * 0.10 = 0.01,
+        # while the latched terminal zero-wheel target retains coefficient 0.10.
+        self.algorithm.large_heading_action_prior_coef = 0.10
+        self.algorithm.large_heading_action_prior_non_stop_weight = 0.10
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV2PPORunnerCfg(Stage2ObstacleP05SemanticFullV1PPORunnerCfg):
+    """Full-route V2: PPO-only map-conditioned navigation with protected terminal stopping."""
+
+    max_iterations = 24
+    save_interval = 2
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v2"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_head"
+        self.algorithm.ppo_surrogate_scale = 0.20
+        self.algorithm.actor_learning_rate = 2.0e-6
+        self.algorithm.large_heading_action_prior_non_stop_weight = 0.0
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV3PPORunnerCfg(Stage2ObstacleP05SemanticFullV2PPORunnerCfg):
+    """Full-route V3: adapt perception map encoder and wheel head while protecting recurrent/goal control."""
+
+    max_iterations = 24
+    save_interval = 2
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v3"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "map_wheel_head"
+        self.algorithm.actor_learning_rate = 1.0e-6
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV4WaypointPPORunnerCfg(Stage2ObstacleP05SemanticFullV1PPORunnerCfg):
+    """Waypoint-conditioned integration while preserving the learned point-goal controller."""
+
+    max_iterations = 24
+    save_interval = 2
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v4_waypoint"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_head"
+        self.algorithm.actor_learning_rate = 1.0e-6
+        self.algorithm.ppo_surrogate_scale = 0.05
+        self.algorithm.large_heading_action_prior_coef = 0.10
+        self.algorithm.large_heading_action_prior_non_stop_weight = 0.50
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV5RouteFramePPORunnerCfg(Stage2ObstacleP05SemanticFullV4WaypointPPORunnerCfg):
+    """Generalized navigation PPO with joint perception/recurrent/control adaptation."""
+
+    max_iterations = 80
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v5_route_frame"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "navigation_stack"
+        self.algorithm.actor_learning_rate = 1.5e-6
+        self.algorithm.learning_rate = 1.5e-6
+        self.algorithm.ppo_surrogate_scale = 0.10
+        self.algorithm.num_learning_epochs = 1
+        self.algorithm.num_mini_batches = 1
+        self.algorithm.entropy_coef = 5.0e-5
+        # Waypoints are now a curriculum hint rather than the primary objective.
+        self.algorithm.large_heading_action_prior_coef = 0.05
+        self.algorithm.large_heading_action_prior_non_stop_weight = 0.20
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV6PhaseGatedRewardPPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV5RouteFramePPORunnerCfg
+):
+    """V6 reward-semantic experiment; keep V5 navigation-stack optimization unchanged for isolation."""
+
+    max_iterations = 100
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v6_phase_gated_reward"
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV7SafetyFirstRoutePPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV6PhaseGatedRewardPPORunnerCfg
+):
+    """Safety-first full-route acquisition with no direct-goal non-stop actor prior."""
+
+    max_iterations = 100
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v7_safety_first_route"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        # During route phases the policy command is the active waypoint, while future
+        # no-teacher navigation may expose the final goal. Avoid an actor-side prior that
+        # can re-introduce direct-goal pressure outside RewardManager. Keep terminal zero-wheel
+        # supervision active through the dedicated stop-phase weight.
+        self.algorithm.large_heading_action_prior_non_stop_weight = 0.0
+        self.algorithm.large_heading_action_prior_stop_phase_zero_target_weight = 1.0
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV8TurnAwareRoutePPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV7SafetyFirstRoutePPORunnerCfg
+):
+    """Turn-aware route acquisition experiment retaining the V7 navigation-stack train scope."""
+
+    max_iterations = 100
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v8_turn_aware_route"
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV9FastRoutePPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV8TurnAwareRoutePPORunnerCfg
+):
+    """Faster route-speed experiment retaining the V8 navigation-stack optimization scope."""
+
+    max_iterations = 100
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v9_fast_route"
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV10CorridorRoutePPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV9FastRoutePPORunnerCfg
+):
+    """Corridor-route objective cleanup retaining the navigation-stack optimization scope."""
+
+    max_iterations = 100
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v10_corridor_route"
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV10EntryRelaxedPPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV10CorridorRoutePPORunnerCfg
+):
+    """Entry-transition relaxation experiment retaining all V10 PPO settings."""
+
+    max_iterations = 60
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v10_entry_relaxed"
+
+
+@configclass
+class Stage2ObstacleP05SemanticFullV10SafeCorridorPPORunnerCfg(
+    Stage2ObstacleP05SemanticFullV10EntryRelaxedPPORunnerCfg
+):
+    """Safe-corridor geometry and aligned exit-control experiment."""
+
+    max_iterations = 60
+    save_interval = 5
+    experiment_name = "ranger_direct/stage2_obstacle_p05_semantic_full_v10_safe_corridor"
+
+
+@configclass
+class Stage2ObstacleP05ExitV2FullWheelControlBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2FullWheelBootstrapPPORunnerCfg
+):
+    """B19: full-wheel supervision while adapting the wheel head and wheel residual together."""
+
+    max_iterations = 8
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b19_full_wheel_control"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_train_scope = "wheel_control"
+        self.algorithm.actor_learning_rate = 1.0e-5
+
+
+@configclass
+class Stage2ObstacleP05ExitV2OnsetNullspaceWheelControlBootstrapPPORunnerCfg(
+    Stage2ObstacleP05ExitV2OnsetNullspaceBootstrapPPORunnerCfg
+):
+    """B16: unfreeze the final wheel head plus residual after nullspace repair."""
+
+    max_iterations = 6
+    save_interval = 1
+    experiment_name = "ranger_direct/stage2_obstacle_p05_exit_v2_bootstrap_b16_onset_nullspace_wheel_control"
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.algorithm.actor_learning_rate = 2.0e-5
+        self.algorithm.actor_train_scope = "wheel_control"
+        self.algorithm.num_learning_epochs = 10
+        self.algorithm.num_mini_batches = 4
 
 
 @configclass

@@ -52,11 +52,11 @@ from isaaclab_tasks.utils import parse_env_cfg
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, wrap_to_pi
 
 import Ranger.tasks  # noqa: F401
+from Ranger.tasks.manager_based.ranger.wheel_semantics import ranger_wheel_joint_to_semantic
 
 
 WHEEL_NAMES = ("w_lb", "w_lf", "w_rf", "w_rb")
 MIRROR_WHEEL_INDEX = (3, 2, 1, 0)
-WHEEL_FORWARD_SIGN = (-1.0, -1.0, 1.0, 1.0)
 VALID_CONDITIONS = {"straight", "arc", "spin"}
 
 
@@ -172,9 +172,8 @@ def _collect_rows(
     wheel_joint_ids_t = torch.as_tensor(wheel_joint_ids, device=unwrapped.device, dtype=torch.long)
     wheel_body_ids_t = torch.as_tensor(wheel_body_ids, device=unwrapped.device, dtype=torch.long)
 
-    sign = torch.tensor(WHEEL_FORWARD_SIGN, device=unwrapped.device, dtype=torch.float32).unsqueeze(0)
-    wheel_target_semantic = wheel_term.velocity_target * sign
-    wheel_joint_vel_semantic = robot.data.joint_vel[:, wheel_joint_ids_t] * sign
+    wheel_target_semantic = ranger_wheel_joint_to_semantic(wheel_term.velocity_target)
+    wheel_joint_vel_semantic = ranger_wheel_joint_to_semantic(robot.data.joint_vel[:, wheel_joint_ids_t])
     wheel_surface_speed = wheel_joint_vel_semantic * float(getattr(unwrapped.cfg, "short_goal_wheel_radius", 0.2024))
 
     root_forward_b = torch.zeros((2, 3), device=unwrapped.device, dtype=torch.float32)

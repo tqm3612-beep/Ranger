@@ -18,6 +18,7 @@ from isaaclab.envs import ManagerBasedEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 
+from ..wheel_semantics import ranger_wheel_joint_to_semantic
 from ..terrain_cfg import (
     RANGER_WAVE_AMPLITUDE_M,
     RANGER_WAVE_GOAL_MARKER_HEIGHT_M,
@@ -53,6 +54,9 @@ OBSTACLE_ROUTE_PREV_DISTANCE_ATTR = "_ranger_obstacle_route_prev_distance"
 OBSTACLE_ROUTE_PROGRESS_PHASE_ATTR = "_ranger_obstacle_route_progress_phase"
 OBSTACLE_ROUTE_PHASE_ATTR = "_ranger_obstacle_route_phase"
 OBSTACLE_TRAINING_SCENARIO_ATTR = "_ranger_obstacle_training_scenario"
+OBSTACLE_ROUTE_FORWARD_ATTR = "_ranger_obstacle_route_forward_w"
+OBSTACLE_ROUTE_LATERAL_ATTR = "_ranger_obstacle_route_lateral_w"
+OBSTACLE_WAYPOINT_TEACHER_ATTR = "_ranger_obstacle_waypoint_teacher"
 
 
 def _obs_debug_enabled() -> bool:
@@ -736,8 +740,6 @@ def reset_short_goal_behind_random_obstacle(
         raise ValueError("obstacle_abs_y_range must be positive and satisfy high > low.")
     if route_lateral_offset <= 0.0:
         raise ValueError("route_lateral_offset must be positive.")
-    if route_side_forward_offset < 0.0:
-        raise ValueError("route_side_forward_offset must be non-negative.")
     if route_exit_forward_offset <= route_side_forward_offset:
         raise ValueError("route_exit_forward_offset must be greater than route_side_forward_offset.")
     if not 0.0 <= route_exit_lateral_scale <= 1.0:
@@ -989,6 +991,176 @@ def reset_short_goal_obstacle_phase_mixture(
         prev_heading_error[env_ids] = math_utils.wrap_to_pi(torch.atan2(target_delta[:, 1], target_delta[:, 0]) - root_yaw)
 
 
+def reset_short_goal_obstacle_route_frame_mixture(
+    env: ManagerBasedEnv,
+    env_ids,
+    scenario_weights: tuple[float, float, float] = (0.70, 0.15, 0.15),
+    route_heading_range_deg: tuple[float, float] = (-45.0, 45.0),
+    initial_heading_error_range_deg: tuple[float, float] = (-15.0, 15.0),
+    waypoint_teacher_fraction: float = 0.70,
+    obstacle_x_range: tuple[float, float] = (3.2, 3.8),
+    obstacle_abs_y_range: tuple[float, float] = (0.15, 0.40),
+    route_lateral_offset: float = 1.10,
+    route_side_forward_offset: float = 0.0,
+    route_exit_forward_offset: float = 2.00,
+    route_exit_lateral_scale: float = 0.55,
+    distance_beyond_obstacle_range: tuple[float, float] = (5.5, 8.0),
+    lateral_offset_range: tuple[float, float] = (-0.30, 0.30),
+    exit_x_after_obstacle_range: tuple[float, float] = (0.55, 1.10),
+    exit_lateral_jitter: float = 0.12,
+    exit_heading_error_range_deg: tuple[float, float] = (-25.0, 25.0),
+    exit_stratify_heading_sign: bool = False,
+    exit_forward_speed_range: tuple[float, float] = (0.0, 0.0),
+    stop_distance_range: tuple[float, float] = (0.30, 0.70),
+    stop_lateral_offset_range: tuple[float, float] = (-0.10, 0.10),
+    stop_heading_error_range_deg: tuple[float, float] = (-10.0, 10.0),
+    rotate_obstacle_with_route: bool = False,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    obstacle_cfg: SceneEntityCfg = SceneEntityCfg("obstacle"),
+) -> None:
+    """Rotate the proven obstacle lesson into an episode-specific start-to-goal route frame.
+
+    Geometry is first sampled in the legacy +X template and then rigidly rotated around each
+    environment origin. This preserves the established full-route/exit/terminal distributions
+    while removing world-axis specialization. A per-episode teacher mask exposes active route
+    waypoints to only a fraction of full-route episodes; the remainder see the final goal and
+    must exploit map/reward information directly.
+    """
+
+    env_ids = _as_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+    if route_heading_range_deg[1] <= route_heading_range_deg[0]:
+        raise ValueError("route_heading_range_deg must satisfy high > low.")
+    if initial_heading_error_range_deg[1] < initial_heading_error_range_deg[0]:
+        raise ValueError("initial_heading_error_range_deg must satisfy high >= low.")
+    if not 0.0 <= float(waypoint_teacher_fraction) <= 1.0:
+        raise ValueError("waypoint_teacher_fraction must be in [0, 1].")
+
+    reset_short_goal_obstacle_phase_mixture(
+        env,
+        env_ids,
+        scenario_weights=scenario_weights,
+        obstacle_x_range=obstacle_x_range,
+        obstacle_abs_y_range=obstacle_abs_y_range,
+        route_lateral_offset=route_lateral_offset,
+        route_side_forward_offset=route_side_forward_offset,
+        route_exit_forward_offset=route_exit_forward_offset,
+        route_exit_lateral_scale=route_exit_lateral_scale,
+        distance_beyond_obstacle_range=distance_beyond_obstacle_range,
+        lateral_offset_range=lateral_offset_range,
+        exit_x_after_obstacle_range=exit_x_after_obstacle_range,
+        exit_lateral_jitter=exit_lateral_jitter,
+        exit_heading_error_range_deg=exit_heading_error_range_deg,
+        exit_stratify_heading_sign=exit_stratify_heading_sign,
+        exit_forward_speed_range=exit_forward_speed_range,
+        stop_distance_range=stop_distance_range,
+        stop_lateral_offset_range=stop_lateral_offset_range,
+        stop_heading_error_range_deg=stop_heading_error_range_deg,
+        asset_cfg=asset_cfg,
+        obstacle_cfg=obstacle_cfg,
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    obstacle: RigidObject = env.scene[obstacle_cfg.name]
+    dtype = asset.data.root_pos_w.dtype
+    origins = env.scene.env_origins[env_ids, :2]
+    count = env_ids.numel()
+    route_angle = torch.empty(count, device=env.device, dtype=dtype).uniform_(
+        math.radians(float(route_heading_range_deg[0])),
+        math.radians(float(route_heading_range_deg[1])),
+    )
+    cos_angle = torch.cos(route_angle)
+    sin_angle = torch.sin(route_angle)
+    route_forward = torch.stack((cos_angle, sin_angle), dim=1)
+    route_lateral = torch.stack((-sin_angle, cos_angle), dim=1)
+
+    route_forward_state = getattr(env, OBSTACLE_ROUTE_FORWARD_ATTR, None)
+    if route_forward_state is None or route_forward_state.shape != (env.num_envs, 2):
+        route_forward_state = torch.zeros((env.num_envs, 2), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_ROUTE_FORWARD_ATTR, route_forward_state)
+    route_forward_state[env_ids] = route_forward
+    route_lateral_state = getattr(env, OBSTACLE_ROUTE_LATERAL_ATTR, None)
+    if route_lateral_state is None or route_lateral_state.shape != (env.num_envs, 2):
+        route_lateral_state = torch.zeros((env.num_envs, 2), device=env.device, dtype=dtype)
+        setattr(env, OBSTACLE_ROUTE_LATERAL_ATTR, route_lateral_state)
+    route_lateral_state[env_ids] = route_lateral
+
+    teacher_state = getattr(env, OBSTACLE_WAYPOINT_TEACHER_ATTR, None)
+    if teacher_state is None or teacher_state.shape != (env.num_envs,):
+        teacher_state = torch.zeros((env.num_envs,), device=env.device, dtype=torch.bool)
+        setattr(env, OBSTACLE_WAYPOINT_TEACHER_ATTR, teacher_state)
+    teacher_state[env_ids] = torch.rand(count, device=env.device) < float(waypoint_teacher_fraction)
+
+    def _rotate_xy(points_xy: torch.Tensor) -> torch.Tensor:
+        rel = points_xy - origins
+        return torch.stack(
+            (
+                cos_angle * rel[:, 0] - sin_angle * rel[:, 1],
+                sin_angle * rel[:, 0] + cos_angle * rel[:, 1],
+            ),
+            dim=1,
+        ) + origins
+
+    obstacle_xy = getattr(env, OBSTACLE_POSITION_ATTR)
+    side_waypoint = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR)
+    exit_waypoint = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR)
+    target_pos_w, prev_goal_distance, goal_reached = _ensure_short_goal_buffers(env)
+    obstacle_xy[env_ids] = _rotate_xy(obstacle_xy[env_ids])
+    side_waypoint[env_ids] = _rotate_xy(side_waypoint[env_ids])
+    exit_waypoint[env_ids] = _rotate_xy(exit_waypoint[env_ids])
+    target_pos_w[env_ids, :2] = _rotate_xy(target_pos_w[env_ids, :2])
+
+    obstacle_pose = obstacle.data.default_root_state[env_ids, :7].clone()
+    obstacle_pose[:, :2] = obstacle_xy[env_ids]
+    obstacle_pose[:, 2] = env.scene.env_origins[env_ids, 2] + 0.60
+    if rotate_obstacle_with_route:
+        obs_roll, obs_pitch, obs_yaw = math_utils.euler_xyz_from_quat(obstacle_pose[:, 3:7])
+        obstacle_pose[:, 3:7] = math_utils.quat_from_euler_xyz(obs_roll, obs_pitch, obs_yaw + route_angle)
+    obstacle.write_root_pose_to_sim(obstacle_pose, env_ids=env_ids)
+
+    root_pose = torch.cat((asset.data.root_pos_w[env_ids], asset.data.root_quat_w[env_ids]), dim=1).clone()
+    root_pose[:, :2] = _rotate_xy(root_pose[:, :2])
+    roll, pitch, yaw = math_utils.euler_xyz_from_quat(root_pose[:, 3:7])
+    scenario = getattr(env, OBSTACLE_TRAINING_SCENARIO_ATTR)[env_ids]
+    full_route = scenario == 0
+    heading_error = torch.zeros(count, device=env.device, dtype=dtype)
+    if initial_heading_error_range_deg[1] > initial_heading_error_range_deg[0]:
+        heading_error[full_route] = torch.empty(
+            int(full_route.sum().item()), device=env.device, dtype=dtype
+        ).uniform_(
+            math.radians(float(initial_heading_error_range_deg[0])),
+            math.radians(float(initial_heading_error_range_deg[1])),
+        )
+    elif torch.any(full_route):
+        heading_error[full_route] = math.radians(float(initial_heading_error_range_deg[0]))
+    root_pose[:, 3:7] = math_utils.quat_from_euler_xyz(roll, pitch, yaw + route_angle + heading_error)
+
+    root_velocity = asset.data.root_vel_w[env_ids].clone()
+    vx = root_velocity[:, 0].clone()
+    vy = root_velocity[:, 1].clone()
+    root_velocity[:, 0] = cos_angle * vx - sin_angle * vy
+    root_velocity[:, 1] = sin_angle * vx + cos_angle * vy
+    asset.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+    asset.write_root_velocity_to_sim(root_velocity, env_ids=env_ids)
+
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR)
+    active_waypoint = torch.where(
+        (route_phase[env_ids] == 0).unsqueeze(1), side_waypoint[env_ids], exit_waypoint[env_ids]
+    )
+    route_prev_distance = getattr(env, OBSTACLE_ROUTE_PREV_DISTANCE_ATTR)
+    route_prev_distance[env_ids] = torch.linalg.vector_norm(active_waypoint - root_pose[:, :2], dim=1)
+    target_delta = target_pos_w[env_ids, :2] - root_pose[:, :2]
+    prev_goal_distance[env_ids] = torch.linalg.vector_norm(target_delta, dim=1)
+    goal_reached[env_ids] = False
+    prev_heading_error = getattr(env, SHORT_GOAL_PREV_HEADING_ERROR_ATTR, None)
+    if prev_heading_error is not None and prev_heading_error.shape == (env.num_envs,):
+        root_yaw = math_utils.euler_xyz_from_quat(root_pose[:, 3:7])[2]
+        prev_heading_error[env_ids] = math_utils.wrap_to_pi(
+            torch.atan2(target_delta[:, 1], target_delta[:, 0]) - root_yaw
+        )
+
+
 def goal_heading_target_pos_w(env: ManagerBasedEnv) -> torch.Tensor:
     """Return sampled goal-heading target positions in world frame."""
 
@@ -1026,6 +1198,55 @@ def short_goal_target_body(
     asset: Articulation = env.scene[asset_cfg.name]
     target_pos_w = _ensure_short_goal_target(env)
     target_vec_w = target_pos_w - asset.data.root_pos_w
+    target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w, target_vec_w)
+    target_xy_b = target_vec_b[:, :2]
+    distance = torch.norm(target_xy_b, dim=1)
+    heading_error = torch.atan2(target_xy_b[:, 1], target_xy_b[:, 0])
+    return target_vec_b, distance, heading_error
+
+
+def short_goal_policy_target_body(
+    env: ManagerBasedEnv,
+    target_mode: str = "final",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the point target exposed to the policy without changing observation shape.
+
+    ``final`` preserves the historical ShortGoal contract. ``active_route`` only changes
+    complete-route obstacle episodes (scenario 0): phase 0 exposes the safe-side waypoint,
+    phase 1 exposes the exit waypoint, and phase 2 returns to the final sampled goal. Exit
+    and terminal rehearsal scenarios continue to expose the final goal directly.
+    """
+
+    mode = str(target_mode).lower()
+    if mode == "final":
+        return short_goal_target_body(env, asset_cfg=asset_cfg)
+    if mode != "active_route":
+        raise ValueError(f"Unsupported short_goal target_mode: {target_mode}")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    final_target_pos_w = _ensure_short_goal_target(env)
+    policy_target_pos_w = final_target_pos_w.clone()
+
+    scenario = getattr(env, OBSTACLE_TRAINING_SCENARIO_ATTR, None)
+    route_phase = getattr(env, OBSTACLE_ROUTE_PHASE_ATTR, None)
+    side_waypoint = getattr(env, OBSTACLE_ROUTE_WAYPOINT_ATTR, None)
+    exit_waypoint = getattr(env, OBSTACLE_ROUTE_EXIT_WAYPOINT_ATTR, None)
+    if scenario is None or route_phase is None or side_waypoint is None or exit_waypoint is None:
+        # ObservationManager probes term shapes before reset events initialize obstacle-route
+        # buffers. Preserve the legacy final-goal observation during that construction-only call.
+        return short_goal_target_body(env, asset_cfg=asset_cfg)
+
+    full_route = scenario == 0
+    teacher_mask = getattr(env, OBSTACLE_WAYPOINT_TEACHER_ATTR, None)
+    if teacher_mask is not None and teacher_mask.shape == (env.num_envs,):
+        full_route = full_route & teacher_mask
+    side_mask = full_route & (route_phase == 0)
+    exit_mask = full_route & (route_phase == 1)
+    policy_target_pos_w[side_mask, :2] = side_waypoint[side_mask]
+    policy_target_pos_w[exit_mask, :2] = exit_waypoint[exit_mask]
+
+    target_vec_w = policy_target_pos_w - asset.data.root_pos_w
     target_vec_b = math_utils.quat_apply_inverse(asset.data.root_quat_w, target_vec_w)
     target_xy_b = target_vec_b[:, :2]
     distance = torch.norm(target_xy_b, dim=1)
@@ -1159,6 +1380,28 @@ def joint_vel_rel_normalized(
     joint_vel_rel = asset.data.joint_vel[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
     out = torch.clamp(joint_vel_rel / scale, min=-1.0, max=1.0)
     _obs_debug(f"exit policy_state/joint_vel_rel shape={tuple(out.shape)}")
+    return out
+
+
+def wheel_joint_vel_semantic_normalized(
+    env: ManagerBasedEnv,
+    scale: float = 20.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", joint_names=["w_lb", "w_lf", "w_rf", "w_rb"]
+    ),
+) -> torch.Tensor:
+    """Return normalized wheel velocity in the RL semantic forward-positive convention."""
+
+    _obs_debug(f"enter policy_state/wheel_joint_vel_semantic joint_count={len(asset_cfg.joint_ids)}")
+    if _policy_state_disabled():
+        out = torch.zeros((env.num_envs, len(asset_cfg.joint_ids)), device=env.device, dtype=torch.float32)
+        _obs_debug(f"exit policy_state/wheel_joint_vel_semantic disabled shape={tuple(out.shape)}")
+        return out
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+    semantic_wheel_vel = ranger_wheel_joint_to_semantic(wheel_joint_vel)
+    out = torch.clamp(semantic_wheel_vel / scale, min=-1.0, max=1.0)
+    _obs_debug(f"exit policy_state/wheel_joint_vel_semantic shape={tuple(out.shape)}")
     return out
 
 
@@ -1341,11 +1584,13 @@ def command_observation(
     goal_x_body: float = 0.0,
     goal_y_body: float = 0.0,
     short_goal_encoding_mode: str = "legacy",
+    short_goal_target_mode: str = "final",
     short_goal_observation_max_distance: float | None = None,
     short_goal_near_distance_range: float = 3.0,
     short_goal_global_distance_unit: float = 1.0,
     short_goal_velocity_reference: float = 1.5,
     short_goal_heading_rate_reference: float | None = None,
+    short_goal_onset_steps: int | None = None,
     goal_visibility_mode: str = "always",
     goal_visible_steps: int = 5,
     goal_hidden_steps: int = 25,
@@ -1417,7 +1662,7 @@ def command_observation(
         obs[:, 6] = torch.sin(heading_error)
         obs[:, 7] = torch.cos(heading_error)
     elif goal_source == "short_goal":
-        target_vec_b, distance, heading_error = short_goal_target_body(env, asset_cfg=asset_cfg)
+        target_vec_b, distance, heading_error = short_goal_policy_target_body(env, target_mode=short_goal_target_mode, asset_cfg=asset_cfg)
         if short_goal_heading_rate_reference is not None:
             heading_rate_reference = float(short_goal_heading_rate_reference)
             if heading_rate_reference <= 0.0:
@@ -1440,6 +1685,17 @@ def command_observation(
                 min=-1.0,
                 max=1.0,
             )
+        if short_goal_onset_steps is not None:
+            onset_steps = int(short_goal_onset_steps)
+            if onset_steps <= 0:
+                raise ValueError("short_goal_onset_steps must be positive when provided.")
+            # Slot 0 is otherwise unused in ShortGoal mode.  It is reserved as a
+            # loss-only reset/onset indicator: 1 at reset and linearly decays to 0
+            # over the requested number of policy steps.  Actor/critic encoders and
+            # the wheel residual explicitly mask this slot so legacy checkpoint
+            # forward behavior is unchanged; the supervised prior reads the raw slot.
+            episode_steps = env.episode_length_buf.to(device=env.device, dtype=obs.dtype)
+            obs[:, 0] = torch.clamp(1.0 - episode_steps / float(onset_steps), min=0.0, max=1.0)
         stop_phase_active = getattr(env, "_short_goal_stop_phase_active", None)
         if stop_phase_active is not None and stop_phase_active.shape == (env.num_envs,):
             # ShortGoal does not use the three command slots; reuse slot 2 for the

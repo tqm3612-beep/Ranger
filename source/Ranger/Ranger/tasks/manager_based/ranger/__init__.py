@@ -417,6 +417,110 @@ gym.register(
 
 
 gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B15-OnsetNullspace",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2OnsetNullspaceBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B17-ResetOnsetNullspace",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2ResetOnsetNullspaceBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B18-FullWheel",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FullWheelBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B20-FullWheelHeadIntensive",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FullWheelHeadIntensiveBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-B21-SemanticFullWheelHead",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2SemanticFullWheelHeadBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-B22-SemanticTerminalFullWheelHead",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2SemanticTerminalFullWheelHeadPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B19-FullWheelControl",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2OnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2FullWheelControlBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B16-OnsetNullspaceWheelControl",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05ExitV2HeadingRateEnvCfg",
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2OnsetNullspaceWheelControlBootstrapPPORunnerCfg"
+        ),
+    },
+)
+
+
+gym.register(
     id="Template-Ranger-Stage2-Obstacle-P05-Exit-V2-Bootstrap-B10-UnifiedWheelControl",
     entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
     disable_env_checker=True,
@@ -425,6 +529,28 @@ gym.register(
         "rsl_rl_cfg_entry_point": (
             f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05ExitV2UnifiedWheelControlBootstrapPPORunnerCfg"
         ),
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-B23-SemanticStopFullWheelHead",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticStopOnsetEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticStopFullWheelHeadPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-B24-SemanticStopCaptureFullWheelHead",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticStopCaptureEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticStopCaptureFullWheelHeadPPORunnerCfg",
     },
 )
 
@@ -447,6 +573,138 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05FullEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05FullPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V1",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV1PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V2",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV2PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V3",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV3PPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V4-Waypoint",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV4WaypointEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV4WaypointPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V5-RouteFrame",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV5RouteFrameEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV5RouteFramePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V6-PhaseGatedReward",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV6PhaseGatedRewardEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV6PhaseGatedRewardPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V7-SafetyFirstRoute",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV7SafetyFirstRouteEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV7SafetyFirstRoutePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V8-TurnAwareRoute",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV8TurnAwareRouteEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV8TurnAwareRoutePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V9-FastRoute",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV9FastRouteEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV9FastRoutePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V10-CorridorRoute",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV10CorridorRouteEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV10CorridorRoutePPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V10-EntryRelaxed",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV10EntryRelaxedEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV10EntryRelaxedPPORunnerCfg",
+    },
+)
+
+
+gym.register(
+    id="Template-Ranger-Stage2-Obstacle-P05-Semantic-Full-V10-SafeCorridor",
+    entry_point=f"{__name__}.forward_debug_env:RangerForwardDebugEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.ranger_env_cfg:RangerStage2ObstacleP05SemanticFullV10SafeCorridorEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:Stage2ObstacleP05SemanticFullV10SafeCorridorPPORunnerCfg",
     },
 )
 

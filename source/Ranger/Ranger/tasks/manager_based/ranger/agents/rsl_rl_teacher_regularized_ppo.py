@@ -12,23 +12,25 @@ from torch import nn
 from rsl_rl.algorithms import PPO
 from rsl_rl.utils import unpad_trajectories
 
+from ..wheel_semantics import ranger_wheel_semantic_modes as _canonical_ranger_wheel_semantic_modes
 
-def ranger_wheel_raw_to_semantic(wheel_actions: torch.Tensor) -> torch.Tensor:
-    """Convert Ranger wheel actions ``[lr, lf, rf, rr]`` to forward-positive semantics."""
+
+def ranger_wheel_policy_to_semantic(wheel_actions: torch.Tensor) -> torch.Tensor:
+    """Return policy wheel actions in canonical semantic ``[lb, lf, rf, rb]`` space.
+
+    Policy actions are already semantic. Physical joint-axis conversion belongs only
+    in the simulator action term.
+    """
 
     if wheel_actions.shape[-1] != 4:
         raise ValueError(f"Expected four Ranger wheel actions, got shape={tuple(wheel_actions.shape)}")
-    signs = wheel_actions.new_tensor((-1.0, -1.0, 1.0, 1.0))
-    return wheel_actions * signs
+    return wheel_actions
 
 
 def ranger_wheel_semantic_modes(wheel_actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return forward common-mode and signed turn-mode from raw Ranger wheel actions."""
+    """Return common/turn directly from semantic Ranger policy wheel actions."""
 
-    semantic_wheel = ranger_wheel_raw_to_semantic(wheel_actions)
-    left = semantic_wheel[..., :2].mean(dim=-1)
-    right = semantic_wheel[..., 2:].mean(dim=-1)
-    return 0.5 * (left + right), 0.5 * (right - left)
+    return _canonical_ranger_wheel_semantic_modes(ranger_wheel_policy_to_semantic(wheel_actions))
 
 
 def teacher_wheel_sample_weights(
@@ -143,6 +145,13 @@ class RangerTeacherRegularizedPPO(PPO):
         large_heading_action_prior_use_heading_rate_feedback: bool = False,
         large_heading_action_prior_heading_rate_gain: float = 0.60,
         large_heading_action_prior_balance_turn_targets: bool = False,
+        large_heading_action_prior_same_side_coef: float = 0.0,
+        large_heading_action_prior_onset_boost: float = 0.0,
+        large_heading_action_prior_onset_heading_max: float = 0.60,
+        large_heading_action_prior_onset_indicator_slot: int | None = None,
+        large_heading_action_prior_use_full_wheel_targets: bool = False,
+        large_heading_action_prior_non_stop_weight: float = 1.0,
+        large_heading_action_prior_stop_phase_zero_target_weight: float = 0.0,
         critic_only: bool = False,
         diagnostic_only: bool = False,
         critic_relearning: bool = False,
@@ -221,10 +230,13 @@ class RangerTeacherRegularizedPPO(PPO):
             "wheel_residual",
             "wheel_control",
             "wheel_control_residual",
+            "map_wheel_head",
+            "navigation_stack",
         }:
             raise ValueError(
                 f"Unsupported actor_train_scope={self.actor_train_scope!r}; "
-                "expected 'all', 'wheel_head', 'wheel_residual', 'wheel_control', or 'wheel_control_residual'."
+                "expected 'all', 'wheel_head', 'wheel_residual', 'wheel_control', "
+                "'wheel_control_residual', 'map_wheel_head', or 'navigation_stack'."
             )
         if self.actor_train_scope != "all" and self.actor_learning_rate is None:
             raise ValueError("A restricted actor_train_scope requires actor_learning_rate / split optimizer mode.")
@@ -244,6 +256,18 @@ class RangerTeacherRegularizedPPO(PPO):
                         )
                     elif self.actor_train_scope == "wheel_control_residual":
                         train_actor_parameter = name.startswith("actor.wheel_control_residual.")
+                    elif self.actor_train_scope == "map_wheel_head":
+                        train_actor_parameter = name.startswith("actor.map_encoder.") or name.startswith(
+                            "actor.wheel_head."
+                        )
+                    elif self.actor_train_scope == "navigation_stack":
+                        train_actor_parameter = (
+                            name.startswith("actor.map_encoder.")
+                            or name.startswith("actor.fusion_norm.")
+                            or name.startswith("actor.memory.")
+                            or name.startswith("actor.actor_trunk.")
+                            or name.startswith("actor.wheel_head.")
+                        )
                     parameter.requires_grad_(train_actor_parameter)
                     if train_actor_parameter:
                         actor_params.append(parameter)
@@ -282,6 +306,14 @@ class RangerTeacherRegularizedPPO(PPO):
             raise ValueError("large_heading_action_prior_heading_scale must be positive.")
         if large_heading_action_prior_heading_rate_gain < 0.0:
             raise ValueError("large_heading_action_prior_heading_rate_gain must be non-negative.")
+        if large_heading_action_prior_same_side_coef < 0.0:
+            raise ValueError("large_heading_action_prior_same_side_coef must be non-negative.")
+        if large_heading_action_prior_onset_boost < 0.0:
+            raise ValueError("large_heading_action_prior_onset_boost must be non-negative.")
+        if large_heading_action_prior_onset_heading_max <= 0.0:
+            raise ValueError("large_heading_action_prior_onset_heading_max must be positive.")
+        if large_heading_action_prior_onset_indicator_slot is not None and large_heading_action_prior_onset_indicator_slot < 0:
+            raise ValueError("large_heading_action_prior_onset_indicator_slot must be non-negative when provided.")
         self.large_heading_action_prior_coef = float(large_heading_action_prior_coef)
         self.large_heading_action_prior_start = float(large_heading_action_prior_start)
         self.large_heading_action_prior_full = float(large_heading_action_prior_full)
@@ -303,6 +335,25 @@ class RangerTeacherRegularizedPPO(PPO):
         )
         self.large_heading_action_prior_heading_rate_gain = float(large_heading_action_prior_heading_rate_gain)
         self.large_heading_action_prior_balance_turn_targets = bool(large_heading_action_prior_balance_turn_targets)
+        self.large_heading_action_prior_same_side_coef = float(large_heading_action_prior_same_side_coef)
+        self.large_heading_action_prior_onset_boost = float(large_heading_action_prior_onset_boost)
+        self.large_heading_action_prior_onset_heading_max = float(large_heading_action_prior_onset_heading_max)
+        self.large_heading_action_prior_onset_indicator_slot = (
+            None
+            if large_heading_action_prior_onset_indicator_slot is None
+            else int(large_heading_action_prior_onset_indicator_slot)
+        )
+        self.large_heading_action_prior_use_full_wheel_targets = bool(
+            large_heading_action_prior_use_full_wheel_targets
+        )
+        if large_heading_action_prior_non_stop_weight < 0.0:
+            raise ValueError("large_heading_action_prior_non_stop_weight must be non-negative.")
+        self.large_heading_action_prior_non_stop_weight = float(large_heading_action_prior_non_stop_weight)
+        if large_heading_action_prior_stop_phase_zero_target_weight < 0.0:
+            raise ValueError("large_heading_action_prior_stop_phase_zero_target_weight must be non-negative.")
+        self.large_heading_action_prior_stop_phase_zero_target_weight = float(
+            large_heading_action_prior_stop_phase_zero_target_weight
+        )
         self.critic_only = bool(critic_only)
         self.diagnostic_only = bool(diagnostic_only)
         self.critic_relearning = bool(critic_relearning)
@@ -357,7 +408,7 @@ class RangerTeacherRegularizedPPO(PPO):
             return actions
 
         perturbed = actions.clone()
-        wheel = ranger_wheel_raw_to_semantic(perturbed[:, 4:8])
+        wheel = ranger_wheel_policy_to_semantic(perturbed[:, 4:8]).clone()
         left = wheel[:, :2].mean(dim=-1)
         right = wheel[:, 2:].mean(dim=-1)
         common = 0.5 * (left + right)
@@ -387,7 +438,7 @@ class RangerTeacherRegularizedPPO(PPO):
         right_shift = new_right - right
         wheel[selected, :2] = wheel[selected, :2] + left_shift[selected, None]
         wheel[selected, 2:] = wheel[selected, 2:] + right_shift[selected, None]
-        perturbed[:, 4:8] = torch.clamp(ranger_wheel_raw_to_semantic(wheel), min=-0.999, max=0.999)
+        perturbed[:, 4:8] = torch.clamp(wheel, min=-0.999, max=0.999)
 
         # Critic-only mode never uses action log-probabilities for optimization. Store the
         # actually executed perturbed command so diagnostics reflect the expanded dataset.
@@ -880,7 +931,7 @@ class RangerTeacherRegularizedPPO(PPO):
         student_mean: torch.Tensor,
         obs_batch,
         masks_batch: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Direct student-only wheel prior used for temporary large-heading repair.
 
         This loss never queries the V10 teacher. It maps the policy's own heading observation to a
@@ -941,10 +992,26 @@ class RangerTeacherRegularizedPPO(PPO):
             )
             else heading_gate
         )
-        non_stop = (~self._stop_phase_mask(obs_batch, masks_batch)).to(student_mean.dtype)
+        stop_phase_mask = self._stop_phase_mask(obs_batch, masks_batch)
+        non_stop = (~stop_phase_mask).to(student_mean.dtype)
         gate = gate.to(student_mean.dtype) * non_stop
 
-        common_mode, turn_mode = ranger_wheel_semantic_modes(student_mean[..., 4:8])
+        semantic_wheel = ranger_wheel_policy_to_semantic(student_mean[..., 4:8])
+        stop_gate = stop_phase_mask.to(student_mean.dtype)
+        stop_gate_sum = stop_gate.sum()
+        if (
+            self.large_heading_action_prior_stop_phase_zero_target_weight > 0.0
+            and float(stop_gate_sum.detach().item()) > 1.0e-8
+        ):
+            stop_wheel_sq = torch.square(semantic_wheel).mean(dim=-1)
+            stop_zero_loss = torch.sum(stop_gate * stop_wheel_sq) / stop_gate_sum
+        else:
+            stop_zero_loss = student_mean.sum() * 0.0
+
+        left = semantic_wheel[..., :2].mean(dim=-1)
+        right = semantic_wheel[..., 2:].mean(dim=-1)
+        common_mode = 0.5 * (left + right)
+        turn_mode = 0.5 * (right - left)
         if self.large_heading_action_prior_use_heading_rate_feedback:
             desired_turn = (
                 self.large_heading_action_prior_turn_gain * torch.sin(effective_heading)
@@ -981,11 +1048,32 @@ class RangerTeacherRegularizedPPO(PPO):
         common_sq = torch.square(common_mode - desired_common)
         turn_sq = torch.square(turn_mode - desired_turn)
         gate_sum = gate.sum()
-        if float(gate_sum.detach().item()) <= 1.0e-8:
-            zero = student_mean.sum() * 0.0
-            return zero, zero.detach(), zero.detach(), zero.detach()
+        gate_norm = torch.clamp(gate_sum, min=1.0e-8)
 
-        common_loss = torch.sum(gate * common_sq) / gate_sum
+        common_loss = torch.sum(gate * common_sq) / gate_norm
+
+        # Bias the supervised steering fit toward onset/closeout states before a large
+        # overshoot develops.  On-policy recovery states remain represented, but they
+        # no longer dominate simply because the inherited policy has already turned too far.
+        if self.large_heading_action_prior_onset_indicator_slot is None:
+            onset_scale = torch.clamp(
+                1.0 - heading_abs / self.large_heading_action_prior_onset_heading_max,
+                min=0.0,
+                max=1.0,
+            )
+        else:
+            onset_slot = int(self.large_heading_action_prior_onset_indicator_slot)
+            goal_dim = int(network_spec.goal_state_range[1] - network_spec.goal_state_range[0])
+            if onset_slot >= goal_dim:
+                raise ValueError(
+                    f"large_heading_action_prior_onset_indicator_slot={onset_slot} is outside goal dim {goal_dim}."
+                )
+            onset_scale = unpad_trajectories(
+                state_padded[..., goal_start + onset_slot : goal_start + onset_slot + 1],
+                masks_batch,
+            ).squeeze(-1)
+            onset_scale = torch.clamp(onset_scale, min=0.0, max=1.0).to(student_mean.dtype)
+        turn_gate = gate * (1.0 + self.large_heading_action_prior_onset_boost * onset_scale)
         if getattr(self, "large_heading_action_prior_balance_turn_targets", False):
             # On-policy rollout distributions can collapse to one side after overshoot.  Prevent
             # that state imbalance from turning a symmetric control prior into a one-sided
@@ -999,18 +1087,86 @@ class RangerTeacherRegularizedPPO(PPO):
             )
             group_losses: list[torch.Tensor] = []
             for group_mask in turn_groups:
-                group_gate = gate * group_mask.to(gate.dtype)
+                group_gate = turn_gate * group_mask.to(turn_gate.dtype)
                 group_gate_sum = group_gate.sum()
                 if float(group_gate_sum.detach().item()) > 1.0e-8:
                     group_losses.append(torch.sum(group_gate * turn_sq) / group_gate_sum)
-            turn_loss = torch.stack(group_losses).mean() if group_losses else torch.sum(gate * turn_sq) / gate_sum
+            turn_loss = (
+                torch.stack(group_losses).mean()
+                if group_losses
+                else torch.sum(turn_gate * turn_sq) / torch.clamp(turn_gate.sum(), min=1.0e-8)
+            )
         else:
-            turn_loss = torch.sum(gate * turn_sq) / gate_sum
-        loss = common_loss + turn_loss
-        fraction = (gate > 0.0).to(student_mean.dtype).mean()
-        common_abs = torch.sum(gate * (common_mode - desired_common).abs()) / gate_sum
-        turn_error_abs = torch.sum(gate * (turn_mode - desired_turn).abs()) / gate_sum
-        return loss, fraction.detach(), common_abs.detach(), turn_error_abs.detach()
+            turn_loss = torch.sum(turn_gate * turn_sq) / torch.clamp(turn_gate.sum(), min=1.0e-8)
+
+        # The common/turn projection leaves two wheel-action nullspace directions:
+        # front-vs-rear disagreement on each side.  Penalize those directions directly
+        # in the actor's supervised loss so the residual cannot satisfy the prior by
+        # making same-side wheels fight each other and generating slip.
+        same_side_sq = torch.square(semantic_wheel[..., 0] - semantic_wheel[..., 1]) + torch.square(
+            semantic_wheel[..., 2] - semantic_wheel[..., 3]
+        )
+        same_side_loss = torch.sum(gate * same_side_sq) / gate_norm
+
+        if self.large_heading_action_prior_use_full_wheel_targets:
+            desired_left = torch.clamp(desired_common - desired_turn, min=-1.0, max=1.0)
+            desired_right = torch.clamp(desired_common + desired_turn, min=-1.0, max=1.0)
+            desired_semantic_wheel = torch.stack(
+                (desired_left, desired_left, desired_right, desired_right), dim=-1
+            )
+            full_wheel_sq = torch.square(semantic_wheel - desired_semantic_wheel).mean(dim=-1)
+            if getattr(self, "large_heading_action_prior_balance_turn_targets", False):
+                full_group_losses: list[torch.Tensor] = []
+                target_eps = 0.05
+                for group_mask in (
+                    desired_turn > target_eps,
+                    desired_turn.abs() <= target_eps,
+                    desired_turn < -target_eps,
+                ):
+                    group_gate = turn_gate * group_mask.to(turn_gate.dtype)
+                    group_gate_sum = group_gate.sum()
+                    if float(group_gate_sum.detach().item()) > 1.0e-8:
+                        full_group_losses.append(torch.sum(group_gate * full_wheel_sq) / group_gate_sum)
+                full_wheel_loss = (
+                    torch.stack(full_group_losses).mean()
+                    if full_group_losses
+                    else torch.sum(turn_gate * full_wheel_sq) / torch.clamp(turn_gate.sum(), min=1.0e-8)
+                )
+            else:
+                full_wheel_loss = torch.sum(turn_gate * full_wheel_sq) / torch.clamp(turn_gate.sum(), min=1.0e-8)
+            # Full-wheel targets directly remove the two front/rear nullspace directions:
+            # [LB, LF] share one target and [RF, RB] share one target.  Do not add the
+            # projected common/turn or same-side losses again; they are algebraically
+            # redundant and would distort the intended four-wheel calibration.
+            loss = full_wheel_loss
+        else:
+            loss = common_loss + turn_loss + self.large_heading_action_prior_same_side_coef * same_side_loss
+
+        # A latched stop phase is part of the learned task, not an actor-free region.  When
+        # enabled, supervise all four semantic wheel actions directly toward zero after the
+        # goal enters the stop radius.  This teaches autonomous braking and simultaneously
+        # removes both same-side nullspace directions in terminal states.
+        loss = (
+            self.large_heading_action_prior_non_stop_weight * loss
+            + self.large_heading_action_prior_stop_phase_zero_target_weight * stop_zero_loss
+        )
+        stop_supervision_active = (
+            stop_gate > 0.0
+            if self.large_heading_action_prior_stop_phase_zero_target_weight > 0.0
+            else torch.zeros_like(stop_phase_mask)
+        )
+        fraction = ((gate > 0.0) | stop_supervision_active).to(student_mean.dtype).mean()
+        common_abs = torch.sum(gate * (common_mode - desired_common).abs()) / gate_norm
+        turn_error_abs = torch.sum(gate * (turn_mode - desired_turn).abs()) / gate_norm
+        same_side_abs = torch.sum(
+            gate
+            * 0.5
+            * (
+                (semantic_wheel[..., 0] - semantic_wheel[..., 1]).abs()
+                + (semantic_wheel[..., 2] - semantic_wheel[..., 3]).abs()
+            )
+        ) / gate_norm
+        return loss, fraction.detach(), common_abs.detach(), turn_error_abs.detach(), same_side_abs.detach()
 
     def _teacher_action_loss(
         self,
@@ -1079,6 +1235,7 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_large_heading_action_prior_fraction = 0.0
         mean_large_heading_action_prior_common_abs = 0.0
         mean_large_heading_action_prior_turn_error_abs = 0.0
+        mean_large_heading_action_prior_same_side_abs = 0.0
         mean_action_prior_actor_grad_norm = 0.0
         mean_surrogate_action_prior_grad_cosine = 0.0
         minibatch_grad_cosines: list[float] = []
@@ -1207,6 +1364,7 @@ class RangerTeacherRegularizedPPO(PPO):
             large_heading_action_prior_fraction = torch.zeros_like(value_loss)
             large_heading_action_prior_common_abs = torch.zeros_like(value_loss)
             large_heading_action_prior_turn_error_abs = torch.zeros_like(value_loss)
+            large_heading_action_prior_same_side_abs = torch.zeros_like(value_loss)
             action_prior_actor_grad_norm = torch.zeros_like(value_loss)
             surrogate_action_prior_grad_cosine = torch.zeros_like(value_loss)
             latent_alignment_loss = torch.zeros_like(value_loss)
@@ -1289,6 +1447,7 @@ class RangerTeacherRegularizedPPO(PPO):
                         large_heading_action_prior_fraction,
                         large_heading_action_prior_common_abs,
                         large_heading_action_prior_turn_error_abs,
+                        large_heading_action_prior_same_side_abs,
                     ) = self._large_heading_action_prior_loss(bounded_mu_batch, obs_batch, masks_batch)
 
                 if bool(getattr(self.policy, "use_gru_residual", False)):
@@ -1411,6 +1570,7 @@ class RangerTeacherRegularizedPPO(PPO):
             mean_large_heading_action_prior_common_abs += float(large_heading_action_prior_common_abs.item())
             turn_error_value = float(large_heading_action_prior_turn_error_abs.item())
             mean_large_heading_action_prior_turn_error_abs += turn_error_value
+            mean_large_heading_action_prior_same_side_abs += float(large_heading_action_prior_same_side_abs.item())
             large_heading_action_prior_turn_error_updates.append(turn_error_value)
             mean_action_prior_actor_grad_norm += float(action_prior_actor_grad_norm.item())
             mean_surrogate_action_prior_grad_cosine += float(surrogate_action_prior_grad_cosine.item())
@@ -1452,6 +1612,7 @@ class RangerTeacherRegularizedPPO(PPO):
         mean_large_heading_action_prior_fraction /= num_updates
         mean_large_heading_action_prior_common_abs /= num_updates
         mean_large_heading_action_prior_turn_error_abs /= num_updates
+        mean_large_heading_action_prior_same_side_abs /= num_updates
         mean_action_prior_actor_grad_norm /= num_updates
         mean_surrogate_action_prior_grad_cosine /= num_updates
         mean_teacher_to_ppo_grad_ratio = mean_teacher_actor_grad_norm / max(mean_ppo_actor_grad_norm, 1.0e-12)
@@ -1517,6 +1678,7 @@ class RangerTeacherRegularizedPPO(PPO):
             "large_heading_action_prior_fraction": mean_large_heading_action_prior_fraction,
             "large_heading_action_prior_common_abs": mean_large_heading_action_prior_common_abs,
             "large_heading_action_prior_turn_error_abs": mean_large_heading_action_prior_turn_error_abs,
+            "large_heading_action_prior_same_side_abs": mean_large_heading_action_prior_same_side_abs,
             "large_heading_action_prior_turn_error_abs_first_epoch": first_epoch_turn_error,
             "large_heading_action_prior_turn_error_abs_last_epoch": last_epoch_turn_error,
             "action_prior_actor_grad_norm": mean_action_prior_actor_grad_norm,

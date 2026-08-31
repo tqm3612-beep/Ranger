@@ -453,6 +453,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "wheel_common_mode_clamped",
         "wheel_turn_mode_clamped",
         "wheel_action_saturation_fraction",
+        "velocity_des_semantic_lb_radps",
+        "velocity_des_semantic_lf_radps",
+        "velocity_des_semantic_rf_radps",
+        "velocity_des_semantic_rb_radps",
+        "pre_step_wheel_target_semantic_lb_radps",
+        "pre_step_wheel_target_semantic_lf_radps",
+        "pre_step_wheel_target_semantic_rf_radps",
+        "pre_step_wheel_target_semantic_rb_radps",
+        "pre_step_wheel_velocity_semantic_lb_radps",
+        "pre_step_wheel_velocity_semantic_lf_radps",
+        "pre_step_wheel_velocity_semantic_rf_radps",
+        "pre_step_wheel_velocity_semantic_rb_radps",
         "stop_phase_active",
         "termination_any_after_step",
         "stopped_goal_reached_after_step",
@@ -869,18 +881,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         )
 
         wheel_actions = actions[:, 4:8]
-        semantic_wheel_actions = ranger_mdp.wheel_raw_to_semantic_lr_lf_rf_rr(wheel_actions)
+        # Actor wheel outputs are already canonical semantic [lb, lf, rf, rb] commands.
+        semantic_wheel_actions = wheel_actions
         semantic_left_action = semantic_wheel_actions[:, :2].mean(dim=1)
         semantic_right_action = semantic_wheel_actions[:, 2:].mean(dim=1)
         wheel_common_mode = 0.5 * (semantic_left_action + semantic_right_action)
         wheel_turn_mode = 0.5 * (semantic_right_action - semantic_left_action)
         wheel_actions_clamped = torch.clamp(wheel_actions, min=-1.0, max=1.0)
-        semantic_wheel_actions_clamped = ranger_mdp.wheel_raw_to_semantic_lr_lf_rf_rr(wheel_actions_clamped)
+        semantic_wheel_actions_clamped = wheel_actions_clamped
         clamped_left_action = semantic_wheel_actions_clamped[:, :2].mean(dim=1)
         clamped_right_action = semantic_wheel_actions_clamped[:, 2:].mean(dim=1)
         wheel_common_mode_clamped = 0.5 * (clamped_left_action + clamped_right_action)
         wheel_turn_mode_clamped = 0.5 * (clamped_right_action - clamped_left_action)
         wheel_action_saturation_fraction = (torch.abs(wheel_actions) > 1.0).to(torch.float32).mean(dim=1)
+
+        wheel_term = unwrapped.action_manager.get_term("wheel_motor_csv")
+        velocity_des_semantic = semantic_wheel_actions_clamped * float(wheel_term._velocity_limit)
+        pre_step_wheel_target_semantic = ranger_mdp.wheel_joint_to_semantic_lb_lf_rf_rb(wheel_term.velocity_target)
+        pre_step_wheel_velocity_semantic = ranger_mdp.wheel_joint_to_semantic_lb_lf_rf_rb(
+            robot.data.joint_vel[:, wheel_term._joint_ids]
+        )
 
         target_pos_w = getattr(unwrapped, "_ranger_short_goal_pos_w", None)
         if not isinstance(target_pos_w, torch.Tensor) or target_pos_w.shape[0] != unwrapped.num_envs:
@@ -930,6 +950,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             }
             for wheel_idx, wheel_name in enumerate(wheel_names):
                 row[f"policy_wheel_raw_{wheel_name}"] = float(wheel_actions[env_id, wheel_idx].item())
+                row[f"velocity_des_semantic_{wheel_name}_radps"] = float(
+                    velocity_des_semantic[env_id, wheel_idx].item()
+                )
+                row[f"pre_step_wheel_target_semantic_{wheel_name}_radps"] = float(
+                    pre_step_wheel_target_semantic[env_id, wheel_idx].item()
+                )
+                row[f"pre_step_wheel_velocity_semantic_{wheel_name}_radps"] = float(
+                    pre_step_wheel_velocity_semantic[env_id, wheel_idx].item()
+                )
             rows.append(row)
         return rows
 
